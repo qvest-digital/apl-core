@@ -1,0 +1,42 @@
+{{- /*
+  Emit the vendored upstream manifests, applying the chart's few knobs on the way through.
+
+  manifests/*.yaml are byte-identical downloads of the upstream release assets (README.md says how
+  to refresh them). They are read with .Files.Get, which does NOT template them, so upstream YAML
+  containing "{{" could never break the chart. Every document is passed through untouched EXCEPT
+  the three Deployments this chart parameterises; those are parsed, mutated in place, re-serialised --
+  and EXCEPT CustomResourceDefinitions, which are skipped because crds/crds.yaml (derived from the
+  same manifest by the vendor script) carries them; see README.md "Why crds/ exists".
+*/ -}}
+{{- $knobs := dict
+      "tekton-triggers-controller"        .Values.controller
+      "tekton-triggers-webhook"           .Values.webhook
+      "tekton-triggers-core-interceptors" .Values.interceptors }}
+{{- range $file := (list "manifests/release.yaml" "manifests/interceptors.yaml") }}
+{{- range $raw := splitList "\n---\n" (print "\n" ($.Files.Get $file)) }}
+{{- $doc := fromYaml $raw }}
+{{- $kind := "" }}{{ if kindIs "map" $doc }}{{ $kind = get $doc "kind" | default "" }}{{ end }}
+{{- if eq $kind "CustomResourceDefinition" }}
+{{- /* skipped here: CRDs live in crds/crds.yaml (derived from this same file by the vendor script)
+       because upstream apl-core's operator applies charts/tekton-triggers/crds with kubectl before
+       helmfile runs -- README.md "Why crds/ exists" */ -}}
+{{- else if and (eq $kind "Deployment") (hasKey $knobs (get $doc.metadata "name" | default "")) }}
+{{-   $k := get $knobs $doc.metadata.name }}
+{{-   $c := index $doc.spec.template.spec.containers 0 }}
+{{-   with $k.resources }}{{ $_ := set $c "resources" . }}{{ end }}
+{{-   with $k.image }}
+{{-     if .repository }}
+{{- /* keep upstream's tag@digest unless a tag is given; strip "<registry>/<path>:" from the
+       upstream reference -- greedy up to the LAST "/<segment>:", so registries with a port work */ -}}
+{{-       $upstreamTag := regexReplaceAll "^.*/[^:/]+:" $c.image "" }}
+{{-       $_ := set $c "image" (printf "%s:%s" .repository (.tag | default $upstreamTag)) }}
+{{-     end }}
+{{-   end }}
+---
+{{ toYaml $doc }}
+{{- else }}
+---
+{{ $raw }}
+{{- end }}
+{{- end }}
+{{- end }}
