@@ -1,0 +1,82 @@
+{{- $v := .Values }}
+{{- $penpotDomain := $v._derived.penpotDomain }}
+{{- $httpRoute := tpl (readFile "../../helmfile.d/snippets/routes.gotmpl") $v | fromYaml }}
+
+resources:
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+  {{ with $httpRoute.annotations }}
+    annotations:
+    {{ . | toYaml | nindent 8 }}
+  {{- end }}
+    name: penpot
+  spec:
+    hostnames:
+      - {{ $penpotDomain }}
+    parentRefs:
+    {{- $httpRoute.parentRefs | toYaml | nindent 4 }}
+    rules:
+      - backendRefs:
+          - name: penpot
+            port: 8080
+        matches:
+          - path:
+              type: PathPrefix
+              value: /
+- {{ tpl (readFile "../../helmfile.d/snippets/serviceentry.gotmpl") (dict "name" "penpot" "host" $penpotDomain) | nindent 2 }}
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: penpot-secret-key
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: penpot-secret-key
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          secret: '{{ "{{ .secretKey | toString }}" }}'
+    data:
+      - secretKey: secretKey
+        remoteRef:
+          key: penpot-secrets
+          property: secretKey
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: penpot-oidc-secret
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: penpot-oidc-secret
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          clientSecret: '{{ "{{ .clientSecret | toString }}" }}'
+    data:
+      - secretKey: clientSecret
+        remoteRef:
+          key: {{ $v._derived.oidcClientSecretKey }}
+          property: {{ $v._derived.oidcClientSecretProperty }}
+{{- /*
+  Valkey holds no persistent or sensitive state here (pub/sub for realtime file-change
+  notifications only), so its password is the same static "changeme" values/gitea/gitea-valkey.gotmpl
+  uses -- a plain Secret, not an ExternalSecret, since there's nothing to read from the secret
+  store. values/penpot/penpot.gotmpl's redis.secretKeys.redisUriKey path needs the full connection
+  string as one key -- the chart has no separate host/password fields for redis.
+*/}}
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: penpot-redis-secret
+  stringData:
+    uri: redis://:changeme@penpot-valkey-headless.penpot.svc.cluster.local:6379/0
