@@ -1,0 +1,337 @@
+{{- $v := .Values }}
+{{- $k := $v.apps.vikunja }}
+{{- $vikunjaDomain := $v._derived.vikunjaDomain }}
+{{- $kubectlImage := "registry.k8s.io/kubectl:v1.34.1" }}
+{{- $httpRoute := tpl (readFile "../../helmfile.d/snippets/routes.gotmpl") $v | fromYaml }}
+
+resources:
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+  {{ with $httpRoute.annotations }}
+    annotations:
+    {{ . | toYaml | nindent 8 }}
+  {{- end }}
+    name: vikunja
+  spec:
+    hostnames:
+      - {{ $vikunjaDomain }}
+    parentRefs:
+    {{- $httpRoute.parentRefs | toYaml | nindent 4 }}
+    rules:
+      - backendRefs:
+          - name: vikunja
+            port: 3456
+        matches:
+          - path:
+              type: PathPrefix
+              value: /
+- {{ tpl (readFile "../../helmfile.d/snippets/serviceentry.gotmpl") (dict "name" "vikunja" "host" $vikunjaDomain) | nindent 2 }}
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: vikunja-admin-credentials
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: vikunja-admin-credentials
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          username: {{ $k.adminUsername }}
+          email: {{ printf "%s@%s" $k.adminUsername $v.cluster.domainSuffix }}
+          password: '{{ "{{ .adminPassword | toString }}" }}'
+    data:
+      - secretKey: adminPassword
+        remoteRef:
+          key: vikunja-secrets
+          property: adminPassword
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: vikunja-service-secret
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: vikunja-service-secret
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          secret: '{{ "{{ .jwtSecret | toString }}" }}'
+    data:
+      - secretKey: jwtSecret
+        remoteRef:
+          key: vikunja-secrets
+          property: jwtSecret
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: vikunja-oidc-secret
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: vikunja-oidc-secret
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          clientSecret: '{{ "{{ .clientSecret | toString }}" }}'
+    data:
+      - secretKey: clientSecret
+        remoteRef:
+          key: {{ $v._derived.oidcClientSecretKey }}
+          property: {{ $v._derived.oidcClientSecretProperty }}
+{{- /*
+  vikunja-mcp lets an MCP client (e.g. a Turnstone agent) talk to this Vikunja instance.
+  Unlike Gitea, Vikunja has no official MCP server and the chart has no sidecar hook (see
+  values/vikunja/vikunja.gotmpl's note on additionalObjects), so this is a standalone
+  Deployment+Service instead of a sidecar -- same shape as the vikunja-bootstrap Job below.
+  The upstream project (democratize-technology/vikunja-mcp) is npm-only and stdio-only, wrapped
+  in supergateway (see vikunja-mcp/Dockerfile) to speak HTTP, with the npm package installed at
+  image-build time rather than fetched by the pod at startup, so every restart runs one pinned,
+  known-good version instead of re-resolving `latest` from the npm registry each time.
+
+  No static credential is baked in, and none is needed: the server exposes a `vikunja_auth`
+  tool (subcommands connect/status/refresh/disconnect, taking apiUrl+apiToken) that a caller
+  invokes as its first MCP call, and -- verified live against supergateway's default stateless
+  mode -- each HTTP request gets its own fresh child process, so one session's auth never leaks
+  into another's. That's per-session credential delegation for free: whoever's token the caller
+  passes to vikunja_auth.connect is who Vikunja sees, matching Gitea's per-request Bearer
+  passthrough in effect, just as an explicit first tool call instead of a header. VIKUNJA_URL
+  below is only the default apiUrl a caller can still override per-session.
+*/}}
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: vikunja-mcp
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app: vikunja-mcp
+    template:
+      metadata:
+        labels:
+          app: vikunja-mcp
+      spec:
+        containers:
+          - name: vikunja-mcp
+            image: vikunja-mcp-local:0.2.1
+            imagePullPolicy: IfNotPresent
+            ports:
+              - name: mcp
+                containerPort: 8090
+            env:
+              - name: VIKUNJA_URL
+                value: http://vikunja.vikunja.svc.cluster.local:3456/api/v1
+            livenessProbe:
+              httpGet:
+                path: /healthz
+                port: mcp
+              initialDelaySeconds: 5
+            readinessProbe:
+              httpGet:
+                path: /healthz
+                port: mcp
+              initialDelaySeconds: 5
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: [ALL]
+              privileged: false
+              runAsNonRoot: true
+              runAsUser: 1000
+              runAsGroup: 1000
+              seccompProfile:
+                type: RuntimeDefault
+            resources:
+              limits:
+                cpu: 200m
+                memory: 256Mi
+              requests:
+                cpu: 10m
+                memory: 64Mi
+        securityContext:
+          fsGroup: 1000
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: vikunja-mcp
+  spec:
+    selector:
+      app: vikunja-mcp
+    ports:
+      - name: mcp
+        port: 8090
+        targetPort: mcp
+{{- if $v._derived.untrustedCA }}
+{{- /*
+  Each app that needs the platform CA creates this secret in its own namespace --
+  values/gitea/gitea-raw.gotmpl does the same. Without it the volume mount in
+  values/vikunja/vikunja.gotmpl has nothing to mount and the pod never starts.
+*/}}
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: custom-ca
+  data:
+    ca-certificates.crt: {{ $v._derived.caCert | b64enc }}
+{{- end }}
+{{- /*
+  Vikunja has no first-run admin bootstrap and no chart hook for one, so the
+  local service account only exists once its CLI has been run inside the pod.
+  Same four objects as the gitea-backup CronJob in values/gitea/gitea-raw.gotmpl,
+  as a Job because this only has to happen once.
+*/}}
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: vikunja-bootstrap
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: vikunja-bootstrap
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # list+watch, not just get: the wait-for-vikunja init container uses `kubectl wait`,
+    # which watches the Deployment rather than polling it.
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: vikunja-bootstrap
+  subjects:
+  - kind: ServiceAccount
+    name: vikunja-bootstrap
+  roleRef:
+    kind: Role
+    name: vikunja-bootstrap
+    apiGroup: rbac.authorization.k8s.io
+- apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: vikunja-bootstrap-admin
+  spec:
+    # Vikunja is usually not up yet when this first runs, and `kubectl exec` fails until it
+    # is. The wait-for-vikunja init container below is the actual ordering gate; backoffLimit
+    # stays as a backstop for the cases the gate cannot cover (the pod going away between the
+    # wait succeeding and the exec landing).
+    backoffLimit: 30
+    template:
+      metadata:
+        annotations:
+          sidecar.istio.io/inject: "false"
+      spec:
+        serviceAccountName: vikunja-bootstrap
+        restartPolicy: OnFailure
+        {{- /*
+          Without this gate the Job races the Vikunja Deployment. Vikunja itself waits on
+          Keycloak (requireavailability), so on a cold install it is minutes behind, and every
+          attempt until then dies with `unable to upgrade connection: container not found
+          ("vikunja")`. Observed burning 6 of the 30 retries on a clean lab install.
+
+          Consuming the retry budget on a *predictable* wait is what makes it unsafe: the
+          budget is meant for genuine failures, and once spent the Job fails permanently. The
+          admin user is then never created, and the team-sync operator -- which logs in as that
+          admin -- fails every reconcile with a 403 that reads like a credentials bug rather
+          than an ordering one.
+
+          `kubectl wait` needs no shell, which matters because registry.k8s.io/kubectl is
+          distroless. Same shape as oauth2-proxy's wait-for-keycloak init container, and as
+          the operator's own "Waiting for Vikunja to be available..." gate.
+        */}}
+        initContainers:
+          - image: {{ $kubectlImage }}
+            name: wait-for-vikunja
+            command:
+              - kubectl
+              - wait
+              - deployments/vikunja
+              - --for=condition=Available
+              - --timeout=15m
+            resources:
+              limits:
+                cpu: 250m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+        containers:
+          - image: {{ $kubectlImage }}
+            name: kubectl
+            {{- /*
+              No shell anywhere in this Job. registry.k8s.io/kubectl has no /bin/sh, and
+              neither does vikunja/vikunja -- both are distroless, so the `kubectl exec ...
+              -- /bin/sh -ec '...'` shape that values/gitea/gitea-raw.gotmpl uses does not
+              work here. The credentials are interpolated by the kubelet's own $(VAR)
+              expansion over `env` instead.
+
+              Re-running is safe: `vikunja user create` for an existing username logs
+              "User with that username already exists" and still exits 0. Verified against
+              vikunja/vikunja:2.5.0.
+            */}}
+            env:
+              - name: ADMIN_USERNAME
+                valueFrom:
+                  secretKeyRef:
+                    name: vikunja-admin-credentials
+                    key: username
+              - name: ADMIN_EMAIL
+                valueFrom:
+                  secretKeyRef:
+                    name: vikunja-admin-credentials
+                    key: email
+              - name: ADMIN_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: vikunja-admin-credentials
+                    key: password
+            command:
+              - kubectl
+              - exec
+              - deployments/vikunja
+              - '--'
+              - /app/vikunja/vikunja
+              - user
+              - create
+              - -u
+              - $(ADMIN_USERNAME)
+              - -e
+              - $(ADMIN_EMAIL)
+              - -p
+              - $(ADMIN_PASSWORD)
+            resources:
+              limits:
+                cpu: 250m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65535
+              runAsGroup: 65535
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                  - ALL
+        securityContext:
+          fsGroup: 65535
