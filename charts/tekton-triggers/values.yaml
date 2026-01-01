@@ -1,20 +1,11 @@
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
-
-interceptors:
-  resources: {}
-  image:
-    repository: "ghcr.io/tektoncd/github.com/tektoncd/triggers/cmd/interceptors"
-    tag: "v0.25.0"
-
+# Only these knobs exist. Everything else is upstream's manifest, verbatim -- see README.md.
+# An empty `repository`/`tag` means "whatever the upstream manifest says".
 controller:
   resources: {}
-  image:
-    repository: "ghcr.io/tektoncd/github.com/tektoncd/triggers/cmd/controller"
-    tag: "v0.25.0"
-
+  image: {repository: "", tag: ""}
 webhook:
   resources: {}
-  image:
-    repository: "ghcr.io/tektoncd/github.com/tektoncd/triggers/cmd/webhook"
-    tag: "v0.25.0"
+  image: {repository: "", tag: ""}
+interceptors:
+  resources: {}
+  image: {repository: "", tag: ""}
