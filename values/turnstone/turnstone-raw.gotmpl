@@ -1,0 +1,507 @@
+{{- $v := .Values }}
+{{- $t := $v.apps.turnstone }}
+{{- $turnstoneDomain := $v._derived.turnstoneDomain }}
+{{- $kubectlImage := "registry.k8s.io/kubectl:v1.34.1" }}
+{{- $httpRoute := tpl (readFile "../../helmfile.d/snippets/routes.gotmpl") $v | fromYaml }}
+{{- $model := $t.defaultModel }}
+
+resources:
+{{- /*
+  One hostname, pointed entirely at the console. Server and console share every top-level path
+  prefix (/, /v1/*, /static/*, /shared/*) and neither UI supports a base path, so path-splitting
+  the two is impossible. The console already reverse-proxies each server node at /node/{id}/ with
+  HTML and JS prefix rewriting -- the same topology as Turnstone's own reference Caddyfile. The
+  server Service therefore stays ClusterIP-only and is never exposed.
+*/}}
+- apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+  {{ with $httpRoute.annotations }}
+    annotations:
+    {{ . | toYaml | nindent 8 }}
+  {{- end }}
+    name: turnstone
+  spec:
+    hostnames:
+      - {{ $turnstoneDomain }}
+    parentRefs:
+    {{- $httpRoute.parentRefs | toYaml | nindent 4 }}
+    rules:
+      {{- /*
+        /metrics and / are both in Turnstone's PUBLIC_PATHS, so /metrics serves Prometheus data
+        with no authentication on both services. An Exact match is more specific than the
+        PathPrefix below, so this rule wins. Same redirect filter shape as the /platform-logout
+        rule in helmfile.d/snippets/routes.gotmpl -- core Gateway API has no "return 403".
+      */}}
+      - matches:
+          - path:
+              type: Exact
+              value: /metrics
+        filters:
+          - type: RequestRedirect
+            requestRedirect:
+              path:
+                type: ReplaceFullPath
+                replaceFullPath: /
+              statusCode: 302
+      - backendRefs:
+          # Matches console.service.port, which values/turnstone/turnstone.gotmpl leaves at the
+          # chart default of 8090.
+          - name: turnstone-console
+            port: 8090
+        matches:
+          - path:
+              type: PathPrefix
+              value: /
+- {{ tpl (readFile "../../helmfile.d/snippets/serviceentry.gotmpl") (dict "name" "turnstone" "host" $turnstoneDomain) | nindent 2 }}
+{{- /*
+  The only declarative way to give Turnstone a model. Its container command is fixed by the chart
+  so --provider/--model/--api-key cannot be passed, there is no seed file and no
+  `turnstone-admin model` subcommand -- but [models.*] in config.toml is read directly by both the
+  server and the console and takes precedence over DB rows of the same alias.
+
+  api_key holds the literal ${ANTHROPIC_API_KEY}; Turnstone expands it from the process
+  environment when it builds the registry, so the real key stays in a Secret and never appears in
+  this ConfigMap or in the database.
+
+  The key is `model =`, NOT `name =`. Turnstone's own turnstone.example.toml gets this wrong; the
+  loader reads entry.get("model") and skips the entry with "has no model name, skipping", leaving
+  an empty registry and a healthy-looking pod with no model at all. Verified against 1.8.1.
+
+  base_url must be set explicitly, to https://api.anthropic.com -- leaving it out does NOT make
+  the Anthropic SDK fall back to its own default. Every [models.*] entry without its own base_url
+  inherits the *CLI-level* --base-url bootstrap flag instead (turnstone/core/model_registry.py,
+  entry_base_url = entry.get("base_url", base_url)) -- and that CLI flag defaults to
+  "http://localhost:8000/v1" (a local vLLM/llama.cpp convention) unless --provider anthropic was
+  also passed on the command line to trigger server.py's own correction. Our turnstone-server
+  container command carries neither flag (the chart's own command is fixed, per the comment
+  above), so the uncorrected localhost default silently wins even though this model's own
+  provider is "anthropic" -- verified live: every chat request failed with
+  `anthropic.APIConnectionError: Connection error` / `[Errno 111] Connection refused` against
+  `http://localhost:8000/v1/`, nothing listening there in this pod at all.
+
+  context_window must also be set explicitly, for the same reason: an entry without it inherits
+  the loader's own hardcoded 32768 default (model_registry.py, ModelConfig.context_window /
+  the CLI-level context_window param), which is not this model's real limit -- it's an arbitrary
+  fallback sized for small local models. Left unset, Turnstone enforces that 32768-token ceiling
+  as the session's context budget and silently DROPS tool results that don't fit once a session
+  fills it, rather than erroring -- verified live: a session at ~33k tokens had every further MCP
+  tool result dropped with "tool result dropped -- context budget exhausted", trivially reachable
+  with a handful of MCP tool calls once gitea-mcp + vikunja-mcp's 60+ tool definitions are loaded
+  into every request too. claude-sonnet-5's real context window is 200000.
+*/}}
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    # NOT "turnstone-config": the chart already emits a ConfigMap of exactly that name via its
+    # own fullname helper, carrying the env-var block. Two releases owning one object name is a
+    # fight, not a merge. Caught by rendering the chart before installing it.
+    name: turnstone-model-config
+  data:
+    config.toml: |
+      # Every entry is named by LITERAL alias, and defaultModel only selects between them at the
+      # bottom. It used to name the first entry ([models.{{"{{"}} $model {{"}}"}}]), which quietly made haiku
+      # undefaultable: setting defaultModel to claude-haiku-4-5 emitted that table twice -- once
+      # from the template, once from the block below -- and duplicate tables are a TOML parse
+      # error, so the pod would have come up healthy with an empty model registry.
+      #
+      # base_url and context_window are spelled out on every entry, for the two reasons the comment
+      # above this ConfigMap gives at length: without base_url the loader inherits a localhost
+      # vLLM convention and every request fails with connection refused, and without
+      # context_window it inherits a 32768 ceiling that silently DROPS tool results once a session
+      # outgrows it. claude-sonnet-5 and claude-haiku-4-5 both really have 200000.
+      [models.claude-sonnet-5]
+      provider = "anthropic"
+      model = "claude-sonnet-5"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+
+      # The default on this lab, deliberately. Most traffic here is trivial -- smoke-testing a new
+      # node, asking which host it is on, checking a tool is wired up -- and that costs the same as
+      # real work when the only model on offer is the expensive one. Sonnet stays defined and is
+      # selectable per conversation in the console, so nothing is lost by defaulting to haiku.
+      [models.claude-haiku-4-5]
+      provider = "anthropic"
+      model = "claude-haiku-4-5-20251001"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+
+      # The heavyweight, offered but never the default: selectable per conversation for work that
+      # actually needs it. Same 200000 window as the other two.
+      [models.claude-opus-5]
+      provider = "anthropic"
+      model = "claude-opus-5"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+{{- if and (ne $model "claude-sonnet-5") (ne $model "claude-haiku-4-5") (ne $model "claude-opus-5") }}
+
+      # defaultModel names neither entry above, so it is defined here rather than left dangling:
+      # [model] default pointing at an undefined alias is the empty-registry failure again.
+      [models.{{ $model }}]
+      provider = "anthropic"
+      model = "{{ $model }}"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+{{- end }}
+
+      [model]
+      default = "{{ $model }}"
+{{- /*
+  Only when a key was supplied. Without one the sealed turnstone-secrets carries no anthropicApiKey
+  property, the ExternalSecret sits in SecretSyncedError with Ready=False, and helm 4's --wait
+  (kstatus: a CR with a Ready condition must be True) blocks the core turnstone-artifacts release
+  for its whole 1200s timeout, then rolls back and the operator retries -- the install never
+  completes. Seen live 2026-09-04 on the first key-less install. The Deployment's env already
+  marks this secretKeyRef optional, so the pod starts either way; only chat needs the key.
+*/}}
+{{- if $t | get "anthropicApiKey" "" }}
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: turnstone-anthropic-key
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: turnstone-anthropic-key
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          ANTHROPIC_API_KEY: '{{ "{{ .anthropicApiKey | toString }}" }}'
+    data:
+      - secretKey: anthropicApiKey
+        remoteRef:
+          key: turnstone-secrets
+          property: anthropicApiKey
+{{- end }}
+{{- /*
+  Regenerated per process start when unset, which would log every user out on restart, and
+  Turnstone refuses anything shorter than 32 characters. The chart reads the key name
+  TURNSTONE_JWT_SECRET verbatim out of this secret, so the template must use exactly that name.
+*/}}
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: turnstone-jwt-secret
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: turnstone-jwt-secret
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          TURNSTONE_JWT_SECRET: '{{ "{{ .jwtSecret | toString }}" }}'
+    data:
+      - secretKey: jwtSecret
+        remoteRef:
+          key: turnstone-secrets
+          property: jwtSecret
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: turnstone-oidc-secret
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: turnstone-oidc-secret
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          clientSecret: '{{ "{{ .clientSecret | toString }}" }}'
+    data:
+      - secretKey: clientSecret
+        remoteRef:
+          key: {{ $v._derived.oidcClientSecretKey }}
+          property: {{ $v._derived.oidcClientSecretProperty }}
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: turnstone-admin-credentials
+  spec:
+    refreshInterval: 5m
+    secretStoreRef:
+      name: core-secrets-store
+      kind: ClusterSecretStore
+    target:
+      name: turnstone-admin-credentials
+      creationPolicy: Owner
+      template:
+        type: Opaque
+        data:
+          username: {{ $t.adminUsername }}
+          password: '{{ "{{ .adminPassword | toString }}" }}'
+    data:
+      - secretKey: adminPassword
+        remoteRef:
+          key: turnstone-secrets
+          property: adminPassword
+{{- if $v._derived.untrustedCA }}
+{{- /*
+  Each app that needs the platform CA creates this secret in its own namespace -- nothing copies
+  it around, and mounting a secret that does not exist leaves the pod in ContainerCreating forever
+  with nothing in the app's own logs. values/gitea/gitea-raw.gotmpl does the same.
+
+  Unlike gitea and vikunja this is NOT mounted over /etc/ssl/certs/ca-certificates.crt: an
+  initContainer concatenates it onto the image's bundle instead, because Turnstone must also reach
+  api.anthropic.com. See values/turnstone/turnstone.gotmpl.
+*/}}
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: custom-ca
+  data:
+    ca-certificates.crt: {{ $v._derived.caCert | b64enc }}
+{{- end }}
+{{- /*
+  Turnstone refuses OIDC login entirely while it has no users -- handle_oidc_authorize returns 403
+  "Initial setup required before OIDC login" when count_users() == 0 -- so SSO cannot bootstrap
+  itself and this Job is required, not optional. It also gives the platform a local service
+  account for machine access, the same posture Argo CD takes with admin.enabled.
+
+  Same four objects as the gitea-backup CronJob in values/gitea/gitea-raw.gotmpl, as a Job because
+  this only has to happen once.
+*/}}
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: turnstone-bootstrap
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: turnstone-bootstrap
+  rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # list+watch, not just get: the wait-for-turnstone init container uses `kubectl wait`,
+    # which watches the Deployment rather than polling it.
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: RoleBinding
+  metadata:
+    name: turnstone-bootstrap
+  subjects:
+  - kind: ServiceAccount
+    name: turnstone-bootstrap
+  roleRef:
+    kind: Role
+    name: turnstone-bootstrap
+    apiGroup: rbac.authorization.k8s.io
+- apiVersion: batch/v1
+  kind: Job
+  metadata:
+    name: turnstone-bootstrap-admin
+  spec:
+    # backoffLimit is a backstop only; the wait-for init container below is the real ordering
+    # gate. It covers the cases the gate cannot -- the pod going away between the wait succeeding
+    # and the exec landing.
+    backoffLimit: 30
+    template:
+      metadata:
+        annotations:
+          sidecar.istio.io/inject: "false"
+      spec:
+        serviceAccountName: turnstone-bootstrap
+        restartPolicy: OnFailure
+        {{- /*
+          Without this gate the Job races the console Deployment, and every attempt until the
+          console is up dies with `unable to upgrade connection: container not found`. Spending
+          the retry budget on a *predictable* wait is what makes it unsafe: once the budget is
+          gone the Job fails permanently, the admin user is never created, and OIDC login then
+          fails with a 403 that reads like a Keycloak problem rather than an ordering one.
+
+          `kubectl wait` needs no shell, which matters because registry.k8s.io/kubectl is
+          distroless. Same shape as oauth2-proxy's wait-for-keycloak init container.
+        */}}
+        initContainers:
+          {{- /*
+            `kubectl wait --for=condition=Available` honours --timeout only if the object EXISTS.
+            Against a missing one it returns NotFound immediately, so the gate below does not wait
+            at all during the window before Argo CD has created the Deployment -- it fails fast and
+            spends a retry. Measured on a clean install: 5 instant failures, escalating the Job into
+            a multi-minute Init:CrashLoopBackOff that was still backing off well after the console
+            went Ready. It recovered only because backoffLimit is 30.
+
+            --for=create is the half that waits for existence (kubectl >= 1.31; the pinned image is
+            v1.34.1). Two containers rather than one because the image is distroless: there is no
+            shell to sequence them in. The Role above already grants list/watch, which both need.
+          */}}
+          - image: {{ $kubectlImage }}
+            name: wait-for-turnstone-created
+            command:
+              - kubectl
+              - wait
+              - deployments/turnstone-console
+              - --for=create
+              - --timeout=15m
+            resources:
+              limits:
+                cpu: 250m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+          - image: {{ $kubectlImage }}
+            name: wait-for-turnstone
+            command:
+              - kubectl
+              - wait
+              - deployments/turnstone-console
+              - --for=condition=Available
+              - --timeout=15m
+            resources:
+              limits:
+                cpu: 250m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+          {{- /*
+            Seed the role that team admins map to. It has to exist before anyone signs in:
+            apply_role_mapping resolves a mapped value through storage.get_role(role_id) and
+            silently drops it when the role is missing, so a team admin would fall back to
+            builtin-operator with no error anywhere.
+
+            Why SQL and not the API. Turnstone ships a Python SDK with full role CRUD
+            (turnstone/sdk/console.py), and turnstone-admin can mint a token for it -- but
+            create_role POSTs to /v1/api/admin/roles and the SERVER mints role_id as a random
+            uuid4. apply_role_mapping matches on that primary key only (there is a
+            get_role_by_name in the storage layer, but the OIDC path never calls it), so a
+            UUID-keyed role cannot be named in TURNSTONE_OIDC_ROLE_MAP -- which helm renders
+            before the role exists. A fixed role_id is the only thing that closes that loop.
+            Upstream fix worth filing: fall back to get_role_by_name, and this step disappears.
+
+            `roles` has a UNIQUE constraint on `name` as well as the role_id primary key, so a
+            stray non-builtin row holding the name is cleared first; otherwise the insert fails
+            on roles_name_key rather than reaching the ON CONFLICT. Never touches builtin rows.
+          */}}
+          - image: {{ $kubectlImage }}
+            name: seed-team-lead-role
+            command:
+              - kubectl
+              - exec
+              - deployments/turnstone-console
+              - '--'
+              - python
+              - -c
+              - |
+                import os, datetime, sqlalchemy as sa
+
+                ROLE_ID = "apl-team-lead"
+                PERMS = (
+                    "read,write,conversation.modify,"
+                    "workstreams.create,workstreams.close,"
+                    "project.create,project.read,project.write,project.delete,"
+                    # "approve" is the SCOPE the approval endpoint gates on, and it is NOT implied by
+                    # "tools.approve". Turnstone derives scopes in core/auth.py:_permissions_to_scopes, which
+                    # only promotes a permission literally named read/write/approve, or any admin.* one --
+                    # "tools.approve" matches neither and contributes nothing. Without the bare "approve" a team
+                    # admin sees the approval prompt, clicks it, and the POST to .../workstreams/<id>/approve
+                    # returns 403 with nothing surfaced in the UI: the tool call never runs and the conversation
+                    # hangs. Verified live 2026-08-29 on Turnstone 1.8.1.
+                    "persona.read,tools.approve,approve"
+                )
+                now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                engine = sa.create_engine(os.environ["TURNSTONE_DB_URL"])
+                with engine.begin() as conn:
+                    conn.execute(
+                        sa.text(
+                            "delete from roles where name = :rid and role_id <> :rid"
+                            " and builtin = 0"
+                        ),
+                        {"rid": ROLE_ID},
+                    )
+                    conn.execute(
+                        sa.text(
+                            "insert into roles"
+                            " (role_id, name, display_name, permissions, builtin, org_id,"
+                            "  created, updated)"
+                            " values (:rid, :rid, :dn, :p, 0, '', :now, :now)"
+                            " on conflict (role_id) do update set"
+                            "  permissions = excluded.permissions,"
+                            "  display_name = excluded.display_name,"
+                            "  updated = excluded.updated"
+                        ),
+                        {"rid": ROLE_ID, "dn": "Team Lead", "p": PERMS, "now": now},
+                    )
+                print("seeded role", ROLE_ID, flush=True)
+            resources:
+              limits:
+                cpu: 250m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+        containers:
+          - image: {{ $kubectlImage }}
+            name: kubectl
+            {{- /*
+              The turnstone image is Debian-based and does have a shell, unlike vikunja/vikunja --
+              but exec'ing the binary directly still avoids all shell quoting concerns, and the
+              kubelet's own $(VAR) expansion over `env` keeps the credentials out of this template.
+
+              `turnstone-admin create-admin` creates the user or promotes an existing one, so
+              re-running is safe. It needs the database, which is why it runs inside the console
+              pod rather than as a standalone container: that pod already has TURNSTONE_DB_URL.
+            */}}
+            env:
+              - name: ADMIN_USERNAME
+                valueFrom:
+                  secretKeyRef:
+                    name: turnstone-admin-credentials
+                    key: username
+              - name: ADMIN_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: turnstone-admin-credentials
+                    key: password
+            command:
+              - kubectl
+              - exec
+              - deployments/turnstone-console
+              - '--'
+              - turnstone-admin
+              - create-admin
+              - --username
+              - $(ADMIN_USERNAME)
+              - --name
+              - App Platform admin
+              - --password
+              - $(ADMIN_PASSWORD)
+            resources:
+              limits:
+                cpu: 250m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+            securityContext:
+              runAsNonRoot: true
+              runAsUser: 65535
+              runAsGroup: 65535
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                  - ALL
+        securityContext:
+          fsGroup: 65535
