@@ -1,0 +1,23 @@
+{{- $v := .Values }}
+
+global:
+  security:
+    allowInsecureImages: true
+  {{- with $v.cluster | get "defaultStorageClass" nil }}
+  defaultStorageClass: {{ . | quote }}
+  {{- end }}
+
+image:
+{{- if $v.otomi.linodeLkeImageRepository }}
+  registry: "{{ $v.otomi.linodeLkeImageRepository }}"
+  repository: docker/valkey/valkey
+{{- else }}
+  registry: docker.io
+  repository: valkey/valkey
+{{- end }}
+  tag: 8.1.3
+
+auth:
+  password: changeme
+
+architecture: standalone
