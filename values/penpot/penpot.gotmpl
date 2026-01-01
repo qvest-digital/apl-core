@@ -1,0 +1,125 @@
+{{- $v := .Values }}
+{{- $k := $v.apps.penpot }}
+{{- $penpotDomain := $v._derived.penpotDomain }}
+{{- $oidcTokenUrlBackchannel := printf "%s/protocol/openid-connect/token" $v._derived.oidcBaseUrlBackchannel }}
+{{- $oidcUserInfoUrlBackchannel := printf "%s/protocol/openid-connect/userinfo" $v._derived.oidcBaseUrlBackchannel }}
+
+{{- with $v.otomi | get "globalPullSecret" nil }}
+global:
+  imagePullSecrets:
+    - name: otomi-pullsecret-global
+{{- end }}
+
+config:
+  publicUri: "https://{{ $penpotDomain }}"
+  # Team-sync is out of scope for this integration (PENPOT.md Phase 4) -- users get their
+  # personal "Personal Projects" team automatically on first OIDC login. Unlike Vikunja/Gitea,
+  # Penpot has no local-admin/service-account bootstrap need at all, so local password auth is
+  # simply switched off rather than kept alongside SSO.
+  flags: "enable-login-with-oidc enable-oidc-registration disable-login-with-password"
+
+  existingSecret: penpot-secret-key
+  secretKeys:
+    apiSecretKey: secret
+
+  telemetryEnabled: false
+
+  postgresql:
+    host: penpot-db-rw.penpot.svc.cluster.local
+    port: 5432
+    database: penpot
+    existingSecret: penpot-db-secret
+    secretKeys:
+      usernameKey: username
+      passwordKey: password
+
+  redis:
+    host: penpot-valkey-headless.penpot.svc.cluster.local
+    port: 6379
+    database: "0"
+    existingSecret: penpot-redis-secret
+    secretKeys:
+      redisUriKey: uri
+
+  objectsStorage:
+    storageBackend: fs
+    filesystem:
+      directory: /opt/data/assets
+
+  providers:
+    oidc:
+      enabled: true
+      # Discovery/token/userinfo go over the internal, plain-HTTP Keycloak address -- the same
+      # backchannel derived value values/kubernetes-gateways/kubernetes-gateways-raw.gotmpl already
+      # uses for oauth2-proxy's jwksUri -- so there is no TLS, and therefore no CA-trust question,
+      # for the backend's JVM at all. Only authURI (the browser redirect) needs the public host.
+      # Verified live against the lab's Keycloak: "provider initialized" logs clean, no JWKS
+      # warning, no SSRF rejection -- see PENPOT.md Phase 0 for the full trace, including why
+      # PENPOT_SSRF_ALLOWED_HOSTS below is not optional.
+      baseURI: {{ $v._derived.oidcBaseUrlBackchannel | quote }}
+      clientID: {{ $v._derived.oidcClientID | quote }}
+      authURI: {{ $v._derived.oidcAuthUrl | quote }}
+      tokenURI: {{ $oidcTokenUrlBackchannel | quote }}
+      userURI: {{ $oidcUserInfoUrlBackchannel | quote }}
+      # Empty disables role-gating entirely -- the chart's own default "designer developer" is a
+      # placeholder value, not a restriction we want.
+      roles: ""
+      scopes: {{ $v._derived.oidcScopes | join " " | quote }}
+    existingSecret: penpot-oidc-secret
+    secretKeys:
+      oidcClientSecretKey: clientSecret
+
+  extraEnvs:
+    # Neither has a typed chart value -- see PENPOT.md Phase 0.
+    - name: PENPOT_OIDC_JWKS_URI
+      value: {{ $v._derived.oidcJwksUrlBackchannel | quote }}
+    - name: PENPOT_SSRF_ALLOWED_HOSTS
+      # Bare hostname, no scheme/port -- confirmed against ssrf.clj live. Without this the JWKS
+      # fetch above is silently rejected: pod stays Ready, one WARN line in the log, nothing
+      # visibly broken until someone actually tries to log in. Must match the host in
+      # $v._derived.oidcBaseUrlBackchannel byte for byte -- that derived value hardcodes the
+      # short form (no ".svc.cluster.local"), and a mismatch here is silent: same SSRF
+      # rejection, confirmed live 2026-09-23 with the FQDN form instead of this one.
+      value: "keycloak-keycloakx-http.keycloak"
+
+backend:
+  image:
+    {{- if $v.otomi.linodeLkeImageRepository }}
+    repository: "{{ $v.otomi.linodeLkeImageRepository }}/docker/penpotapp/backend"
+    {{- else }}
+    repository: penpotapp/backend
+    {{- end }}
+    tag: "2.17.2"
+  resources: {{- $k.resources.backend | toYaml | nindent 4 }}
+
+frontend:
+  image:
+    {{- if $v.otomi.linodeLkeImageRepository }}
+    repository: "{{ $v.otomi.linodeLkeImageRepository }}/docker/penpotapp/frontend"
+    {{- else }}
+    repository: penpotapp/frontend
+    {{- end }}
+    tag: "2.17.2"
+  resources: {{- $k.resources.frontend | toYaml | nindent 4 }}
+
+exporter:
+  image:
+    {{- if $v.otomi.linodeLkeImageRepository }}
+    repository: "{{ $v.otomi.linodeLkeImageRepository }}/docker/penpotapp/exporter"
+    {{- else }}
+    repository: penpotapp/exporter
+    {{- end }}
+    tag: "2.17.2"
+  resources: {{- $k.resources.exporter | toYaml | nindent 4 }}
+
+# mcp stays off: the chart gates its Deployment purely on "enable-mcp" being present in
+# config.flags (templates/_helpers.tpl's penpot.mcpEnabled), which it isn't above. Out of scope
+# for this integration, see PENPOT.md.
+
+persistence:
+  assets:
+    enabled: true
+    size: {{ $k.persistence.size }}
+    {{- with $v.cluster.defaultStorageClass }}
+    storageClass: {{ . }}
+    {{- end }}

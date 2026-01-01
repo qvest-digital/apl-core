@@ -1,0 +1,16 @@
+kind: AplDatabase
+metadata:
+    name: penpot
+spec:
+    externalClusters: []
+    recovery: {}
+    replicas: 2
+    resources:
+        limits: {cpu: 200m, memory: 192Mi}
+        requests: {cpu: 200m, memory: 192Mi}
+    size: 5Gi
+    # storageClass is deliberately NOT set here -- same reasoning as
+    # tests/fixtures/env/databases/vikunja.yaml. values/penpot/penpot-otomi-db.gotmpl reads
+    # $vdb.storageClass unguarded; the only thing that supplies it is the per-database block in
+    # helmfile.d/snippets/defaults.gotmpl. Setting it here would mask a database missing from that
+    # list instead of testing the path production actually uses.
