@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "turnstone.fullname" . }}-config
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+data:
+  TURNSTONE_DB_BACKEND: {{ .Values.database.backend | quote }}
+  TURNSTONE_DB_HOST: {{ include "turnstone.postgresql.host" . | quote }}
+  TURNSTONE_DB_PORT: {{ include "turnstone.postgresql.port" . | quote }}
+  TURNSTONE_DB_NAME: {{ include "turnstone.postgresql.database" . | quote }}
+  TURNSTONE_DB_USER: {{ include "turnstone.postgresql.username" . | quote }}
+  TURNSTONE_SERVER_HOST: "0.0.0.0"
+  TURNSTONE_SERVER_PORT: {{ .Values.server.service.port | quote }}
+  TURNSTONE_CONSOLE_HOST: "0.0.0.0"
+  TURNSTONE_CONSOLE_PORT: {{ .Values.console.service.port | quote }}
+  TURNSTONE_POLL_INTERVAL: "5"
+  {{- /*
+    Hardcoded, not operator-configurable. Anthropic's native tool-search (deferred loading via a
+    server-side tool_search_tool_bm25 tool) auto-activates once tool count exceeds
+    tools.search_threshold (default 20, tools.search default "auto") -- MCP catalogs across
+    gitea-mcp + vikunja-mcp alone already exceed that (54 + 9 = 63 tools). Turnstone has a real
+    bug in how it persists/resumes that server-side tool's tool_use/tool_result pairing across a
+    session resume: verified live, every resumed chat 400'd with `messages.1:
+    tool_search_tool_bm25 tool use ... was found without a corresponding
+    tool_search_tool_bm25_tool_result block`. Forcing tools.search off avoids the feature (and the
+    bug) entirely -- all tools are sent directly every turn instead, at higher per-turn token cost
+    but no crash. _seed_config_from_env (turnstone/console/server.py) only seeds a setting on
+    FIRST boot if it isn't already stored in the DB, so this env var has no effect on an
+    already-running instance.
+
+    Deliberately set here rather than as an operator-generated extraEnv entry -- see
+    values/turnstone/turnstone.gotmpl for why that broke the install.
+  */}}
+  TURNSTONE_TOOLS_SEARCH: "off"
+  {{- /*
+    Seed tools.allow_private_network on first boot. web_fetch / open_preview refuse
+    private-network addresses by default; on this lab every service an agent must reach
+    (Gitea, Vikunja, a team's own app) IS a private-network address, so the default makes
+    those tools useless here. Same first-boot-only mechanism as TURNSTONE_TOOLS_SEARCH above:
+    _seed_config_from_env (turnstone/console/server.py) maps TURNSTONE_{SECTION}_{KEY} to the
+    settings-registry key (here tools.allow_private_network) and writes it ONLY if the setting
+    is not already stored in the DB -- so this has no effect on an already-running instance, and
+    a later change in the Console's Settings -> Tools wins over it. A public site that redirects
+    INTO the private network is still refused; cloud-metadata, link-local, multicast and reserved
+    addresses stay refused even with this on. This is the [tools] setting, distinct from the
+    already-set [oidc] TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK, which only governs a private IdP.
+  */}}
+  TURNSTONE_TOOLS_ALLOW_PRIVATE_NETWORK: "true"
+  {{- if .Values.llm.baseUrl }}
+  TURNSTONE_LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}
+  {{- end }}
+  TURNSTONE_LLM_PROVIDER: {{ .Values.llm.provider | quote }}
