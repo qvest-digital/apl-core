@@ -11,16 +11,45 @@
 # below is written generically as `task` in comments/output but works identically either way.
 #
 # Quick start:
-#   task setup                        # everything, defaults on (gitea/harbor/tekton/vikunja/turnstone)
+#   task setup                        # interactive: prompts, one yes/no per optional app, with
+#                                      # a suggested default -- Enter/Enter/... reproduces this
+#                                      # fork's historic defaults (gitea/harbor/tekton/vikunja/
+#                                      # turnstone on, everything else off)
 #   ANTHROPIC_API_KEY=sk-ant-... task setup
-#   task setup TURNSTONE_ENABLED=false
+#   task setup TURNSTONE_ENABLED=false          # answers that one prompt for you, still interactive
+#   NONINTERACTIVE=true task setup              # no prompts at all -- see install:prompt below
 #   task down CONFIRM=yes             # destructive: deletes the kind cluster
 #
-# State that has to survive across tasks (the MetalLB pool, the derived APPS_REVISION) is written
-# to .taskfiles/state/ (gitignored) rather than threaded through Task's own var system, because
-# it's computed by one task and consumed by several later ones run as separate `task` invocations.
+# Interactive app selection: `install:prompt` (run first by `setup`, before cluster:create) asks
+# one Y/n or y/N question per optional app -- see that task in .taskfiles/install.yml for the
+# full list, defaults, and the reasoning for which apps aren't offered at all (git-server,
+# metrics-server: required by this lab regardless; promtail: has no working on/off switch in
+# this platform today). Every *_ENABLED var can still be passed on the CLI/env to skip its
+# prompt outright (`task setup KYVERNO_ENABLED=true`), interactive or not. Prompting itself is
+# skipped entirely -- falling back to each var's existing non-interactive default -- when stdin
+# isn't a terminal or NONINTERACTIVE=true is set, so CI and scripted invocations are unaffected.
+# A "no" here is never a dead end: any app can be switched on later from the Console (or a commit
+# to the values repo) once the platform is up -- see SETUP.md's "Changing values after install"
+# and CLAUDE.md rule 6.
+#
+# State that has to survive across tasks (the MetalLB pool, the derived APPS_REVISION, the
+# resolved app-toggle answers) is written to .taskfiles/state/ (gitignored) rather than threaded
+# through Task's own var system, because it's computed by one task and consumed by several later
+# ones run as separate `task` invocations.
+#
+# Output: quiet by default -- one "> doing X ... OK (Ns)" line per step, with each step's raw
+# output captured to .taskfiles/state/logs/<step>.log and the last 40 lines of it printed inline
+# if the step fails. `VERBOSE=true task setup` (or `task setup VERBOSE=true`) suppresses nothing
+# and streams every command live. See .taskfiles/lib.sh for the whole contract.
 
 version: '3'
+
+# Task's own `task: [x] <command>` echo is itself a large share of the noise this Taskfile used
+# to produce -- especially for the multi-line script blocks, which it prints in full. The status
+# lines from .taskfiles/lib.sh replace it in both modes. To see what a task would run without
+# executing it, `silent: true` alone hides the dry-run preview too -- pass go-task's own -v/
+# --verbose flag to get it back: `go-task -v <task> --dry`.
+silent: true
 
 vars:
   CLUSTER_NAME: apl
@@ -42,18 +71,59 @@ vars:
   APPS_REPO_URL: https://github.com/qvest-digital/apl-core.git
   API_CLONE_DIR: /tmp/apl-api-taskfile
   CONSOLE_CLONE_DIR: /tmp/apl-console-taskfile
+  # Sourced by every task that runs something noisy. Absolute, via .ROOT_DIR, so it resolves the
+  # same from an included taskfile or a task invoked from a subdirectory.
+  LIB: '{{.ROOT_DIR}}/.taskfiles/lib.sh'
 
 # Read as OS env vars by every task's shell scripts (rather than Go-template vars) so the same
 # `${GITEA_ENABLED:-true}`-style shell default works whether the value came from the CLI
-# (`task setup GITEA_ENABLED=false`), a real env var, or neither. The `| default` here only
-# supplies what a *CLI var* would otherwise leave undefined -- it's the standard Task idiom for
-# "optional CLI var with a fallback".
+# (`task setup GITEA_ENABLED=false`), a real env var, or neither.
+#
+# The *_ENABLED toggles below are deliberately NOT given a `| default "true"`/`"false"` here, the
+# way VERBOSE is. That default used to be baked in at exactly this layer for the original 5
+# (`| default "true"`) -- but that makes "the user didn't pass this flag" and "the user passed
+# it as true" indistinguishable downstream, which install:prompt needs to tell apart: it must
+# skip prompting for (and never overwrite) any var the user *did* pass, interactive or not.
+# So this layer only does what Task's CLI-var plumbing requires (turn a possibly-undefined CLI
+# var into a defined-but-possibly-empty OS env var) and pushes the actual "not yet decided"
+# default down to where the decision is actually made: install:prompt (interactive) or
+# install:values (non-interactive), both in .taskfiles/install.yml. An unset/unpassed var
+# reaches those shells as an empty string, which both treat as "not yet decided" -- never as
+# false.
 env:
-  GITEA_ENABLED: '{{.GITEA_ENABLED | default "true"}}'
-  HARBOR_ENABLED: '{{.HARBOR_ENABLED | default "true"}}'
-  TEKTON_ENABLED: '{{.TEKTON_ENABLED | default "true"}}'
-  VIKUNJA_ENABLED: '{{.VIKUNJA_ENABLED | default "true"}}'
-  TURNSTONE_ENABLED: '{{.TURNSTONE_ENABLED | default "true"}}'
+  # Same idiom as before: `VERBOSE=true task setup`, `task setup VERBOSE=true` and an exported
+  # VERBOSE all reach the shells as ${VERBOSE:-false}. VERBOSE has no "ask the user" mode, so it
+  # keeps its old always-materialize-a-default form.
+  VERBOSE: '{{.VERBOSE | default "false"}}'
+  # Defaults on in this fork (see install:prompt for the "yes" suggestion, install:values for the
+  # non-interactive fallback -- both still resolve to true if this reaches them empty).
+  GITEA_ENABLED: '{{.GITEA_ENABLED}}'
+  HARBOR_ENABLED: '{{.HARBOR_ENABLED}}'
+  TEKTON_ENABLED: '{{.TEKTON_ENABLED}}'
+  VIKUNJA_ENABLED: '{{.VIKUNJA_ENABLED}}'
+  TURNSTONE_ENABLED: '{{.TURNSTONE_ENABLED}}'
+  # Off by default in this fork (including prometheus, despite upstream defaulting it on).
+  ALERTMANAGER_ENABLED: '{{.ALERTMANAGER_ENABLED}}'
+  GRAFANA_ENABLED: '{{.GRAFANA_ENABLED}}'
+  KNATIVE_ENABLED: '{{.KNATIVE_ENABLED}}'
+  KSERVE_ENABLED: '{{.KSERVE_ENABLED}}'
+  KUBEFLOW_PIPELINES_ENABLED: '{{.KUBEFLOW_PIPELINES_ENABLED}}'
+  KYVERNO_ENABLED: '{{.KYVERNO_ENABLED}}'
+  LINODE_CFW_ENABLED: '{{.LINODE_CFW_ENABLED}}'
+  LOKI_ENABLED: '{{.LOKI_ENABLED}}'
+  OTEL_ENABLED: '{{.OTEL_ENABLED}}'
+  POLICY_REPORTER_ENABLED: '{{.POLICY_REPORTER_ENABLED}}'
+  PROMETHEUS_ENABLED: '{{.PROMETHEUS_ENABLED}}'
+  RABBITMQ_ENABLED: '{{.RABBITMQ_ENABLED}}'
+  TRIVY_ENABLED: '{{.TRIVY_ENABLED}}'
+  # git-server and metrics-server are NOT exposed as toggles at all -- see install:prompt's
+  # header comment for why (git-server: this lab's GitOps values repo has nowhere else to live;
+  # metrics-server: HPAs this fork's own values.yaml configures would sit permanently
+  # ScalingActive=False, which Argo CD's own HPA health check reads as Degraded, hanging
+  # install:watch-argocd's Synced+Healthy wait). promtail is not listed at all -- confirmed
+  # during this work to have no `installed:` gate anywhere in helmfile.d, and no chart wires
+  # apps.promtail.enabled to anything, so as of this fork's current state it is a dead value
+  # with no effect either way, not a real toggle.
 
 includes:
   cluster: .taskfiles/cluster.yml
@@ -64,13 +134,24 @@ includes:
 tasks:
   default:
     desc: List all available tasks
-    silent: true
     cmds:
-      - task --list
+      # .TASK_EXE, not a literal `task` -- on Arch/CachyOS `task` is Taskwarrior and this printed
+      # "No matches." from an unrelated program and exited 1.
+      - '{{.TASK_EXE}} --list'
 
   setup:
     desc: "Full end-to-end lab setup -- equivalent to SETUP.md's Quickstart, ~15 minutes"
     cmds:
+      - |
+        . "{{.LIB}}"
+        apl_header "App Platform local lab -- full setup (~15 min)"
+        if apl_verbose; then
+          apl_info "VERBOSE=true -- every command streams live, nothing is captured."
+        else
+          apl_info "quiet mode -- per-step output goes to $APL_LOG_DIR/<step>.log"
+          apl_info "re-run with VERBOSE=true to stream everything live instead."
+        fi
+      - task: install:prompt
       - task: cluster:create
       - task: cluster:metallb
       - task: cluster:cni
@@ -84,13 +165,15 @@ tasks:
       - task: install:watch-argocd
       - task: install:trust-ca
       - task: install:credentials
-      - task: verify:platform
       - cmd: |
+          . "{{.LIB}}"
+          apl_header "setup complete"
           echo
-          echo "=== setup complete ==="
-          echo "Credentials: $(pwd)/passwords.txt"
-          echo "Run 'task verify:vikunja' / 'task verify:turnstone' for the non-browser app checklists."
-          echo "Browser-only checks (SSO round-trip, tiles, an actual chat turn) are never scriptable -- see SETUP.md."
+          # The file keeps its provenance header; the terminal does not need it. Not `cat |
+          # grep` -- CLAUDE.md rule 2, and grep exits 1 on no match, which would fail the task.
+          grep -v '^#' passwords.txt || true
+          echo
+          apl_info "Per-step logs from this run: $APL_LOG_DIR/"
 
   down:
     desc: "Delete the kind cluster and local generated state (destructive; requires CONFIRM=yes)"
@@ -98,7 +181,17 @@ tasks:
       - sh: '[ "{{.CONFIRM}}" = "yes" ]'
         msg: "Refusing to delete anything without CONFIRM=yes -- this destroys the cluster and all in-cluster data. Run: task down CONFIRM=yes"
     cmds:
-      - kind delete cluster --name {{.CLUSTER_NAME}}
-      - rm -f passwords.txt values.yaml apl-root-ca.crt
-      - rm -rf {{.STATE_DIR}} /tmp/apl-ca.key /tmp/apl-ca.pkcs1.key /tmp/apl-ca.crt
-      - 'echo "Cluster deleted. Note: kind''s own docker network usually survives -- MetalLB pool may or may not change on next task cluster:create."'
+      - |
+        . "{{.LIB}}"
+        apl_header "Tearing down the lab"
+        del() { set -eu; kind delete cluster --name {{.CLUSTER_NAME}}; }
+        apl_run down-cluster "Deleting kind cluster {{.CLUSTER_NAME}}" del || exit $?
+        clean() {
+          set -eu
+          rm -f passwords.txt values.yaml apl-root-ca.crt
+          rm -rf {{.STATE_DIR}} /tmp/apl-ca.key /tmp/apl-ca.pkcs1.key /tmp/apl-ca.crt
+        }
+        apl_run down-state "Removing generated local state" clean || exit $?
+        apl_ok "Cluster deleted."
+        apl_info "kind's own docker network usually survives -- the MetalLB pool may or may not"
+        apl_info "change on the next 'task cluster:create'."

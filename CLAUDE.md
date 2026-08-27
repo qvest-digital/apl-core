@@ -48,13 +48,24 @@ not a manual walk through `SETUP.md`.** That was the point of building it: this 
 longer need an agent driving `kubectl`/`docker`/`helm` by hand, session after session, to come up
 the same way SETUP.md already proved works. Useful sub-tasks (see `task --list`):
 
-- `task setup` — everything, defaults on (gitea/harbor/tekton/vikunja/turnstone)
-- `ANTHROPIC_API_KEY=sk-ant-... task setup` — non-interactive, for Turnstone
-- `task setup TURNSTONE_ENABLED=false` (and the other `*_ENABLED` toggles)
+- `task setup` — interactive: asks Y/n per optional app (gitea/harbor/tekton/vikunja/turnstone
+  default yes, everything else — including prometheus — defaults no), Enter accepts the
+  suggestion. **As an agent, you almost never want the interactive prompts** — run
+  `NONINTERACTIVE=true task setup` instead so every `*_ENABLED` var falls back to its documented
+  default without blocking on a terminal read you cannot answer; this is also what CI should use.
+  (Passing any `*_ENABLED=` explicitly answers just that one app either way, interactive or not.)
+- `ANTHROPIC_API_KEY=sk-ant-... NONINTERACTIVE=true task setup` — fully unattended, for Turnstone
+- `task setup TURNSTONE_ENABLED=false` (and the other `*_ENABLED` toggles — see
+  `.taskfiles/install.yml`'s `prompt` task for the full list, including apps not offered at all:
+  git-server and metrics-server are always on, promtail has no working gate at all today)
 - `task verify:platform` / `task verify:vikunja` / `task verify:turnstone` — the non-browser
   checklists, safe to re-run any time against an already-up cluster
 - `task down CONFIRM=yes` — destructive, deletes the cluster; still needs the same confirmation
   care as any other destructive action in this file
+- Output is quiet by default (one status line per step, raw output captured to
+  `.taskfiles/state/logs/<step>.log`, last 40 lines printed inline on failure).
+  `VERBOSE=true task setup` (or `task setup VERBOSE=true`) streams every command live instead —
+  see `.taskfiles/lib.sh` for the whole contract.
 
 If `task setup` fails, don't fall back to re-deriving the fix from first principles — read the
 matching step in `SETUP.md` first (the Taskfile's comments cite the exact section), fix the
@@ -245,6 +256,18 @@ should have worked.
 **5. Derive environment-specific values, never copy them.** The MetalLB range comes from the live
 docker network every time. It has been `172.18.x` and `172.19.x` on the same machine across
 rebuilds. `cluster.domainSuffix` must agree with it.
+
+**6. Once install is `completed`, configuration lives in the git values repo — never hand-patch the
+live cluster to change it.** A raw `helm upgrade`, or patching the generated Secret/`ExternalSecret`
+directly, gets reverted by Argo CD's `selfHeal` (the operator Deployment) or by external-secrets
+(the Secret itself) within seconds, and repeated attempts have grown the values Secret past
+`RequestEntityTooLarge`, leaving the cluster unrecoverable. This applies any time you're touching
+this cluster, not just during initial setup — a live debugging session is exactly when the
+temptation to hand-patch something "just to test it" shows up. The supported way to change
+configuration on a running cluster is a commit to the git values repo (what the Console's own
+app-activation tiles do via `apl-api`); the operator's poll/reconcile loop picks it up with no
+restart needed. Full account, including the specific failure mode this generalizes from, in
+`SETUP.md`'s "Changing values after install" section.
 
 ## Traps that will cost you an hour each
 

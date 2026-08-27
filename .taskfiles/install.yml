@@ -1,21 +1,131 @@
 # Chart schema, CA, values.yaml, helm install, convergence watchers, post-install. SETUP.md
 # steps 6, 6b, 6c, 7, 8, 9.
+#
+# Output style: see .taskfiles/lib.sh. The two watch tasks are the exception to "capture it" --
+# a poll loop that prints nothing for 15 minutes is indistinguishable from a hang (CLAUDE.md
+# rule 1b), so their once-a-minute status lines always print. What changed there is only their
+# shape: a parsed one-liner instead of the raw status ConfigMap JSON blob. VERBOSE=true still
+# adds the raw blob back.
 version: '3'
+silent: true
 
 tasks:
+  prompt:
+    desc: "Interactively ask which optional apps to install; resolves *_ENABLED for install:values"
+    cmds:
+      # Not wrapped in apl_run: this is nothing but terminal I/O, and apl_run's job (capture
+      # noisy command output, show a spinner-like "... OK (Ns)") has nothing to do here.
+      - |
+        . "{{.LIB}}"
+        set -eu
+        mkdir -p {{.STATE_DIR}}
+        TOGGLES_FILE={{.STATE_DIR}}/app_toggles.env
+        : > "$TOGGLES_FILE"
+
+        INTERACTIVE=false
+        if [ -t 0 ] && [ "${NONINTERACTIVE:-false}" != "true" ]; then
+          INTERACTIVE=true
+        fi
+
+        apl_header "App selection"
+        if [ "$INTERACTIVE" = "true" ]; then
+          apl_info "Enter/Enter/... reproduces this fork's historic defaults (the 5 core apps on,"
+          apl_info "everything else off). Pass e.g. 'task setup KYVERNO_ENABLED=true' to answer"
+          apl_info "any one of these without being asked -- explicit answers are never prompted for."
+        elif [ "${NONINTERACTIVE:-false}" = "true" ]; then
+          apl_info "NONINTERACTIVE=true -- skipping all prompts, using *_ENABLED env vars/defaults."
+        else
+          apl_info "stdin is not a terminal -- skipping all prompts, using *_ENABLED env vars/defaults."
+        fi
+        # A "no" answer is never a dead end: any app can be switched on later from the Console
+        # (a commit to the values git repo), once the platform is up -- see SETUP.md's "Changing
+        # values after install" and CLAUDE.md rule 6. Not required for the platform to come up at
+        # all either way -- git-server and metrics-server -- so neither is offered here:
+        apl_info "(git-server and metrics-server are always installed -- required by this lab"
+        apl_info "regardless of any answer below; not offered as a choice.)"
+
+        # $1=VARNAME  $2=display label  $3=suggested default (yes|no)
+        # An already-set $VARNAME (CLI var or real env var -- Taskfile.yml's env: block passes
+        # both through as-is, empty only when genuinely neither was given) is an explicit user
+        # decision: never prompted for, never overwritten, just recorded as-is.
+        ask() {
+          _var=$1; _label=$2; _default=$3
+          eval "_current=\${$_var:-}"
+          if [ -n "$_current" ]; then
+            apl_skip "install $_label? -- explicit ${_var}=${_current}, not asking"
+          elif [ "$INTERACTIVE" = "true" ]; then
+            if [ "$_default" = "yes" ]; then _hint="Y/n"; else _hint="y/N"; fi
+            printf '   Install %s? [%s] ' "$_label" "$_hint"
+            read -r _ans || _ans=""
+            case "$_ans" in
+              "") _current=$_default ;;
+              y | Y | yes | YES | Yes) _current=yes ;;
+              n | N | no | NO | No) _current=no ;;
+              *)
+                apl_warn "unrecognized answer '$_ans' -- using suggested default ($_default)"
+                _current=$_default
+                ;;
+            esac
+          else
+            _current=$_default
+          fi
+          case "$_current" in
+            yes | true) _bool=true ;;
+            *) _bool=false ;;
+          esac
+          eval "$_var=$_bool"
+          echo "export $_var=$_bool" >> "$TOGGLES_FILE"
+        }
+
+        apl_section "Core apps (default: on, this fork's historic behavior)"
+        ask GITEA_ENABLED gitea yes
+        ask HARBOR_ENABLED harbor yes
+        ask TEKTON_ENABLED tekton yes
+        ask VIKUNJA_ENABLED vikunja yes
+        ask TURNSTONE_ENABLED turnstone yes
+
+        apl_section "Optional platform apps (default: off, including prometheus)"
+        ask ALERTMANAGER_ENABLED alertmanager no
+        ask GRAFANA_ENABLED grafana no
+        ask LOKI_ENABLED loki no
+        ask OTEL_ENABLED otel no
+        ask PROMETHEUS_ENABLED prometheus no
+        ask KNATIVE_ENABLED knative no
+        ask KSERVE_ENABLED kserve no
+        ask KUBEFLOW_PIPELINES_ENABLED kubeflow-pipelines no
+        ask KYVERNO_ENABLED kyverno no
+        # policy-reporter reports on PolicyReport CRs -- kyverno (or trivy) is what populates
+        # them, so enabling this alone deploys a working app with nothing to report on yet.
+        # Still asked independently, per-app, like everything else in this list.
+        ask POLICY_REPORTER_ENABLED policy-reporter no
+        ask LINODE_CFW_ENABLED linode-cfw no
+        ask RABBITMQ_ENABLED rabbitmq no
+        ask TRIVY_ENABLED trivy no
+
+        apl_section "Summary"
+        ON=$(grep '=true$' "$TOGGLES_FILE" | sed -e 's/^export //' -e 's/_ENABLED=true$//' | tr '\n' ' ')
+        OFF=$(grep '=false$' "$TOGGLES_FILE" | sed -e 's/^export //' -e 's/_ENABLED=false$//' | tr '\n' ' ')
+        apl_ok "installing: ${ON:-<none>}"
+        apl_info "not installing: ${OFF:-<none>}"
+        apl_info "(git-server, metrics-server also always installed -- see above)"
+
   schema:
     desc: "Generate chart/apl/values.schema.json (gitignored, generated -- not optional)"
     cmds:
-      # Without this Helm validates NOTHING, silently -- a missing domainSuffix becomes a
-      # confusing failure inside the operator instead of a named error at `helm template` time.
-      - bin/gen-chart-schema.sh {{.OPERATOR_IMAGE}}
+      - |
+        . "{{.LIB}}"
+        apl_header "Platform install"
+        # Without this Helm validates NOTHING, silently -- a missing domainSuffix becomes a
+        # confusing failure inside the operator instead of a named error at `helm template` time.
+        gen() { set -eu; bin/gen-chart-schema.sh {{.OPERATOR_IMAGE}}; }
+        apl_run schema "Generating chart/apl/values.schema.json" gen || exit $?
 
   ca:
     desc: "Generate the platform root CA with a subjectKeyIdentifier (required for Turnstone)"
     cmds:
-      - mkdir -p {{.STATE_DIR}}
       - |
-        set -euo pipefail
+        . "{{.LIB}}"
+        mkdir -p {{.STATE_DIR}}
         # The platform's own auto-generated root CA carries no subjectKeyIdentifier, so
         # cert-manager's leaves carry no authorityKeyIdentifier, and Python 3.13+'s
         # VERIFY_X509_STRICT refuses them with "Missing Authority Key Identifier" -- invisible to
@@ -24,36 +134,53 @@ tasks:
         # retrofit onto an already-bootstrapped cluster (customRootCAKey is an x-secret and would
         # win over the stale customRootCA read back from storedSecrets -- recreate the cluster
         # instead, see SETUP.md step 7).
-        openssl req -x509 -newkey rsa:4096 -nodes \
-          -keyout {{.STATE_DIR}}/apl-ca.key -out {{.STATE_DIR}}/apl-ca.crt \
-          -days 3650 -sha256 -subj "/C=NL/ST=Utrecht/L=Utrecht/O=Otomi/OU=Development" \
-          -addext "basicConstraints=critical,CA:TRUE" \
-          -addext "keyUsage=critical,digitalSignature,keyCertSign,cRLSign" \
-          -addext "subjectKeyIdentifier=hash"
-        openssl rsa -traditional -in {{.STATE_DIR}}/apl-ca.key -out {{.STATE_DIR}}/apl-ca.pkcs1.key
-        openssl x509 -in {{.STATE_DIR}}/apl-ca.crt -noout -text | grep -q 'Subject Key Identifier' \
-          || { echo "error: generated CA has no subjectKeyIdentifier -- Turnstone SSO will fail" >&2; exit 1; }
-        echo "CA generated with a subjectKeyIdentifier -- good"
+        ca() {
+          set -euo pipefail
+          openssl req -x509 -newkey rsa:4096 -nodes \
+            -keyout {{.STATE_DIR}}/apl-ca.key -out {{.STATE_DIR}}/apl-ca.crt \
+            -days 3650 -sha256 -subj "/C=NL/ST=Utrecht/L=Utrecht/O=Otomi/OU=Development" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,digitalSignature,keyCertSign,cRLSign" \
+            -addext "subjectKeyIdentifier=hash"
+          openssl rsa -traditional -in {{.STATE_DIR}}/apl-ca.key -out {{.STATE_DIR}}/apl-ca.pkcs1.key
+          openssl x509 -in {{.STATE_DIR}}/apl-ca.crt -noout -text | grep -q 'Subject Key Identifier' \
+            || { echo "error: generated CA has no subjectKeyIdentifier -- Turnstone SSO will fail" >&2; exit 1; }
+        }
+        apl_run ca "Generating the platform root CA (4096-bit, with a subjectKeyIdentifier)" ca || exit $?
+        apl_ok "CA carries a subjectKeyIdentifier -- Turnstone's Python TLS stack will accept it"
 
   values:
     desc: "Assemble values.yaml (CA + Anthropic key + app toggles), then validate it renders"
     cmds:
+      # Not wrapped in apl_run: this block may prompt on the terminal for the Anthropic key, and
+      # it prints its own diagnostics. Capturing it would hide the prompt.
       - |
+        . "{{.LIB}}"
         set -euo pipefail
-        [ -f {{.STATE_DIR}}/pool_start.txt ] || { echo "error: run 'task cluster:metallb' first" >&2; exit 1; }
-        [ -f {{.STATE_DIR}}/apl-ca.crt ] || { echo "error: run 'task install:ca' first" >&2; exit 1; }
+        [ -f {{.STATE_DIR}}/pool_start.txt ] || { apl_fail "run 'task cluster:metallb' first"; exit 1; }
+        [ -f {{.STATE_DIR}}/apl-ca.crt ] || { apl_fail "run 'task install:ca' first"; exit 1; }
         POOL_START=$(cat {{.STATE_DIR}}/pool_start.txt)
 
+        # install:prompt (run earlier in `task setup`) resolved every *_ENABLED var to a concrete
+        # true/false and recorded it here, since a `task:` reference is its own shell -- nothing
+        # exported there survives into this one. Sourced if present; if this task is instead run
+        # standalone (e.g. `task install:values` against an already-answered/CI setup), each
+        # ${X_ENABLED:-<default>} below falls back to whatever the process env already carries,
+        # same as before install:prompt existed.
+        if [ -f {{.STATE_DIR}}/app_toggles.env ]; then
+          . {{.STATE_DIR}}/app_toggles.env
+        fi
+
         ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
-        if [ "$TURNSTONE_ENABLED" = "true" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+        if [ "${TURNSTONE_ENABLED:-true}" = "true" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
           if [ -t 0 ]; then
             read -rsp 'Anthropic API key (sk-ant-...): ' ANTHROPIC_API_KEY; echo
           fi
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "error: TURNSTONE_ENABLED=true but no Anthropic API key available (env var unset, and" >&2
-            echo "either not interactive or left blank). Either export ANTHROPIC_API_KEY=sk-ant-... or" >&2
-            echo "run with TURNSTONE_ENABLED=false -- the install would otherwise complete but both" >&2
-            echo "Turnstone pods would sit in CreateContainerConfigError forever." >&2
+            apl_fail "TURNSTONE_ENABLED=true but no Anthropic API key available (env var unset, and"
+            apl_fail "either not interactive or left blank). Either export ANTHROPIC_API_KEY=sk-ant-... or"
+            apl_fail "run with TURNSTONE_ENABLED=false -- the install would otherwise complete but both"
+            apl_fail "Turnstone pods would sit in CreateContainerConfigError forever."
             exit 1
           fi
         fi
@@ -85,13 +212,20 @@ tasks:
           platformClass:
             gateway: {replicas: 1, autoscaling: {minReplicas: 1}}
         apps:
+          # git-server is left at its chart default (enabled: true) -- not one of the toggles
+          # below. This lab's GitOps values repo (the one the operator polls) lives there; there
+          # is nowhere else for it to live in this setup, so it's never offered as a choice.
           argocd:
             autoscaling: {repoServer: {minReplicas: 1}}
           istio:
             autoscaling: {pilot: {minReplicas: 1}, egressgateway: {minReplicas: 1}}
           metrics-server:
-            # kind does not enable kubelet serving-cert bootstrapping; upstream only adds this
-            # automatically for provider: linode.
+            # Always enabled (chart default; not one of the toggles below) -- this lab's own
+            # HPAs above (argocd, istio, ingress gateway) would sit ScalingActive=False without
+            # it, which Argo CD's HPA health check reports as Degraded, hanging
+            # install:watch-argocd's Synced+Healthy wait. kind does not enable kubelet
+            # serving-cert bootstrapping either; upstream only adds this arg automatically for
+            # provider: linode.
             extraArgs: ["--kubelet-insecure-tls=true"]
           cert-manager:
             # BOTH required -- src/cmd/bootstrap.ts checks customRootCA and customRootCAKey
@@ -105,17 +239,43 @@ tasks:
         } >> values.yaml
         cat >> values.yaml <<EOF
           gitea:
-            enabled: $GITEA_ENABLED
+            enabled: ${GITEA_ENABLED:-true}
           harbor:
-            enabled: $HARBOR_ENABLED
+            enabled: ${HARBOR_ENABLED:-true}
           tekton:
-            enabled: $TEKTON_ENABLED
+            enabled: ${TEKTON_ENABLED:-true}
           vikunja:
-            enabled: $VIKUNJA_ENABLED
+            enabled: ${VIKUNJA_ENABLED:-true}
           turnstone:
-            enabled: $TURNSTONE_ENABLED
+            enabled: ${TURNSTONE_ENABLED:-true}
+          alertmanager:
+            enabled: ${ALERTMANAGER_ENABLED:-false}
+          grafana:
+            enabled: ${GRAFANA_ENABLED:-false}
+          knative:
+            enabled: ${KNATIVE_ENABLED:-false}
+          kserve:
+            enabled: ${KSERVE_ENABLED:-false}
+          kubeflow-pipelines:
+            enabled: ${KUBEFLOW_PIPELINES_ENABLED:-false}
+          kyverno:
+            enabled: ${KYVERNO_ENABLED:-false}
+          linode-cfw:
+            enabled: ${LINODE_CFW_ENABLED:-false}
+          loki:
+            enabled: ${LOKI_ENABLED:-false}
+          otel:
+            enabled: ${OTEL_ENABLED:-false}
+          policy-reporter:
+            enabled: ${POLICY_REPORTER_ENABLED:-false}
+          prometheus:
+            enabled: ${PROMETHEUS_ENABLED:-false}
+          rabbitmq:
+            enabled: ${RABBITMQ_ENABLED:-false}
+          trivy:
+            enabled: ${TRIVY_ENABLED:-false}
         EOF
-        if [ "$TURNSTONE_ENABLED" = "true" ]; then
+        if [ "${TURNSTONE_ENABLED:-true}" = "true" ]; then
           {
             echo "    # Sealed like any x-secret -- never reaches the values repo or Turnstone's DB;"
             echo "    # the model definition stores the literal \${ANTHROPIC_API_KEY} and Turnstone"
@@ -125,58 +285,93 @@ tasks:
         fi
         unset ANTHROPIC_API_KEY
         chmod 0600 values.yaml
-        echo "wrote values.yaml ($(wc -l < values.yaml) lines)"
-      - helm template -f values.yaml apl ./chart/apl >/dev/null
-      - 'echo "values.yaml renders cleanly against the chart schema"'
+        apl_ok "wrote values.yaml ($(wc -l < values.yaml) lines, mode 0600)"
+      - |
+        . "{{.LIB}}"
+        render() { set -eu; helm template -f values.yaml apl ./chart/apl >/dev/null; }
+        apl_run values-render "Checking values.yaml renders against the chart schema" render || exit $?
 
   apply:
     desc: "helm install the operator (deploys in seconds; the platform install itself takes 5-15 min)"
     cmds:
-      - helm install -f values.yaml apl ./chart/apl
+      - |
+        . "{{.LIB}}"
+        # helm's NOTES.txt plus the rendered release summary is a screenful nobody reads on a
+        # successful install -- captured, and printed in full if it fails.
+        apply() { set -eu; helm install -f values.yaml apl ./chart/apl; }
+        apl_run helm-install "helm install apl ./chart/apl" apply || exit $?
 
   watch:
     desc: "Watch apl-installation-status until completed (bounded: 30 x 60s = 30 min cap)"
     cmds:
       - |
+        . "{{.LIB}}"
         set -euo pipefail
+        LOG=$(apl_logfile install-watch)
+        : > "$LOG"
+        apl_section "Waiting for the platform install (bounded: 30 x 60s)"
         for i in $(seq 1 30); do
           D=$(kubectl get cm apl-installation-status -n apl-operator -o jsonpath='{.data}' 2>/dev/null || true)
           P=$(kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Running"||$4=="Completed"' | wc -l)
           T=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l)
           OP=$(kubectl get pods -n apl-operator --no-headers 2>/dev/null | awk '{print $2" "$3" restarts="$4}')
-          echo "[install] ${D:-no status configmap yet} | pods ok ${P}/${T} | operator: ${OP:-absent}"
-          if echo "$OP" | grep -qE 'CrashLoopBackOff|ImagePullBackOff|Error'; then
-            echo "[install] !! OPERATOR UNHEALTHY" >&2
+          # Full raw ConfigMap data always goes to the log; on screen it is reduced to the two
+          # fields anyone actually reads (status + attempt), because the raw blob per poll was
+          # one of the noisiest things in a setup run.
+          printf '%s %s\n' "$(date -Is)" "${D:-<no status configmap yet>}" >> "$LOG"
+          STATUS=$(printf '%s' "$D" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+          ATTEMPT=$(printf '%s' "$D" | sed -n 's/.*"attempt":"\([^"]*\)".*/\1/p')
+          # (+Nm), not "[i/30]" -- 30 is a safety cap on how long we're willing to wait, not a
+          # step count, and printing it as a fraction reads as "10/30 done" when it means "done".
+          # The real progress is the pods count right after it.
+          apl_info "(+${i}m) install: ${STATUS:-pending} (attempt ${ATTEMPT:-?}) | pods ok ${P}/${T} | operator: ${OP:-absent}"
+          apl_verbose && apl_dim "raw: ${D:-<none>}"
+          # Failure signatures are checked against the pod state and the attempt counter, never
+          # against a bare "Error" grep of build output (CLAUDE.md).
+          if printf '%s' "$OP" | grep -qE 'CrashLoopBackOff|ImagePullBackOff|Error'; then
+            apl_warn "operator pod unhealthy: $OP"
           fi
-          if echo "$D" | grep -qE '"attempt":"([2-9]|[1-9][0-9])"'; then
-            echo "[install] !! ATTEMPT CLIMBING -- unbounded-retry signature, something is wedged" >&2
+          if printf '%s' "$D" | grep -qE '"attempt":"([2-9]|[1-9][0-9])"'; then
+            apl_warn "attempt is climbing -- the unbounded-retry signature, something is wedged"
           fi
-          if echo "$D" | grep -q '"status":"completed"'; then
-            echo "[install] COMPLETED"
+          if printf '%s' "$D" | grep -q '"status":"completed"'; then
+            apl_ok "platform install completed after $i poll(s)"
             exit 0
           fi
           sleep 60
         done
-        echo "error: install did not complete within 30 minutes" >&2
+        apl_fail "install did not complete within 30 minutes -- poll history: $LOG"
         exit 1
 
   watch-argocd:
     desc: "Watch Argo CD until every Application is Synced+Healthy (bounded: 30 x 60s = 30 min cap)"
     cmds:
       - |
+        . "{{.LIB}}"
         set -euo pipefail
+        LOG=$(apl_logfile install-watch-argocd)
+        : > "$LOG"
+        apl_section "Waiting for Argo CD to converge (bounded: 30 x 60s)"
         STABLE=0
         for i in $(seq 1 30); do
+          # TOTAL is recomputed from the live cluster every poll -- never a literal, because the
+          # app count depends on which *_ENABLED toggles this run used.
           NOTOK=$(kubectl get applications -n argocd \
             -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
             --no-headers 2>/dev/null | awk '$2!="Synced" || $3!="Healthy"')
           TOTAL=$(kubectl get applications -n argocd --no-headers 2>/dev/null | wc -l)
-          BADCOUNT=$(echo "$NOTOK" | grep -c . || true)
+          BADCOUNT=$(printf '%s' "$NOTOK" | grep -c . || true)
+          OK=$((TOTAL - BADCOUNT))
           P=$(kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Running"||$4=="Completed"' | wc -l)
           T=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l)
-          echo "[argocd] apps ${TOTAL} total, ${BADCOUNT} not Synced+Healthy | pods ${P}/${T}"
-          if [ "$BADCOUNT" -gt 0 ]; then
-            echo "$NOTOK" | sed 's/^/[argocd]   /'
+          # (+Nm), not "[i/30]" -- same reasoning as install:watch above: 30 is a bound on
+          # patience, not a progress denominator, and the real fraction is right after it.
+          apl_info "(+${i}m) argocd: ${OK}/${TOTAL} apps Synced+Healthy | pods ${P}/${T}"
+          printf '%s ok=%s/%s pods=%s/%s\n%s\n' "$(date -Is)" "$OK" "$TOTAL" "$P" "$T" "$NOTOK" >> "$LOG"
+          # The names of what is still lagging are signal, not noise -- but only under VERBOSE,
+          # since early in an install this is 60 lines a minute. The log always has them.
+          if [ "$BADCOUNT" -gt 0 ] && apl_verbose; then
+            printf '%s' "$NOTOK" | sed 's/^/     /'
           fi
           if [ "$BADCOUNT" -eq 0 ] && [ "$TOTAL" -gt 0 ]; then
             STABLE=$((STABLE+1))
@@ -184,47 +379,63 @@ tasks:
             STABLE=0
           fi
           if [ "$STABLE" -ge 2 ]; then
-            echo "[argocd] ALL SYNCED+HEALTHY, stable for 2 checks"
+            apl_ok "all ${TOTAL} Argo CD applications Synced+Healthy, stable for 2 checks"
             exit 0
           fi
           sleep 60
         done
-        echo "error: Argo CD did not fully converge within 30 minutes -- see 'task verify:platform' for what's stuck" >&2
+        apl_fail "Argo CD did not fully converge within 30 minutes -- poll history: $LOG"
+        apl_fail "run 'task verify:platform' to see what is stuck"
         exit 1
 
   trust-ca:
     desc: "Trust the platform CA on the kind node's containerd (required for any image pull)"
     cmds:
       - |
-        set -euo pipefail
-        kubectl get secret custom-ca -n cert-manager -o jsonpath='{.data.tls\.crt}' \
-          | base64 -d > apl-root-ca.crt
-        docker cp apl-root-ca.crt {{.CLUSTER_NAME}}-control-plane:/usr/local/share/ca-certificates/apl-root-ca.crt
-        docker exec {{.CLUSTER_NAME}}-control-plane update-ca-certificates
-        docker exec {{.CLUSTER_NAME}}-control-plane systemctl restart containerd
+        . "{{.LIB}}"
+        trust() {
+          set -euo pipefail
+          kubectl get secret custom-ca -n cert-manager -o jsonpath='{.data.tls\.crt}' \
+            | base64 -d > apl-root-ca.crt
+          docker cp apl-root-ca.crt {{.CLUSTER_NAME}}-control-plane:/usr/local/share/ca-certificates/apl-root-ca.crt
+          docker exec {{.CLUSTER_NAME}}-control-plane update-ca-certificates
+          docker exec {{.CLUSTER_NAME}}-control-plane systemctl restart containerd
+        }
+        apl_run trust-ca "Installing the platform CA into the kind node's trust store" trust || exit $?
       # This step is NOT persisted across `kind delete cluster` -- it patches the live node
       # container, not a kind config file. Re-run after every fresh install.
       - |
-        set -euo pipefail
+        . "{{.LIB}}"
+        set -uo pipefail
         D=$(cat {{.STATE_DIR}}/pool_start.txt).nip.io
+        LOG=$(apl_logfile trust-ca-verify)
         sleep 3
-        docker exec {{.CLUSTER_NAME}}-control-plane curl -sv --max-time 5 "https://harbor.$D/v2/" 2>&1 \
-          | grep -qi "certificate verify ok" \
-          && echo "CA trusted -- Harbor pull path verified" \
-          || echo "warning: could not confirm CA trust via Harbor (harbor may still be starting -- not fatal)"
+        # Output captured to a file rather than piped, so the grep below reads it without any
+        # exit code passing through a pipe.
+        docker exec {{.CLUSTER_NAME}}-control-plane curl -sv --max-time 5 "https://harbor.$D/v2/" > "$LOG" 2>&1 || true
+        if grep -qi "certificate verify ok" "$LOG"; then
+          apl_ok "CA trusted -- Harbor pull path verified"
+        else
+          # A warning is signal, so it prints in quiet mode too -- see .taskfiles/lib.sh.
+          apl_warn "could not confirm CA trust via Harbor (harbor may still be starting -- not fatal); see $LOG"
+        fi
+        apl_show_log "$LOG"
 
   credentials:
     desc: "Fetch initial platform-admin credentials into passwords.txt (0600, gitignored)"
     cmds:
       - |
+        . "{{.LIB}}"
         set -euo pipefail
+        apl_section "Initial platform-admin credentials"
         CONSOLE=$(kubectl --context {{.KIND_CONTEXT}} get cm welcome -n apl-operator -o jsonpath='{.data.consoleUrl}')
         USERNAME=$(kubectl --context {{.KIND_CONTEXT}} get secret platform-admin-initial-credentials -n keycloak \
                      -o jsonpath='{.data.username}' | base64 -d)
         PASSWORD=$(kubectl --context {{.KIND_CONTEXT}} get secret platform-admin-initial-credentials -n keycloak \
                      -o jsonpath='{.data.password}' | base64 -d)
-        [ -n "$CONSOLE" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] \
-          || { echo "warning: one or more values came back empty -- is the install actually completed?" >&2; }
+        if [ -z "$CONSOLE" ] || [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+          apl_warn "one or more values came back empty -- is the install actually completed?"
+        fi
         # `umask` is a shell builtin go-task's own embedded interpreter (mvdan/sh) does not
         # implement ("umask: unsupported builtin") -- rely on the chmod after writing instead of
         # restricting the file's permissions from the moment of creation. Fine for a local lab.
@@ -236,8 +447,6 @@ tasks:
         password: $PASSWORD
         EOF
         chmod 600 passwords.txt
-        echo "console:  $CONSOLE"
-        echo "username: $USERNAME"
-        echo "password: <written to passwords.txt>"
+        apl_ok "credentials written to passwords.txt"
       # Keycloak marks this credential temporary and forces a change on first login --
       # passwords.txt records the install-time secret, not a live view.

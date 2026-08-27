@@ -42,13 +42,27 @@ is encoded as a [`go-task`](https://taskfile.dev/installation/) `Taskfile.yml` (
 `.taskfiles/*.yml` in the repo root). Use it instead of copy-pasting the steps below by hand:
 
 ```bash
-task setup                            # everything, Gitea/Harbor/Tekton/Vikunja/Turnstone all on
-ANTHROPIC_API_KEY=sk-ant-... task setup   # non-interactive (Turnstone needs a key -- see step 6c)
-task setup TURNSTONE_ENABLED=false    # skip Turnstone, no key needed
+task setup                            # interactive: asks Y/n per optional app, Enter to accept
+                                       # each suggested default -- Enter/Enter/... reproduces the
+                                       # historic Gitea/Harbor/Tekton/Vikunja/Turnstone-on-only
+                                       # behavior below
+ANTHROPIC_API_KEY=sk-ant-... task setup   # still interactive; Turnstone's key is pre-supplied
+task setup TURNSTONE_ENABLED=false    # answers just that one prompt for you, no key needed
+NONINTERACTIVE=true task setup        # no prompts at all -- every *_ENABLED var falls back to
+                                       # its documented default (see .taskfiles/install.yml's
+                                       # `prompt` task for the full app list and defaults)
 task verify:platform                  # re-run the health checks any time against an up cluster
 task down CONFIRM=yes                 # destructive: deletes the cluster and generated local state
 task --list                           # every other sub-task (build one image, watch the install, ...)
 ```
+
+`task setup` prompts once per optional app (`install:prompt`, run before `cluster:create`) unless
+stdin isn't a terminal or `NONINTERACTIVE=true` is passed, in which case it silently falls back to
+each `*_ENABLED` var's default -- so CI and scripted invocations are unaffected either way. Any
+`*_ENABLED=true|false` passed explicitly (CLI var or real env var) answers that app's prompt for
+you and is never asked interactively. Saying "no" to an app here is not a dead end: it can be
+switched on later, once the platform is up, from the Console (or a commit to the values git repo)
+-- see "Changing values after install" below and `CLAUDE.md` rule 6.
 
 Installing `go-task`: see the [official install docs](https://taskfile.dev/installation/) for your
 platform. **The installed binary is not always named `task`** — e.g. Arch/CachyOS's `go-task`
@@ -1618,11 +1632,23 @@ silently. Without the flag the change still lands, but the release is left `STAT
 configuration lives in the git values repo and restarting the operator can re-run bootstrap and
 regenerate the platform CA.
 
-### Do not use this to enable a *new app* on a running cluster ⬜
+### Do not hand-patch the cluster to enable a *new app* — but the Console's own path is fine ⬜
 
-Tried, and it does not work. Enabling `apps.vikunja` on an installed cluster needs a new
-`APPS_REPO_URL`/`APPS_REVISION`, because `charts/vikunja` does not exist at the revision Argo CD is
-already using. Three things then compound:
+**This section is about bypassing the git-values flow** (a raw `helm upgrade`, or hand-patching the
+generated Secret/`ExternalSecret` directly). It does not apply to flipping `apps.<name>.enabled` the
+way the platform is actually designed to take that change: a commit to the git values repo (which is
+exactly what the Console's app-activation tiles do via `apl-api`) is picked up by the operator's own
+poll/reconcile loop (`src/operator/main.ts`) with no restart and no bootstrap re-run — because, per
+the note just above, once install is `completed` that *is* where configuration lives. Toggling an app
+whose chart already exists at the Argo CD-tracked `APPS_REVISION` (e.g. flipping `gitea`/`harbor`/
+`tekton`/`vikunja`/`turnstone`/etc. from `enabled: false` to `true`) this way works live, on an
+already-running cluster, with no rebuild.
+
+What was tried below, and does not work, is narrower: enabling `apps.vikunja` back when
+`charts/vikunja` **did not exist yet** at the revision Argo CD was already syncing — a chart-existence
+problem, not a general "you can't enable apps post-install" one — combined with trying to force the
+change through by hand-patching Helm/the Secret instead of through the git-values repo. Three things
+then compounded:
 
 1. **`helm upgrade` loses the operator Deployment.** Argo CD's own `apl-operator-apl-operator`
    Application manages that same Deployment with `selfHeal: true`, and it wins. Helm writes the
