@@ -1,50 +1,92 @@
 # kind cluster + MetalLB + Calico. SETUP.md steps 1-4.
+#
+# Output style: see .taskfiles/lib.sh. Everything noisy goes through apl_run (captured to
+# .taskfiles/state/logs/<slug>.log unless VERBOSE=true) -- `kind create cluster` included. It
+# used to be exempted, on the theory that its own tick-per-step output was the target style;
+# seen in a full run it is just the one loud, multi-emoji block in an otherwise plain stream,
+# so it is captured like everything else now. VERBOSE=true still streams it live.
 version: '3'
+silent: true
 
 tasks:
   create:
     desc: "Create the kind cluster (deletes any existing one with the same name first)"
     cmds:
-      - kind delete cluster --name {{.CLUSTER_NAME}}
-      - kind create cluster --name {{.CLUSTER_NAME}}
-      # kind create cluster returns before the node is Ready -- checking immediately shows
-      # NotReady with coredns Pending, which looks like failure but just needs ~15s more.
-      - kubectl --context {{.KIND_CONTEXT}} wait --for=condition=Ready node --all --timeout=120s
-      - kubectl --context {{.KIND_CONTEXT}} get nodes -o wide
-      - kubectl --context {{.KIND_CONTEXT}} get storageclass
+      - |
+        . "{{.LIB}}"
+        apl_header "Cluster"
+        del() { set -eu; kind delete cluster --name {{.CLUSTER_NAME}}; }
+        apl_run cluster-delete "Removing any existing '{{.CLUSTER_NAME}}' cluster" del || exit $?
+      - |
+        . "{{.LIB}}"
+        create() { set -eu; kind create cluster --name {{.CLUSTER_NAME}}; }
+        apl_run cluster-create "Creating kind cluster '{{.CLUSTER_NAME}}'" create || exit $?
+      - |
+        . "{{.LIB}}"
+        # kind create cluster returns before the node is Ready -- checking immediately shows
+        # NotReady with coredns Pending, which looks like failure but just needs ~15s more.
+        ready() {
+          set -eu
+          kubectl --context {{.KIND_CONTEXT}} wait --for=condition=Ready node --all --timeout=120s
+          kubectl --context {{.KIND_CONTEXT}} get nodes -o wide
+          kubectl --context {{.KIND_CONTEXT}} get storageclass
+        }
+        apl_run cluster-ready "Waiting for the node to become Ready" ready || exit $?
+        apl_info "nodes/storageclass detail: $(apl_logfile cluster-ready)"
 
   metallb:
     desc: "Install MetalLB, pool derived from the live docker network (never hardcoded)"
     cmds:
-      - mkdir -p {{.STATE_DIR}}
       - |
-        set -euo pipefail
+        . "{{.LIB}}"
+        apl_header "MetalLB"
+        mkdir -p {{.STATE_DIR}}
         # Derive the range from the live docker network -- it has been both 172.18.x and 172.19.x
         # on the same machine across rebuilds. A stale address makes MetalLB advertise an
         # unreachable IP, which presents as a platform failure rather than a config mistake.
+        # Not wrapped in apl_run: the derived pool is signal, and it is one line.
+        set -euo pipefail
         SUBNET=$(docker network inspect kind --format '{{`{{range .IPAM.Config}}{{println .Subnet}}{{end}}`}}' | grep -v ':')
         PREFIX=$(echo "$SUBNET" | cut -d. -f1-2)
         POOL_START="$PREFIX.255.200"
         POOL_END="$PREFIX.255.250"
-        echo "pool: $POOL_START-$POOL_END"
         echo -n "$POOL_START" > {{.STATE_DIR}}/pool_start.txt
         echo -n "$POOL_END" > {{.STATE_DIR}}/pool_end.txt
-      - kubectl create namespace mlb --dry-run=client -o yaml | kubectl apply -f -
-      - helm repo add metallb https://metallb.github.io/metallb
-      - helm repo update metallb
-      - helm upgrade --install metallb metallb/metallb -n mlb
-      # Wait for the controller's admission webhook to actually be serving, rather than SETUP.md's
-      # blind `sleep 60` -- functionally equivalent, event-driven instead of a fixed guess. 90s
-      # was measured against a node with cached images from a still-running earlier cluster on the
-      # same machine and timed out on a genuinely cold node (frr-k8s's images alone took ~72s to
-      # pull) -- 240s to give real headroom, since the deployment is Available the moment its
-      # condition flips regardless of the ceiling.
-      - kubectl wait --for=condition=Available deployment/metallb-controller -n mlb --timeout=240s
+        apl_ok "pool derived from the live docker network: $POOL_START-$POOL_END"
       - |
-        set -euo pipefail
-        POOL_START=$(cat {{.STATE_DIR}}/pool_start.txt)
-        POOL_END=$(cat {{.STATE_DIR}}/pool_end.txt)
-        cat <<EOF | kubectl apply -f -
+        . "{{.LIB}}"
+        install() {
+          set -euo pipefail
+          kubectl create namespace mlb --dry-run=client -o yaml | kubectl apply -f -
+          helm repo add metallb https://metallb.github.io/metallb
+          helm repo update metallb
+          helm upgrade --install metallb metallb/metallb -n mlb
+        }
+        apl_run metallb-install "Installing the MetalLB chart" install || exit $?
+      - |
+        . "{{.LIB}}"
+        # Wait for the controller's admission webhook to actually be serving, rather than
+        # SETUP.md's blind `sleep 60` -- functionally equivalent, event-driven instead of a fixed
+        # guess. 90s was measured against a node with cached images from a still-running earlier
+        # cluster on the same machine and timed out on a genuinely cold node (frr-k8s's images
+        # alone took ~72s to pull) -- 240s to give real headroom, since the deployment is
+        # Available the moment its condition flips regardless of the ceiling.
+        avail() {
+          set -eu
+          kubectl wait --for=condition=Available deployment/metallb-controller -n mlb --timeout=240s
+        }
+        apl_run metallb-available "Waiting for metallb-controller to become Available (<=240s)" avail || exit $?
+      # Deployment Available only means the pod passed its readiness probe -- the webhook Service's
+      # endpoint can lag a few seconds behind that, and the apply below goes through the validating
+      # webhook. Hit blind that gap once as "connection refused" from the webhook Service, so retry
+      # instead of trusting Available to mean "reachable" (bounded: 10 x 5s = 50s cap).
+      - |
+        . "{{.LIB}}"
+        pool() {
+          set -euo pipefail
+          POOL_START=$(cat {{.STATE_DIR}}/pool_start.txt)
+          POOL_END=$(cat {{.STATE_DIR}}/pool_end.txt)
+          MANIFEST=$(cat <<EOF
         apiVersion: metallb.io/v1beta1
         kind: IPAddressPool
         metadata: {name: default-pool, namespace: mlb}
@@ -54,10 +96,36 @@ tasks:
         kind: L2Advertisement
         metadata: {name: default-pool, namespace: mlb}
         EOF
-      - kubectl get pods -n mlb
+        )
+          for i in $(seq 1 10); do
+            if echo "$MANIFEST" | kubectl apply -f -; then
+              exit 0
+            fi
+            echo "metallb webhook not reachable yet, retrying ($i/10)..." >&2
+            sleep 5
+          done
+          echo "error: metallb webhook never became reachable after 10 retries" >&2
+          exit 1
+        }
+        apl_run metallb-pool "Applying the IPAddressPool (retries the webhook, 10 x 5s)" pool || exit $?
+      - |
+        . "{{.LIB}}"
+        pods() { set -eu; kubectl get pods -n mlb; }
+        apl_run metallb-pods "Recording MetalLB pod state" pods || exit $?
 
   cni:
     desc: "Install Calico CNI (layers over kind's dormant kindnet)"
     cmds:
-      - kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.3/manifests/calico.yaml
-      - kubectl wait --for=condition=Ready pod -l k8s-app=calico-node -n kube-system --timeout=120s
+      - |
+        . "{{.LIB}}"
+        apl_header "CNI"
+        apply() {
+          set -eu
+          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.3/manifests/calico.yaml
+        }
+        apl_run calico-apply "Applying the Calico manifest" apply || exit $?
+        wait_ready() {
+          set -eu
+          kubectl wait --for=condition=Ready pod -l k8s-app=calico-node -n kube-system --timeout=120s
+        }
+        apl_run calico-ready "Waiting for calico-node to become Ready (<=120s)" wait_ready || exit $?

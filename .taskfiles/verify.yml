@@ -1,117 +1,180 @@
 # Post-install verification. SETUP.md steps 8 (Argo CD layer), 9 (CA/reachability), 10 (Vikunja),
 # 11 (Turnstone). Browser-only checks (SSO round-trip, tiles, an actual chat turn) are NOT here --
 # no command substitutes for them, see SETUP.md itself for the checklist.
+#
+# Output style: deliberately different from the rest of the Taskfile. These tasks exist to be
+# *read* -- their output is a human checklist, not incidental tool noise -- so nothing here is
+# captured to a log or hidden behind VERBOSE. What quiet mode buys them is only consistent
+# section headers and a tick/cross per check instead of undifferentiated table spam.
 version: '3'
+silent: true
 
 tasks:
   platform:
     desc: "Platform-level health: pods, Argo CD sync, gateway, operator/image handover"
     cmds:
       - |
+        . "{{.LIB}}"
         set -euo pipefail
-        echo "=== readiness probe survives Argo CD handover ==="
+        apl_header "Platform verification"
+
+        apl_section "readiness probe survives Argo CD handover"
         PROBE=$(kubectl get deploy apl-operator -n apl-operator \
           -o jsonpath='{.spec.template.spec.containers[0].readinessProbe.exec.command}' 2>/dev/null || true)
-        echo "$PROBE"
-        [ -n "$PROBE" ] || echo "warning: empty -- chart and image may disagree, see SETUP.md step 8"
+        if [ -n "$PROBE" ]; then
+          apl_ok "$PROBE"
+        else
+          apl_warn "empty -- chart and image may disagree, see SETUP.md step 8"
+        fi
 
-        echo "=== operator image after handover ==="
-        kubectl get deploy apl-operator -n apl-operator -o jsonpath='{..image}{"\n"}'
+        apl_section "operator image after handover"
+        apl_info "$(kubectl get deploy apl-operator -n apl-operator -o jsonpath='{..image}')"
 
-        echo "=== pods not Running/Completed (must be empty) ==="
-        kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"'
+        apl_section "pods not Running/Completed (must be empty)"
+        BAD=$(kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed"')
+        if [ -z "$BAD" ]; then
+          apl_ok "every pod is Running or Completed"
+        else
+          apl_warn "$(printf '%s' "$BAD" | grep -c .) pod(s) not Running/Completed:"
+          printf '%s\n' "$BAD" | sed 's/^/     /'
+        fi
 
-        echo "=== helm releases ==="
-        helm list -A
+        # There used to be a full `helm list -A` table here. Removed deliberately: 30+ rows of
+        # deployed artefacts nobody reads, and the Argo CD section below is the check that
+        # actually says whether they are healthy. `helm list -A` by hand if you want it.
 
-        echo "=== gateway LoadBalancer (external IP must match domainSuffix's first octet-group) ==="
-        kubectl get svc -A -o wide | grep -i loadbalancer
+        apl_section "gateway LoadBalancer (external IP must match domainSuffix's first octet-group)"
+        kubectl get svc -A -o wide | grep -i loadbalancer | sed 's/^/   /' || \
+          apl_warn "no LoadBalancer service found -- MetalLB may not have assigned an address"
 
-        echo "=== Argo CD applications not Synced+Healthy (must be empty) ==="
-        kubectl get applications -n argocd \
+        apl_section "Argo CD applications not Synced+Healthy (must be empty)"
+        TOTAL=$(kubectl get applications -n argocd --no-headers | wc -l)
+        NOTOK=$(kubectl get applications -n argocd \
           -o custom-columns='NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status' \
-          --no-headers | awk '$2!="Synced" || $3!="Healthy"'
+          --no-headers | awk '$2!="Synced" || $3!="Healthy"')
+        if [ -z "$NOTOK" ]; then
+          apl_ok "all ${TOTAL} applications Synced+Healthy"
+        else
+          apl_warn "$(printf '%s' "$NOTOK" | grep -c .) of ${TOTAL} applications not Synced+Healthy:"
+          printf '%s\n' "$NOTOK" | sed 's/^/     /'
+        fi
 
         D=$(cat {{.STATE_DIR}}/pool_start.txt).nip.io
-        echo "=== console reachability (403 with an HTML body is correct -- oauth2-proxy's login interstitial) ==="
-        curl -sk -o /dev/null -w 'HTTP %{http_code}\n' "https://console.$D/"
-        curl -sk -D- -o /dev/null "https://console.$D/oauth2/start" | grep -i location || true
+        apl_section "console reachability"
+        apl_dim "403 with an HTML body is correct -- oauth2-proxy's login interstitial"
+        apl_info "https://console.$D/ -> HTTP $(curl -sk -o /dev/null -w '%{http_code}' "https://console.$D/")"
+        LOC=$(curl -sk -D- -o /dev/null "https://console.$D/oauth2/start" | grep -i '^location:' || true)
+        if [ -n "$LOC" ]; then
+          apl_info "oauth2/start -> $(printf '%s' "$LOC" | tr -d '\r')"
+        else
+          apl_warn "no Location header from /oauth2/start -- the SSO redirect is not wired up"
+        fi
 
   vikunja:
     desc: "Vikunja checklist (non-browser parts only -- SETUP.md step 10)"
     cmds:
       - |
+        . "{{.LIB}}"
         set -euo pipefail
-        if [ "$VIKUNJA_ENABLED" != "true" ]; then
-          echo "VIKUNJA_ENABLED=$VIKUNJA_ENABLED -- nothing to verify"
+        if [ "${VIKUNJA_ENABLED:-true}" != "true" ]; then
+          apl_skip "VIKUNJA_ENABLED=${VIKUNJA_ENABLED:-true} -- nothing to verify"
           exit 0
         fi
+        apl_header "Vikunja verification"
         D=$(kubectl get httproute vikunja -n vikunja -o jsonpath='{.spec.hostnames[0]}' | sed 's/^vikunja\.//')
-        [ -n "$D" ] || { echo "error: could not derive domain from the vikunja httproute" >&2; exit 1; }
+        [ -n "$D" ] || { apl_fail "could not derive domain from the vikunja httproute"; exit 1; }
 
-        echo "=== pods / cluster / secrets / bootstrap job ==="
-        kubectl get pods -n vikunja
-        kubectl get cluster -n vikunja
-        kubectl get externalsecrets -n vikunja
-        kubectl get jobs -n vikunja
+        apl_section "pods / cluster / secrets / bootstrap job"
+        kubectl get pods -n vikunja | sed 's/^/   /'
+        kubectl get cluster -n vikunja | sed 's/^/   /'
+        kubectl get externalsecrets -n vikunja | sed 's/^/   /'
+        kubectl get jobs -n vikunja | sed 's/^/   /'
 
-        echo "=== OIDC provider (empty list is the most likely failure -- pod is Running/Ready either way) ==="
-        curl -sk "https://vikunja.$D/api/v1/info" | jq '.auth.openid_connect'
+        apl_section "OIDC provider"
+        apl_dim "an empty list is the most likely failure -- the pod is Running/Ready either way"
+        OIDC=$(curl -sk "https://vikunja.$D/api/v1/info" | jq -c '.auth.openid_connect')
+        if printf '%s' "$OIDC" | grep -q '"providers":\[{'; then
+          apl_ok "$OIDC"
+        else
+          apl_warn "no OIDC providers advertised: $OIDC"
+        fi
 
-        echo "=== admin credential actually authenticates (a Job 'Complete' on a no-op rerun proves nothing) ==="
+        apl_section "admin credential actually authenticates"
+        apl_dim "a Job 'Complete' on a no-op rerun proves nothing -- this does a real login"
         U=$(kubectl get secret vikunja-admin-credentials -n vikunja -o jsonpath='{.data.username}' | base64 -d)
         P=$(kubectl get secret vikunja-admin-credentials -n vikunja -o jsonpath='{.data.password}' | base64 -d)
         T=$(curl -sk -X POST "https://vikunja.$D/api/v1/login" -H 'Content-Type: application/json' \
               -d "{\"username\":\"$U\",\"password\":\"$P\"}" | jq -r .token)
-        [ -n "$T" ] && [ "$T" != null ] && echo "admin login OK" || { echo "ADMIN LOGIN FAILED" >&2; exit 1; }
+        if [ -n "$T" ] && [ "$T" != null ]; then
+          apl_ok "admin login OK"
+        else
+          apl_fail "ADMIN LOGIN FAILED"
+          exit 1
+        fi
 
-        echo
-        echo "Not covered here (browser-only, see SETUP.md step 10): the /apps/admin tile, the"
-        echo "otomi-idp SSO round-trip, and team-member visibility (which only appears after that login)."
+        apl_section "not covered here (browser-only, SETUP.md step 10)"
+        apl_dim "the /apps/admin tile, the otomi-idp SSO round-trip, and team-member visibility"
+        apl_dim "(which only appears after that login)."
 
   turnstone:
     desc: "Turnstone checklist (non-browser parts only -- SETUP.md step 11, sections 1-4 + metrics)"
     cmds:
       - |
+        . "{{.LIB}}"
         set -euo pipefail
-        if [ "$TURNSTONE_ENABLED" != "true" ]; then
-          echo "TURNSTONE_ENABLED=$TURNSTONE_ENABLED -- nothing to verify"
+        if [ "${TURNSTONE_ENABLED:-true}" != "true" ]; then
+          apl_skip "TURNSTONE_ENABLED=${TURNSTONE_ENABLED:-true} -- nothing to verify"
           exit 0
         fi
+        apl_header "Turnstone verification"
         D=$(kubectl get httproute turnstone -n turnstone -o jsonpath='{.spec.hostnames[0]}' | sed 's/^turnstone\.//')
-        [ -n "$D" ] || { echo "error: could not derive domain from the turnstone httproute" >&2; exit 1; }
+        [ -n "$D" ] || { apl_fail "could not derive domain from the turnstone httproute"; exit 1; }
 
-        echo "=== section 1: the app itself ==="
-        kubectl get pods -n turnstone
-        kubectl get cluster -n turnstone
-        kubectl get externalsecrets -n turnstone
-        kubectl get jobs -n turnstone
+        apl_section "section 1: the app itself"
+        kubectl get pods -n turnstone | sed 's/^/   /'
+        kubectl get cluster -n turnstone | sed 's/^/   /'
+        kubectl get externalsecrets -n turnstone | sed 's/^/   /'
+        kubectl get jobs -n turnstone | sed 's/^/   /'
 
-        echo "=== section 2: the certificate chain (the whole point of 'task install:ca') ==="
-        echo "-- OIDC discovery under Python's VERIFY_X509_STRICT, expect 200 --"
-        kubectl exec -n turnstone deploy/turnstone-console -- python -c \
-          "import httpx,os;print(httpx.get(os.environ['TURNSTONE_OIDC_ISSUER']+'/.well-known/openid-configuration').status_code)"
-        echo "-- api.anthropic.com reachability, expect 401 (TLS fine, key check fails -- that's a PASS) --"
-        kubectl exec -n turnstone deploy/turnstone-console -- python -c \
-          "import httpx;print(httpx.get('https://api.anthropic.com/v1/models').status_code)"
-        echo "   (do not re-check this with 'openssl verify' on the host -- it doesn't apply"
-        echo "   VERIFY_X509_STRICT and will report a broken chain as OK. Only Python sees it.)"
+        apl_section "section 2: the certificate chain (the whole point of 'task install:ca')"
+        RC=$(kubectl exec -n turnstone deploy/turnstone-console -- python -c \
+          "import httpx,os;print(httpx.get(os.environ['TURNSTONE_OIDC_ISSUER']+'/.well-known/openid-configuration').status_code)")
+        if [ "$RC" = "200" ]; then
+          apl_ok "OIDC discovery under Python's VERIFY_X509_STRICT: HTTP $RC"
+        else
+          apl_warn "OIDC discovery returned HTTP $RC (expected 200)"
+        fi
+        RC=$(kubectl exec -n turnstone deploy/turnstone-console -- python -c \
+          "import httpx;print(httpx.get('https://api.anthropic.com/v1/models').status_code)")
+        if [ "$RC" = "401" ]; then
+          apl_ok "api.anthropic.com reachable: HTTP $RC (TLS fine, key check fails -- that is a PASS)"
+        else
+          apl_warn "api.anthropic.com returned HTTP $RC (expected 401)"
+        fi
+        apl_dim "do not re-check this with 'openssl verify' on the host -- it doesn't apply"
+        apl_dim "VERIFY_X509_STRICT and will report a broken chain as OK. Only Python sees it."
 
-        echo "=== section 3: the model registry (a missing model is silent otherwise) ==="
+        apl_section "section 3: the model registry (a missing model is silent otherwise)"
         for d in turnstone-server turnstone-console; do
-          kubectl logs -n turnstone deploy/$d | grep -iE 'no model name, skipping|empty registry' \
-            && echo "warning: the model=/name= trap fired in $d" >&2 || true
+          # Targeted signature, not a bare "Error" grep -- see CLAUDE.md.
+          HITS=$(kubectl logs -n turnstone deploy/$d | grep -iE 'no model name, skipping|empty registry' || true)
+          [ -z "$HITS" ] || apl_warn "the model=/name= trap fired in $d: $HITS"
         done
-        kubectl get cm turnstone-model-config -n turnstone -o jsonpath='{.data.config\.toml}'
+        kubectl get cm turnstone-model-config -n turnstone -o jsonpath='{.data.config\.toml}' | sed 's/^/   /'
         echo
 
-        echo "=== section 4: the admin account (Job 'Complete' on a no-op rerun proves nothing) ==="
-        kubectl exec -n turnstone deploy/turnstone-console -- turnstone-admin list-users
+        apl_section "section 4: the admin account"
+        apl_dim "a Job 'Complete' on a no-op rerun proves nothing -- this lists the real users"
+        kubectl exec -n turnstone deploy/turnstone-console -- turnstone-admin list-users | sed 's/^/   /'
 
-        echo "=== /metrics redirect (expect 302, not a Prometheus dump) ==="
-        curl -sk -o /dev/null -w 'HTTP %{http_code}\n' "https://turnstone.$D/metrics"
+        apl_section "/metrics redirect (expect 302, not a Prometheus dump)"
+        RC=$(curl -sk -o /dev/null -w '%{http_code}' "https://turnstone.$D/metrics")
+        if [ "$RC" = "302" ]; then
+          apl_ok "HTTP $RC"
+        else
+          apl_warn "HTTP $RC (expected 302 -- a 200 here would mean /metrics is publicly exposed)"
+        fi
 
-        echo
-        echo "Not covered here (browser-only, see SETUP.md step 11 sections 5-7): the console tile,"
-        echo "the otomi-idp SSO round-trip, role mapping after a real login, and an actual chat turn"
-        echo "against the Claude API."
+        apl_section "not covered here (browser-only, SETUP.md step 11 sections 5-7)"
+        apl_dim "the console tile, the otomi-idp SSO round-trip, role mapping after a real login,"
+        apl_dim "and an actual chat turn against the Claude API."
