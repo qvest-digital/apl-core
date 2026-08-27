@@ -55,6 +55,10 @@ the same way SETUP.md already proved works. Useful sub-tasks (see `task --list`)
   default without blocking on a terminal read you cannot answer; this is also what CI should use.
   (Passing any `*_ENABLED=` explicitly answers just that one app either way, interactive or not.)
 - `ANTHROPIC_API_KEY=sk-ant-... NONINTERACTIVE=true task setup` — fully unattended, for Turnstone
+- The operator image's test suite is **skipped by default** for setup speed
+  (`--build-arg SKIP_TESTS=true`, wired in `.taskfiles/images.yml`'s `build-operator`) — pass
+  `RUN_OPERATOR_TESTS=true task setup` to run it instead (e.g. before a PR, or when actually
+  working on the operator)
 - `task setup TURNSTONE_ENABLED=false` (and the other `*_ENABLED` toggles — see
   `.taskfiles/install.yml`'s `prompt` task for the full list, including apps not offered at all:
   git-server and metrics-server are always on, promtail has no working gate at all today)

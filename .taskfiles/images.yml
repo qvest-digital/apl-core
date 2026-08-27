@@ -42,9 +42,19 @@ tasks:
           CTX=$(mktemp -d)
           git ls-files -z | tar --null -T - -c | tar -x -C "$CTX"
           APPS_REVISION=$(cat {{.STATE_DIR}}/apps_revision.txt)
+          # Opt-out: tests skipped by default (SKIP_TESTS=true) for setup speed -- the Dockerfile's
+          # `npm run test:ci` step can't cache across code changes and is a large share of this
+          # image's build time. RUN_OPERATOR_TESTS=true task setup flips SKIP_TESTS=false to run
+          # them, e.g. before a PR or when actually working on the operator.
+          if [ "${RUN_OPERATOR_TESTS:-false}" = "true" ]; then
+            SKIP_TESTS=false
+          else
+            SKIP_TESTS=true
+          fi
           docker build --build-arg VERSION={{.OPERATOR_VERSION}} \
                        --build-arg APPS_REVISION="$APPS_REVISION" \
                        --build-arg APPS_REPO_URL="{{.APPS_REPO_URL}}" \
+                       --build-arg SKIP_TESTS="$SKIP_TESTS" \
                        -t {{.OPERATOR_IMAGE}} "$CTX"
           rm -rf "$CTX"
           # Never trust docker build's exit code through anything, and never trust it blindly even

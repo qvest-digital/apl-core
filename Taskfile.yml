@@ -18,6 +18,9 @@
 #   ANTHROPIC_API_KEY=sk-ant-... task setup
 #   task setup TURNSTONE_ENABLED=false          # answers that one prompt for you, still interactive
 #   NONINTERACTIVE=true task setup              # no prompts at all -- see install:prompt below
+#   RUN_OPERATOR_TESTS=true task setup          # also runs the operator image's test:ci suite
+#                                                # (skipped by default for setup speed -- opt in
+#                                                # before a PR, or when working on the operator)
 #   task down CONFIRM=yes             # destructive: deletes the kind cluster
 #
 # Interactive app selection: `install:prompt` (run first by `setup`, before cluster:create) asks
@@ -50,6 +53,13 @@ version: '3'
 # executing it, `silent: true` alone hides the dry-run preview too -- pass go-task's own -v/
 # --verbose flag to get it back: `go-task -v <task> --dry`.
 silent: true
+# `cluster-and-images` below runs the cluster chain and images:build-all as parallel deps -- in
+# go-task's default `interleaved` output mode, two tasks' apl_run status lines print char-by-char
+# interleaved on screen. `group` buffers each task's output and prints it as one contiguous block
+# instead. This only affects go-task's own stdout handling, not .taskfiles/lib.sh's apl_run
+# (which does its own capture-to-file and inline tail-on-failure via plain echo/tail) -- grouping
+# contains that behavior, it doesn't change it.
+output: group
 
 vars:
   CLUSTER_NAME: apl
@@ -95,6 +105,12 @@ env:
   # VERBOSE all reach the shells as ${VERBOSE:-false}. VERBOSE has no "ask the user" mode, so it
   # keeps its old always-materialize-a-default form.
   VERBOSE: '{{.VERBOSE | default "false"}}'
+  # Opt-out, not opt-in: the operator image's `npm run test:ci` is a large share of its build
+  # time and can't cache across code changes, so it's skipped by default for setup speed.
+  # RUN_OPERATOR_TESTS=true task setup runs them (e.g. before a PR, or when actually working on
+  # the operator). No interactive prompt, no CLI-vs-unset ambiguity to resolve -- a plain binary
+  # default, so (unlike the *_ENABLED toggles below) it materializes its default right here.
+  RUN_OPERATOR_TESTS: '{{.RUN_OPERATOR_TESTS | default "false"}}'
   # Defaults on in this fork (see install:prompt for the "yes" suggestion, install:values for the
   # non-interactive fallback -- both still resolve to true if this reaches them empty).
   GITEA_ENABLED: '{{.GITEA_ENABLED}}'
@@ -139,6 +155,23 @@ tasks:
       # "No matches." from an unrelated program and exited 1.
       - '{{.TASK_EXE}} --list'
 
+  cluster-and-images:
+    desc: "Join point: cluster:up (create+metallb+cni) and images:build-all run concurrently; waits for both"
+    # go-task runs `deps:` entries in parallel by default and waits for all of them before running
+    # this task's own `cmds:` -- images:build-all has no dependency on a running cluster (only
+    # images:load-all's `kind load docker-image` does), so overlapping it with cluster:up hides
+    # its ~71s behind the cluster chain's ~109s instead of paying both serially. install:prompt
+    # (run before this in `setup`'s cmds) already resolves every *_ENABLED var first; images:build
+    # -all doesn't need any of them anyway (only install:values/install:apply do, later), so no
+    # ordering requirement is lost by starting the two branches together.
+    deps:
+      - task: cluster:up
+      - task: images:build-all
+    cmds:
+      - |
+        . "{{.LIB}}"
+        apl_ok "cluster ready and images built (ran concurrently)"
+
   setup:
     desc: "Full end-to-end lab setup -- equivalent to SETUP.md's Quickstart, ~15 minutes"
     cmds:
@@ -152,10 +185,7 @@ tasks:
           apl_info "re-run with VERBOSE=true to stream everything live instead."
         fi
       - task: install:prompt
-      - task: cluster:create
-      - task: cluster:metallb
-      - task: cluster:cni
-      - task: images:build-all
+      - task: cluster-and-images
       - task: images:load-all
       - task: install:schema
       - task: install:ca

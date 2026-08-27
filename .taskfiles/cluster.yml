@@ -9,6 +9,13 @@ version: '3'
 silent: true
 
 tasks:
+  up:
+    desc: "Create the cluster, then install MetalLB and Calico CNI (serial chain -- see Taskfile.yml's join task)"
+    cmds:
+      - task: create
+      - task: metallb
+      - task: cni
+
   create:
     desc: "Create the kind cluster (deletes any existing one with the same name first)"
     cmds:

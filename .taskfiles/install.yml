@@ -12,6 +12,12 @@ silent: true
 tasks:
   prompt:
     desc: "Interactively ask which optional apps to install; resolves *_ENABLED for install:values"
+    # Required alongside Taskfile.yml's top-level `output: group` (added for the parallel
+    # cluster-and-images join task): group mode buffers a task's entire stdout until it finishes,
+    # which silently deadlocked this task -- the "Install gitea? [Y/n]" prompt sat in the buffer
+    # forever while `read -r` waited for an answer nobody could see to give. `interactive: true`
+    # tells go-task this task needs a real, unbuffered terminal and exempts it from grouping.
+    interactive: true
     cmds:
       # Not wrapped in apl_run: this is nothing but terminal I/O, and apl_run's job (capture
       # noisy command output, show a spinner-like "... OK (Ns)") has nothing to do here.
@@ -302,15 +308,21 @@ tasks:
         apl_run helm-install "helm install apl ./chart/apl" apply || exit $?
 
   watch:
-    desc: "Watch apl-installation-status until completed (bounded: 30 x 60s = 30 min cap)"
+    # Base cadence 20s (was 60s). Same ~30 min real-world cap: 1800s / 20s = 90 iterations
+    # (was 30 x 60s). Elapsed time is tracked directly in seconds (ELAPSED, incremented by the
+    # actual sleep each iteration) rather than derived from the iteration count, since each
+    # iteration is now shorter than a minute.
+    desc: "Watch apl-installation-status until completed (bounded: 90 x 20s = 30 min cap)"
     cmds:
       - |
         . "{{.LIB}}"
         set -euo pipefail
         LOG=$(apl_logfile install-watch)
         : > "$LOG"
-        apl_section "Waiting for the platform install (bounded: 30 x 60s)"
-        for i in $(seq 1 30); do
+        apl_section "Waiting for the platform install (bounded: 90 x 20s)"
+        INTERVAL=20
+        ELAPSED=0
+        for i in $(seq 1 90); do
           D=$(kubectl get cm apl-installation-status -n apl-operator -o jsonpath='{.data}' 2>/dev/null || true)
           P=$(kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Running"||$4=="Completed"' | wc -l)
           T=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l)
@@ -321,10 +333,11 @@ tasks:
           printf '%s %s\n' "$(date -Is)" "${D:-<no status configmap yet>}" >> "$LOG"
           STATUS=$(printf '%s' "$D" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
           ATTEMPT=$(printf '%s' "$D" | sed -n 's/.*"attempt":"\([^"]*\)".*/\1/p')
-          # (+Nm), not "[i/30]" -- 30 is a safety cap on how long we're willing to wait, not a
-          # step count, and printing it as a fraction reads as "10/30 done" when it means "done".
-          # The real progress is the pods count right after it.
-          apl_info "(+${i}m) install: ${STATUS:-pending} (attempt ${ATTEMPT:-?}) | pods ok ${P}/${T} | operator: ${OP:-absent}"
+          # (+MmSs), not "[i/90]" -- 90 is a safety cap on how long we're willing to wait, not a
+          # step count, and printing it as a fraction reads as "10/90 done" when it means "done".
+          # The real progress is the pods count right after it. Elapsed is time actually slept so
+          # far (before this poll), not i * INTERVAL, so it stays accurate however INTERVAL is set.
+          apl_info "(+$((ELAPSED/60))m$((ELAPSED%60))s) install: ${STATUS:-pending} (attempt ${ATTEMPT:-?}) | pods ok ${P}/${T} | operator: ${OP:-absent}"
           apl_verbose && apl_dim "raw: ${D:-<none>}"
           # Failure signatures are checked against the pod state and the attempt counter, never
           # against a bare "Error" grep of build output (CLAUDE.md).
@@ -338,22 +351,41 @@ tasks:
             apl_ok "platform install completed after $i poll(s)"
             exit 0
           fi
-          sleep 60
+          sleep "$INTERVAL"
+          ELAPSED=$((ELAPSED+INTERVAL))
         done
         apl_fail "install did not complete within 30 minutes -- poll history: $LOG"
         exit 1
 
   watch-argocd:
-    desc: "Watch Argo CD until every Application is Synced+Healthy (bounded: 30 x 60s = 30 min cap)"
+    # Base cadence 20s (was 60s), same ~30 min real-world cap: 1800s / 20s = 90 iterations (was
+    # 30 x 60s) -- see install:watch's header comment for the elapsed-time tracking rationale,
+    # which applies here identically.
+    #
+    # On top of that, the confirmation-only gap is shortened further: a real measured run hit
+    # full Synced+Healthy at poll 7, then burned one whole base-cadence sleep purely to reach
+    # poll 8's confirming re-poll. Once STABLE first becomes 1 (this poll was clean, but not yet
+    # confirmed), the sleep before the next (confirming) poll drops to CONFIRM_INTERVAL=10s
+    # instead of the normal 20s. If that confirming poll is also clean, STABLE reaches 2 and the
+    # loop exits immediately, without sleeping again. If it is NOT clean, STABLE resets to 0 and
+    # the very next sleep is chosen fresh from STABLE's new value -- i.e. it falls back to the
+    # normal 20s cadence automatically, no separate branch needed. Only a poll immediately
+    # following a first-clean-poll ever gets the short gap; every other poll uses the base
+    # cadence. Because that occasional 10s dip means the real cap can land a little under (never
+    # over) 90 iterations, this is an ~30 min cap, not an exact one.
+    desc: "Watch Argo CD until every Application is Synced+Healthy (bounded: ~90 x 20s = ~30 min cap)"
     cmds:
       - |
         . "{{.LIB}}"
         set -euo pipefail
         LOG=$(apl_logfile install-watch-argocd)
         : > "$LOG"
-        apl_section "Waiting for Argo CD to converge (bounded: 30 x 60s)"
+        apl_section "Waiting for Argo CD to converge (bounded: ~90 x 20s)"
+        INTERVAL=20
+        CONFIRM_INTERVAL=10
+        ELAPSED=0
         STABLE=0
-        for i in $(seq 1 30); do
+        for i in $(seq 1 90); do
           # TOTAL is recomputed from the live cluster every poll -- never a literal, because the
           # app count depends on which *_ENABLED toggles this run used.
           NOTOK=$(kubectl get applications -n argocd \
@@ -364,12 +396,14 @@ tasks:
           OK=$((TOTAL - BADCOUNT))
           P=$(kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Running"||$4=="Completed"' | wc -l)
           T=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l)
-          # (+Nm), not "[i/30]" -- same reasoning as install:watch above: 30 is a bound on
+          # (+MmSs), not "[i/90]" -- same reasoning as install:watch above: 90 is a bound on
           # patience, not a progress denominator, and the real fraction is right after it.
-          apl_info "(+${i}m) argocd: ${OK}/${TOTAL} apps Synced+Healthy | pods ${P}/${T}"
+          # Elapsed is time actually slept so far (before this poll), which stays accurate even
+          # though individual sleeps vary between INTERVAL and CONFIRM_INTERVAL below.
+          apl_info "(+$((ELAPSED/60))m$((ELAPSED%60))s) argocd: ${OK}/${TOTAL} apps Synced+Healthy | pods ${P}/${T}"
           printf '%s ok=%s/%s pods=%s/%s\n%s\n' "$(date -Is)" "$OK" "$TOTAL" "$P" "$T" "$NOTOK" >> "$LOG"
           # The names of what is still lagging are signal, not noise -- but only under VERBOSE,
-          # since early in an install this is 60 lines a minute. The log always has them.
+          # since early in an install this is many lines a minute. The log always has them.
           if [ "$BADCOUNT" -gt 0 ] && apl_verbose; then
             printf '%s' "$NOTOK" | sed 's/^/     /'
           fi
@@ -382,7 +416,16 @@ tasks:
             apl_ok "all ${TOTAL} Argo CD applications Synced+Healthy, stable for 2 checks"
             exit 0
           fi
-          sleep 60
+          # Short confirmation gap only right after the first clean poll (STABLE==1) -- every
+          # other case (still converging, or just fell back out of a failed confirmation) uses
+          # the normal base cadence.
+          if [ "$STABLE" -eq 1 ]; then
+            SLEEP=$CONFIRM_INTERVAL
+          else
+            SLEEP=$INTERVAL
+          fi
+          sleep "$SLEEP"
+          ELAPSED=$((ELAPSED+SLEEP))
         done
         apl_fail "Argo CD did not fully converge within 30 minutes -- poll history: $LOG"
         apl_fail "run 'task verify:platform' to see what is stuck"
