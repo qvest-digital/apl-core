@@ -580,9 +580,10 @@ Work outward. Each step has a cheap check that fails loudly.
    `https://vikunja.<domainSuffix>/`. Check a team view too — `isShared` should put it there with
    the same URL.
 4. **SSO.** Log in as a team member through Keycloak; the account is auto-created.
-5. **Team sync.** Needs `teamSync.enabled` and the patched `apl-tasks` image, which builds without
-   credentials — see § 3.2. Expect `apl-vikunja-operator` `1/1 Running`; a `CrashLoopBackOff` almost
-   certainly means the released `linode/apl-tasks` image is in use and has no `operator:vikunja`.
+5. **Team sync.** Stale as written — the operator + `teamSync.enabled` this described was removed
+   2026-08-27 (`dd885ca9a`); see § 3.2 for the record of how it worked, and `SETUP.md`'s "Team
+   sync" section under step 10 for what replaced it (a claim-driven mechanism through
+   `vikunja-patches/apl-tasks.patch`, proven live but not yet on a fresh install).
 6. **Suite.** `npm run test:ci` from a clean context — see `CLAUDE.md`.
 
 For a token in steps 2–4: the `otomi` client has `directAccessGrantsEnabled`, so a password grant

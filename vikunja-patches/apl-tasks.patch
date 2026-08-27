@@ -1,0 +1,65 @@
+diff --git a/src/tasks/keycloak/config.ts b/src/tasks/keycloak/config.ts
+index e79b49c..8146d87 100644
+--- a/src/tasks/keycloak/config.ts
++++ b/src/tasks/keycloak/config.ts
+@@ -146,6 +146,29 @@ export const protocolMappersList: Array<Record<string, unknown>> = [
+       'jsonType.label': 'String',
+     },
+   },
++  {
++    // Lets Vikunja auto-create and maintain a matching team from this claim, with no
++    // Vikunja-specific operator needed -- see apl-core's VIKUNJA.md Appendix B, proven live
++    // against stock Keycloak. 'aggregate.attrs' is what makes a built-in User Attribute mapper
++    // pull the value from the user's GROUP attributes (set per-team in createGroups below), not
++    // just the user's own attributes -- undocumented in Vikunja's own OIDC guide, which points at
++    // a nonexistent custom mapper plugin instead. Harmless if Vikunja is disabled: an unused
++    // claim in the token, nothing reads it.
++    name: 'vikunja-groups',
++    protocol: 'openid-connect',
++    protocolMapper: 'oidc-usermodel-attribute-mapper',
++    consentRequired: false,
++    config: {
++      'user.attribute': 'vikunja_groups',
++      'claim.name': 'vikunja_groups',
++      'jsonType.label': 'JSON',
++      multivalued: 'true',
++      'aggregate.attrs': 'true',
++      'userinfo.token.claim': 'true',
++      'id.token.claim': 'true',
++      'access.token.claim': 'true',
++    },
++  },
+   {
+     name: 'email',
+     protocol: 'openid-connect',
+diff --git a/src/tasks/keycloak/realm-factory.ts b/src/tasks/keycloak/realm-factory.ts
+index e7da05d..e9ad0f5 100644
+--- a/src/tasks/keycloak/realm-factory.ts
++++ b/src/tasks/keycloak/realm-factory.ts
+@@ -39,11 +39,21 @@ export function createClient(redirectUris: string[], webOrigins: string, secret:
+ }
+ 
+ export function createGroups(teamIds: string[]): Array<GroupRepresentation> {
+-  const groupNames: string[] = teamIds
+-    .map((id) => `team-${id}`)
+-    .concat(['platform-admin', 'all-teams-admin', 'team-admin'])
+-  const groups = groupNames.map((name) => defaultsDeep(new GroupRepresentation(), { name }))
+-  return groups
++  // Only real teams get a vikunja_groups attribute, not the admin/team-admin marker groups --
++  // same reasoning CLAUDE.md documents for the team-admin role: those aren't teams, and Vikunja
++  // has no equivalent of platform-admin/all-teams-admin. oidcID must stay stable across
++  // reconciles: Vikunja keys the team on it, not the display name, so renaming a team here would
++  // silently rename the Vikunja team too (not recreate it) -- that's the intended behavior.
++  const teamGroups = teamIds.map((id) =>
++    defaultsDeep(new GroupRepresentation(), {
++      name: `team-${id}`,
++      attributes: { vikunja_groups: [JSON.stringify({ name: `Team ${id}`, oidcID: `kc-team-${id}` })] },
++    }),
++  )
++  const adminGroups = ['platform-admin', 'all-teams-admin', 'team-admin'].map((name) =>
++    defaultsDeep(new GroupRepresentation(), { name }),
++  )
++  return teamGroups.concat(adminGroups)
+ }
+ 
+ export function createIdpMappers(

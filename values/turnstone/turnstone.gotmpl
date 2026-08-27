@@ -275,21 +275,27 @@ extraEnv:
         key: ANTHROPIC_API_KEY
 
   {{- /*
-    Anthropic's native tool-search (deferred loading via a server-side tool_search_tool_bm25
-    tool) auto-activates once tool count exceeds tools.search_threshold (default 20,
-    tools.search default "auto") -- MCP catalogs across gitea-mcp + vikunja-mcp alone already
-    exceed that (54 + 9 = 63 tools). Turnstone has a real bug in how it persists/resumes that
-    server-side tool's tool_use/tool_result pairing across a session resume: verified live, every
-    resumed chat 400'd with `messages.1: tool_search_tool_bm25 tool use ... was found without a
-    corresponding tool_search_tool_bm25_tool_result block`. Forcing tools.search off avoids the
-    feature (and the bug) entirely -- all tools are sent directly every turn instead, at higher
-    per-turn token cost but no crash. _seed_config_from_env (turnstone/console/server.py) only
-    seeds a setting on FIRST boot if it isn't already stored in the DB, so this env var has no
-    effect on an already-running instance -- it was also set live via
-    `PUT /api/admin/settings/tools.search {"value":"off"}` to fix the current cluster immediately.
+    Turning tools.search off (below) was reverted 2026-08-27: the literal string "off" survives
+    this file's own template render fine, but the operator's generic YAML writer (objectToYaml,
+    src/common/utils.ts) re-emits Application values using a YAML-1.2 serializer that leaves
+    boolean-ish words like "off"/"on"/"yes"/"no" unquoted. Argo CD then parses that text with a
+    YAML-1.1 (Go) reader, which resolves bare `off` to the boolean false -- so the env var Argo CD
+    actually tries to apply carries a bool where Kubernetes' EnvVar.Value requires a string, and
+    the typed-patch server-side apply is rejected outright: "expected string, got ...Value:false".
+    turnstone-server/turnstone-console then never get created; every other Turnstone check below
+    was blocked by this alone. Confirmed via `helm template` in isolation (renders correctly) vs.
+    the live Argo CD Application's `spec.source.helm.values` (contains `value: off`, unquoted) --
+    so the corruption happens in the operator's own values-serialization step, not this chart.
+
+    This is NOT a Turnstone bug and reverting it does not fix tool-search's own two real bugs
+    (documented below, still true): dropped MCP tool results past ~33k tokens, and a 400 on
+    session resume once tool count exceeds tools.search_threshold (20; gitea-mcp + vikunja-mcp
+    alone total 63 tools). TODO: find a way to force tools.search off that doesn't route a
+    YAML-1.1-ambiguous word through objectToYaml -- e.g. set it via the admin API from a
+    post-install hook instead of an env var, or seed it as a non-ambiguous encoding Turnstone's
+    settings_registry (choices=["auto","on","off"], turnstone/core/settings_registry.py) would
+    still accept. Until then, tool-search stays on its buggy default and both bugs are live.
   */}}
-  - name: TURNSTONE_TOOLS_SEARCH
-    value: "off"
 
   {{- /* Pre-derived endpoints, used verbatim -- never assemble an OIDC URL by hand. */}}
   - name: TURNSTONE_OIDC_ISSUER

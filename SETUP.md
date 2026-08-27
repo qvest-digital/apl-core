@@ -1249,10 +1249,38 @@ T=$(curl -sk -X POST "https://vikunja.$D/api/v1/login" -H 'Content-Type: applica
 [ -n "$T" ] && [ "$T" != null ] && echo "admin login OK" || echo "ADMIN LOGIN FAILED"
 ```
 
-### Team sync
+### Team sync ✅ (claim-driven, replaces the removed operator)
 
-Removed. Platform teams are no longer synced into Vikunja teams -- see `vikunja-patches/README.md`
-for what this used to do and why it was taken out. Nothing to check here.
+The pushed operator described in `vikunja-patches/README.md` (removed 2026-08-27, `dd885ca9a`) is
+still gone. In its place: `apl-keycloak-operator` now also seeds a `vikunja_groups` attribute on
+every `team-<id>` Keycloak group, and a matching OIDC claim mapper on the `otomi` client -- both
+via `vikunja-patches/apl-tasks.patch` (built with `vikunja-patches/apl-tasks-teams.Dockerfile`, no
+registry token needed, same technique the old operator patch used). Vikunja's own OIDC
+claim-driven team feature (`VIKUNJA.md` Appendix B) then creates and maintains the team itself, on
+first login by one of its members -- nothing pushes into Vikunja's API, so none of the removed
+operator's "acts on every team automatically" risk applies here: the write only ever touches
+Keycloak, which already owns group membership anyway.
+
+**Proven live, 2026-08-27:** the claim (`oidc-usermodel-attribute-mapper` with `aggregate.attrs`)
+was verified to land correctly in a real ID token, and Vikunja auto-created a team from it on
+login -- see the browser check below. **Not yet proven:** that this happens automatically on a
+*fresh* install with `versions.tasks: v0.0.0-vikunja-teams` set. Keycloak's ClientScope PUT
+endpoint silently ignores changes to an *existing* scope's nested `protocolMappers` (already
+flagged in `apl-tasks` with `// @NOTE this PUT operation is almost pointless...`) -- true for
+every mapper in that list, not just this one -- so on the already-bootstrapped cluster this was
+tested against, the mapper had to be added by hand directly on the client to prove the claim/team
+mechanism works at all. A clean install creates the client scope via `POST` with the full mapper
+list included from the start, which should not hit this limitation -- but that path itself is
+unverified. Re-run the browser check below on a fresh install before trusting this note is stale.
+
+```bash
+D=$(kubectl get httproute vikunja -n vikunja -o jsonpath='{.spec.hostnames[0]}' | sed 's/^vikunja\.//')
+curl -sk -H "Authorization: Bearer $TOKEN" "https://keycloak.$D/admin/realms/otomi/clients/otomi/protocol-mappers/models" \
+  | jq '.[] | select(.name=="vikunja-groups")'   # empty means the mapper never landed
+```
+
+Browser check: sign in to Vikunja as a member of a real team (not just `platform-admin`, which was
+the one actually tested) → **Teams** shows an entry named `Team <id> (otomi-idp)`.
 
 ### Browser checks ⬜ — no command covers these
 
@@ -1382,6 +1410,25 @@ correctly empty. Sign in, wait up to `VIKUNJA_RECONCILE_INTERVAL` (60s), then lo
 
 Still **not** proven: one real agent turn against the Claude API. TLS to Anthropic is proven
 (401 from inside the pod); an actual completion is not.
+
+⛔ **`tools.search` is back on its buggy default — the "off" workaround was reverted, unfixed.**
+Commit `c54acf38c` (2026-08-26) added `TURNSTONE_TOOLS_SEARCH: "off"` to force this feature off
+(it has two real bugs: silently drops MCP tool results past ~33k tokens, and 400s on session
+resume — see that commit's message for how each was verified live). That line was never run
+through an actual install until 2026-08-27, and it blocked one outright: the literal word `off`
+survives this chart's own render, but the operator's generic YAML writer (`objectToYaml`,
+`src/common/utils.ts`) serializes it with a YAML-1.2 emitter that leaves `off`/`on`/`yes`/`no`
+unquoted, and Argo CD then reads that text with a YAML-1.1 (Go) parser, which resolves bare `off`
+to the boolean `false` — so the `turnstone-server`/`turnstone-console` Deployments fail Argo CD's
+typed-patch server-side apply (`expected string, got ...Value:false`) and are never created. Ruled
+out as a chart bug: `helm template` alone renders the value correctly quoted; the corruption is
+only in the operator's Application-values serialization step, confirmed by reading the live
+Application's `spec.source.helm.values`. Reverted rather than patching `objectToYaml` (that
+function is upstream-derived, shared by every other operator-generated value, and a one-line fix
+there was judged riskier to carry through future upstream syncs than living with tool-search's two
+known bugs a while longer). **Until a real fix lands, both tool-search bugs above are live again.**
+TODO next attempt: set it via Turnstone's admin API from a post-install hook instead of an env
+var, so the value never passes through `objectToYaml` at all.
 
 ⬜ Known gaps, neither a regression:
 - **Turnstone rights need more work.** `apl-team-lead` is a global power-user role, not a team
