@@ -1,6 +1,6 @@
 # kind cluster + MetalLB + Calico. SETUP.md steps 1-4.
 #
-# Output style: see .taskfiles/lib.sh. Everything noisy goes through apl_run (captured to
+# Output style: see .taskfiles/lib.sh. Everything noisy goes through apl_run_sub (captured to
 # .taskfiles/state/logs/<slug>.log unless VERBOSE=true) -- `kind create cluster` included. It
 # used to be exempted, on the theory that its own tick-per-step output was the target style;
 # seen in a full run it is just the one loud, multi-emoji block in an otherwise plain stream,
@@ -23,11 +23,11 @@ tasks:
         . "{{.LIB}}"
         apl_header "Cluster"
         del() { set -eu; kind delete cluster --name {{.CLUSTER_NAME}}; }
-        apl_run cluster-delete "Removing any existing '{{.CLUSTER_NAME}}' cluster" del || exit $?
+        apl_run_sub cluster-delete "Removing any existing '{{.CLUSTER_NAME}}' cluster" del || exit $?
       - |
         . "{{.LIB}}"
         create() { set -eu; kind create cluster --name {{.CLUSTER_NAME}}; }
-        apl_run cluster-create "Creating kind cluster '{{.CLUSTER_NAME}}'" create || exit $?
+        apl_run_sub cluster-create "Creating kind cluster '{{.CLUSTER_NAME}}'" create || exit $?
       - |
         . "{{.LIB}}"
         # kind create cluster returns before the node is Ready -- checking immediately shows
@@ -38,7 +38,7 @@ tasks:
           kubectl --context {{.KIND_CONTEXT}} get nodes -o wide
           kubectl --context {{.KIND_CONTEXT}} get storageclass
         }
-        apl_run cluster-ready "Waiting for the node to become Ready" ready || exit $?
+        apl_run_sub cluster-ready "Waiting for the node to become Ready" ready || exit $?
         apl_info "nodes/storageclass detail: $(apl_logfile cluster-ready)"
 
   metallb:
@@ -51,7 +51,7 @@ tasks:
         # Derive the range from the live docker network -- it has been both 172.18.x and 172.19.x
         # on the same machine across rebuilds. A stale address makes MetalLB advertise an
         # unreachable IP, which presents as a platform failure rather than a config mistake.
-        # Not wrapped in apl_run: the derived pool is signal, and it is one line.
+        # Not wrapped at all (not even apl_run_sub): the derived pool is signal, and it is one line.
         set -euo pipefail
         SUBNET=$(docker network inspect kind --format '{{`{{range .IPAM.Config}}{{println .Subnet}}{{end}}`}}' | grep -v ':')
         PREFIX=$(echo "$SUBNET" | cut -d. -f1-2)
@@ -69,7 +69,7 @@ tasks:
           helm repo update metallb
           helm upgrade --install metallb metallb/metallb -n mlb
         }
-        apl_run metallb-install "Installing the MetalLB chart" install || exit $?
+        apl_run_sub metallb-install "Installing the MetalLB chart" install || exit $?
       - |
         . "{{.LIB}}"
         # Wait for the controller's admission webhook to actually be serving, rather than
@@ -82,7 +82,7 @@ tasks:
           set -eu
           kubectl wait --for=condition=Available deployment/metallb-controller -n mlb --timeout=240s
         }
-        apl_run metallb-available "Waiting for metallb-controller to become Available (<=240s)" avail || exit $?
+        apl_run_sub metallb-available "Waiting for metallb-controller to become Available (<=240s)" avail || exit $?
       # Deployment Available only means the pod passed its readiness probe -- the webhook Service's
       # endpoint can lag a few seconds behind that, and the apply below goes through the validating
       # webhook. Hit blind that gap once as "connection refused" from the webhook Service, so retry
@@ -114,11 +114,11 @@ tasks:
           echo "error: metallb webhook never became reachable after 10 retries" >&2
           exit 1
         }
-        apl_run metallb-pool "Applying the IPAddressPool (retries the webhook, 10 x 5s)" pool || exit $?
+        apl_run_sub metallb-pool "Applying the IPAddressPool (retries the webhook, 10 x 5s)" pool || exit $?
       - |
         . "{{.LIB}}"
         pods() { set -eu; kubectl get pods -n mlb; }
-        apl_run metallb-pods "Recording MetalLB pod state" pods || exit $?
+        apl_run_sub metallb-pods "Recording MetalLB pod state" pods || exit $?
 
   cni:
     desc: "Install Calico CNI (layers over kind's dormant kindnet)"
@@ -130,9 +130,9 @@ tasks:
           set -eu
           kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.3/manifests/calico.yaml
         }
-        apl_run calico-apply "Applying the Calico manifest" apply || exit $?
+        apl_run_sub calico-apply "Applying the Calico manifest" apply || exit $?
         wait_ready() {
           set -eu
           kubectl wait --for=condition=Ready pod -l k8s-app=calico-node -n kube-system --timeout=120s
         }
-        apl_run calico-ready "Waiting for calico-node to become Ready (<=120s)" wait_ready || exit $?
+        apl_run_sub calico-ready "Waiting for calico-node to become Ready (<=120s)" wait_ready || exit $?

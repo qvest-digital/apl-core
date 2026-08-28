@@ -44,7 +44,8 @@ git merge upstream/main   # resolve conflicts per §3, do not --no-commit and ha
 
 Upstream's 05b2e9499..HEAD diff and this fork's 05b2e9499..main diff both touch the files below.
 Everything else the fork added (new charts, new `values/vikunja/*`, `values/turnstone/*`, the
-`*-patches/` directories, the docs) is a new path from this fork's side — those only conflict if
+`*-patches/` directories, `Taskfile.yml` + `.taskfiles/`, the docs) is a new path from this fork's
+side — those only conflict if
 upstream happens to have added the same path, which is unlikely and worth a second look if it
 happens rather than assuming either side wins.
 

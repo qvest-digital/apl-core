@@ -201,9 +201,11 @@ tasks:
           echo
           # The file keeps its provenance header; the terminal does not need it. Not `cat |
           # grep` -- CLAUDE.md rule 2, and grep exits 1 on no match, which would fail the task.
+          # Nothing is printed after the password block -- it is the last thing on screen, so it
+          # is the thing you can still see once the run scrolls to a stop. The per-step logs are
+          # already announced at the top of the run ($APL_LOG_DIR), so repeating the pointer here
+          # would only bury the passwords.
           grep -v '^#' passwords.txt || true
-          echo
-          apl_info "Per-step logs from this run: $APL_LOG_DIR/"
 
   down:
     desc: "Delete the kind cluster and local generated state (destructive; requires CONFIRM=yes)"

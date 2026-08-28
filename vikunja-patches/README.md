@@ -28,6 +28,15 @@ approach is wanted again, the removal commit and everything it deleted is in `gi
 
 ## apl-api — required
 
+> **You normally do not run any of this by hand.** `.taskfiles/images.yml`'s `build-api` /
+> `build-console` tasks already clone both repos, apply this patch *and* `turnstone-patches/`'s (in
+> that order — the turnstone patch's context lines assume this one applied), sync the schema, build
+> and `kind load`. Because this lab runs both apps from one `apl-api` and one `apl-console` image,
+> the Taskfile tags both as `v0.0.0-turnstone`, not the vikunja-only tag below. The commands here
+> are the manual equivalent, for a vikunja-only integration or when debugging the Taskfile.
+> Note also that `npm` must run inside `linode/apl-tools` rather than on the host — see `CLAUDE.md`
+> and `SETUP.md`'s "Do not run npm on the host".
+
 ```bash
 git clone https://github.com/linode/apl-api.git && cd apl-api
 git apply /path/to/apl-core/vikunja-patches/apl-api.patch

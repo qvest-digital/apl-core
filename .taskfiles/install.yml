@@ -27,6 +27,7 @@ tasks:
         mkdir -p {{.STATE_DIR}}
         TOGGLES_FILE={{.STATE_DIR}}/app_toggles.env
         : > "$TOGGLES_FILE"
+        chmod 0600 "$TOGGLES_FILE"  # may end up holding ANTHROPIC_API_KEY in plaintext below
 
         INTERACTIVE=false
         if [ -t 0 ] && [ "${NONINTERACTIVE:-false}" != "true" ]; then
@@ -90,6 +91,46 @@ tasks:
         ask VIKUNJA_ENABLED vikunja yes
         ask TURNSTONE_ENABLED turnstone yes
 
+        # Deliberately unconditional -- asked regardless of the TURNSTONE_ENABLED answer above,
+        # and sealed into values.yaml either way (install:values). bootstrapSealedSecrets seals
+        # every schema x-secret exactly once, at this initial `helm install`, with no dependency
+        # on apps.turnstone.enabled -- it runs once, ever, and is never revisited by the operator's
+        # ongoing git-poll reconcile loop. Skipping this question because Turnstone is off today
+        # means the key can never be added later without recreating the cluster: turning Turnstone
+        # on afterwards via the Console only flips the enabled flag, it can't retroactively seal a
+        # secret. Answering here, even with Turnstone off, means flipping it on later just works.
+        apl_section "Anthropic API key (optional -- powers Turnstone's chat features)"
+        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+          apl_skip "Anthropic API key -- explicit ANTHROPIC_API_KEY already set, not asking"
+        elif [ "$INTERACTIVE" = "true" ]; then
+          apl_info "Sealed now regardless of the Turnstone answer above -- lets you turn Turnstone"
+          apl_info "on later from the Console with no extra step. Blank is fine: Turnstone (if"
+          apl_info "enabled) still starts and SSO still works, only chat prompts fail until a key"
+          apl_info "is set."
+          # `read -rs` is a bash-ism -- go-task embeds mvdan/sh, which accepts `-r` but silently
+          # fails (rc=1, no input consumed) on `-s`. That failure was previously masked by a
+          # `|| ANTHROPIC_API_KEY=""` fallback, which made a broken read indistinguishable from
+          # "user declined" -- the prompt above would print, then immediately skip, with no
+          # chance to type anything. `stty -echo`/`stty echo` gets the same no-echo behavior
+          # portably; verified working under a real pty.
+          printf '   Anthropic API key (sk-ant-..., blank to skip): '
+          stty -echo
+          read -r ANTHROPIC_API_KEY
+          stty echo
+          echo
+        fi
+        ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+        if [ -n "$ANTHROPIC_API_KEY" ]; then
+          # Single-quoted, with embedded single-quotes escaped -- this file is `.`-sourced by
+          # install:values, so an unquoted paste containing whitespace/`$`/backticks/`;` would at
+          # best corrupt the file and at worst get executed.
+          _escaped=$(printf '%s' "$ANTHROPIC_API_KEY" | sed "s/'/'\\\\''/g")
+          echo "export ANTHROPIC_API_KEY='$_escaped'" >> "$TOGGLES_FILE"
+          apl_ok "Anthropic API key: will be sealed"
+        else
+          apl_info "Anthropic API key: skipped -- chat won't work until one is set (any time)"
+        fi
+
         apl_section "Optional platform apps (default: off, including prometheus)"
         ask ALERTMANAGER_ENABLED alertmanager no
         ask GRAFANA_ENABLED grafana no
@@ -111,9 +152,13 @@ tasks:
         apl_section "Summary"
         ON=$(grep '=true$' "$TOGGLES_FILE" | sed -e 's/^export //' -e 's/_ENABLED=true$//' | tr '\n' ' ')
         OFF=$(grep '=false$' "$TOGGLES_FILE" | sed -e 's/^export //' -e 's/_ENABLED=false$//' | tr '\n' ' ')
-        apl_ok "installing: ${ON:-<none>}"
-        apl_info "not installing: ${OFF:-<none>}"
-        apl_info "(git-server, metrics-server also always installed -- see above)"
+        # Both lists cover *optional* apps only. "<none>" here has burned a reader before: it
+        # reads as "nothing gets installed", when in fact the whole core platform below deploys
+        # regardless of every answer given above.
+        apl_ok "optional apps to install: ${ON:-none selected}"
+        apl_info "optional apps skipped: ${OFF:-none}"
+        apl_info "core platform installs regardless: git-server, metrics-server, cert-manager,"
+        apl_info "  argocd, istio, keycloak, sealed-secrets, external-secrets, cnpg, the operator"
 
   schema:
     desc: "Generate chart/apl/values.schema.json (gitignored, generated -- not optional)"
@@ -157,6 +202,12 @@ tasks:
 
   values:
     desc: "Assemble values.yaml (CA + Anthropic key + app toggles), then validate it renders"
+    # Its own fallback prompt (below) can read from the terminal when run standalone with no
+    # app_toggles.env -- same reason install:prompt needs this: Taskfile.yml's `output: group`
+    # buffers a task's entire stdout until it finishes, which silently deadlocks any prompt
+    # inside it (see install:prompt's comment; this task hit the same class of bug, just
+    # unreachable during a normal `task setup` because install:prompt always runs first).
+    interactive: true
     cmds:
       # Not wrapped in apl_run: this block may prompt on the terminal for the Anthropic key, and
       # it prints its own diagnostics. Capturing it would hide the prompt.
@@ -177,18 +228,28 @@ tasks:
           . {{.STATE_DIR}}/app_toggles.env
         fi
 
+        # install:prompt already asked for this, unconditionally and optionally, regardless of
+        # TURNSTONE_ENABLED -- see its comment for why (bootstrapSealedSecrets runs exactly once,
+        # ever, at this install, with no dependency on apps.turnstone.enabled; skipping the
+        # question because Turnstone is off today would mean never being able to add the key
+        # later without recreating the cluster). Only prompt again here if this task is run
+        # standalone and install:prompt never got the chance to ask. Never hard-fail on a missing
+        # key any more: Turnstone's own chart handles a missing key by starting without it (SSO
+        # still works, chat prompts fail until a key is set) -- see values/turnstone/turnstone.gotmpl.
         ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+        if [ -z "$ANTHROPIC_API_KEY" ] && [ ! -f {{.STATE_DIR}}/app_toggles.env ] && [ -t 0 ]; then
+          # See install:prompt's comment on why `read -rs`/`-p` don't work under go-task's shell.
+          printf 'Anthropic API key (sk-ant-..., blank to skip): '
+          stty -echo
+          read -r ANTHROPIC_API_KEY
+          stty echo
+          echo
+        fi
         if [ "${TURNSTONE_ENABLED:-true}" = "true" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
-          if [ -t 0 ]; then
-            read -rsp 'Anthropic API key (sk-ant-...): ' ANTHROPIC_API_KEY; echo
-          fi
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            apl_fail "TURNSTONE_ENABLED=true but no Anthropic API key available (env var unset, and"
-            apl_fail "either not interactive or left blank). Either export ANTHROPIC_API_KEY=sk-ant-... or"
-            apl_fail "run with TURNSTONE_ENABLED=false -- the install would otherwise complete but both"
-            apl_fail "Turnstone pods would sit in CreateContainerConfigError forever."
-            exit 1
-          fi
+          apl_warn "TURNSTONE_ENABLED=true with no Anthropic API key -- Turnstone will start, but"
+          apl_warn "every chat prompt will fail until a key is sealed. bootstrapSealedSecrets only"
+          apl_warn "ever runs at initial install, so the one way to add a key now is: 'task down"
+          apl_warn "CONFIRM=yes' and re-run 'task setup' (or this task) with ANTHROPIC_API_KEY set."
         fi
 
         cat > values.yaml <<EOF
@@ -254,6 +315,25 @@ tasks:
             enabled: ${VIKUNJA_ENABLED:-true}
           turnstone:
             enabled: ${TURNSTONE_ENABLED:-true}
+        EOF
+        # Must be emitted here, immediately after turnstone's own `enabled:`, and before any
+        # other app key -- appending it later (after alertmanager..trivy are already written)
+        # would nest it under whichever app happened to be emitted last instead of turnstone,
+        # since that app's own mapping is the only one still open in the YAML block at that
+        # point. (That was the actual shape of the bug this replaced: anthropicApiKey silently
+        # landing under trivy's config instead of turnstone's, whenever this path was exercised
+        # with a key present.) Written whenever a key was supplied, regardless of
+        # TURNSTONE_ENABLED -- see install:prompt's comment for why.
+        if [ -n "$ANTHROPIC_API_KEY" ]; then
+          {
+            echo "    # Sealed like any x-secret -- never reaches the values repo or Turnstone's DB;"
+            echo "    # the model definition stores the literal \${ANTHROPIC_API_KEY} and Turnstone"
+            echo "    # expands it from the pod environment. See TURNSTONE.md section 2."
+            _yaml_escaped=$(printf '%s' "$ANTHROPIC_API_KEY" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            echo "    anthropicApiKey: \"$_yaml_escaped\""
+          } >> values.yaml
+        fi
+        cat >> values.yaml <<EOF
           alertmanager:
             enabled: ${ALERTMANAGER_ENABLED:-false}
           grafana:
@@ -281,14 +361,6 @@ tasks:
           trivy:
             enabled: ${TRIVY_ENABLED:-false}
         EOF
-        if [ "${TURNSTONE_ENABLED:-true}" = "true" ]; then
-          {
-            echo "    # Sealed like any x-secret -- never reaches the values repo or Turnstone's DB;"
-            echo "    # the model definition stores the literal \${ANTHROPIC_API_KEY} and Turnstone"
-            echo "    # expands it from the pod environment. See TURNSTONE.md section 2."
-            echo "    anthropicApiKey: $ANTHROPIC_API_KEY"
-          } >> values.yaml
-        fi
         unset ANTHROPIC_API_KEY
         chmod 0600 values.yaml
         apl_ok "wrote values.yaml ($(wc -l < values.yaml) lines, mode 0600)"
@@ -308,21 +380,28 @@ tasks:
         apl_run helm-install "helm install apl ./chart/apl" apply || exit $?
 
   watch:
-    # Base cadence 20s (was 60s). Same ~30 min real-world cap: 1800s / 20s = 90 iterations
-    # (was 30 x 60s). Elapsed time is tracked directly in seconds (ELAPSED, incremented by the
-    # actual sleep each iteration) rather than derived from the iteration count, since each
-    # iteration is now shorter than a minute.
-    desc: "Watch apl-installation-status until completed (bounded: 90 x 20s = 30 min cap)"
+    # Base cadence 10s (was 20s, was 60s before that) -- this is the step users watch most
+    # closely for stall-vs-progress, so it gets the tightest polling of any watch loop here.
+    # Same ~30 min real-world cap: 1800s / 10s = 180 iterations.
+    desc: "Watch apl-installation-status until completed (bounded: 30 min cap, polled every 10s)"
+    # Same root cause as install:prompt's `interactive: true`: Taskfile.yml's top-level
+    # `output: group` buffers a task's entire stdout until it finishes. This task reads no input,
+    # but grouping would hold all ~180 poll lines back and dump them at the end -- destroying the
+    # only reason the loop prints per-poll progress at all (a screen that shows nothing for 15
+    # minutes is indistinguishable from a hang). `interactive: true` exempts it from grouping.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
         set -euo pipefail
         LOG=$(apl_logfile install-watch)
         : > "$LOG"
-        apl_section "Waiting for the platform install (bounded: 90 x 20s)"
-        INTERVAL=20
-        ELAPSED=0
-        for i in $(seq 1 90); do
+        # Not apl_section: "--" mid-run, between a list of "▶ ... ✅" steps, reads as a style
+        # switch. "▶" with no trailing "..." matches the step-list look without implying a single
+        # command that completes with one status -- this one prints many lines as it goes.
+        printf '▶ %sWaiting for the platform install (up to 30 min)%s\n' "$APL_B" "$APL_R"
+        INTERVAL=10
+        for i in $(seq 1 180); do
           D=$(kubectl get cm apl-installation-status -n apl-operator -o jsonpath='{.data}' 2>/dev/null || true)
           P=$(kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Running"||$4=="Completed"' | wc -l)
           T=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l)
@@ -333,11 +412,14 @@ tasks:
           printf '%s %s\n' "$(date -Is)" "${D:-<no status configmap yet>}" >> "$LOG"
           STATUS=$(printf '%s' "$D" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
           ATTEMPT=$(printf '%s' "$D" | sed -n 's/.*"attempt":"\([^"]*\)".*/\1/p')
-          # (+MmSs), not "[i/90]" -- 90 is a safety cap on how long we're willing to wait, not a
-          # step count, and printing it as a fraction reads as "10/90 done" when it means "done".
-          # The real progress is the pods count right after it. Elapsed is time actually slept so
-          # far (before this poll), not i * INTERVAL, so it stays accurate however INTERVAL is set.
-          apl_info "(+$((ELAPSED/60))m$((ELAPSED%60))s) install: ${STATUS:-pending} (attempt ${ATTEMPT:-?}) | pods ok ${P}/${T} | operator: ${OP:-absent}"
+          # No "(attempt ?)" placeholder -- the ConfigMap genuinely doesn't exist yet for the
+          # first few polls (helm install just fired), which isn't uncertainty worth flagging,
+          # just too early to have an answer. Show the attempt count once there is one.
+          if [ -n "$ATTEMPT" ]; then ATTEMPT_TXT=" (attempt $ATTEMPT)"; else ATTEMPT_TXT=""; fi
+          # `[P/T]` up front, matching apl_run's own "[k/N] ▶ label" counted-step look -- but this
+          # counts pods ready, not "[i/180]" (180 is a safety cap on patience, not a step count,
+          # and would read as "40/180 done" when it means "done").
+          printf '[%s/%s] ▶ install: %s%s | operator: %s\n' "$P" "$T" "${STATUS:-pending}" "$ATTEMPT_TXT" "${OP:-absent}"
           apl_verbose && apl_dim "raw: ${D:-<none>}"
           # Failure signatures are checked against the pod state and the attempt counter, never
           # against a bare "Error" grep of build output (CLAUDE.md).
@@ -352,15 +434,13 @@ tasks:
             exit 0
           fi
           sleep "$INTERVAL"
-          ELAPSED=$((ELAPSED+INTERVAL))
         done
         apl_fail "install did not complete within 30 minutes -- poll history: $LOG"
         exit 1
 
   watch-argocd:
     # Base cadence 20s (was 60s), same ~30 min real-world cap: 1800s / 20s = 90 iterations (was
-    # 30 x 60s) -- see install:watch's header comment for the elapsed-time tracking rationale,
-    # which applies here identically.
+    # 30 x 60s).
     #
     # On top of that, the confirmation-only gap is shortened further: a real measured run hit
     # full Synced+Healthy at poll 7, then burned one whole base-cadence sleep purely to reach
@@ -373,17 +453,21 @@ tasks:
     # following a first-clean-poll ever gets the short gap; every other poll uses the base
     # cadence. Because that occasional 10s dip means the real cap can land a little under (never
     # over) 90 iterations, this is an ~30 min cap, not an exact one.
-    desc: "Watch Argo CD until every Application is Synced+Healthy (bounded: ~90 x 20s = ~30 min cap)"
+    desc: "Watch Argo CD until every Application is Synced+Healthy (bounded: ~30 min cap)"
+    # Exempt from Taskfile.yml's top-level `output: group` for the same reason as install:watch
+    # above -- grouping would buffer every poll line to the end, so the live progress this loop
+    # exists to give would arrive only once the wait is already over.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
         set -euo pipefail
         LOG=$(apl_logfile install-watch-argocd)
         : > "$LOG"
-        apl_section "Waiting for Argo CD to converge (bounded: ~90 x 20s)"
+        # Not apl_section -- see install:watch's comment on the same line for why.
+        printf '▶ %sWaiting for Argo CD to converge (up to ~30 min)%s\n' "$APL_B" "$APL_R"
         INTERVAL=20
         CONFIRM_INTERVAL=10
-        ELAPSED=0
         STABLE=0
         for i in $(seq 1 90); do
           # TOTAL is recomputed from the live cluster every poll -- never a literal, because the
@@ -396,11 +480,9 @@ tasks:
           OK=$((TOTAL - BADCOUNT))
           P=$(kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Running"||$4=="Completed"' | wc -l)
           T=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l)
-          # (+MmSs), not "[i/90]" -- same reasoning as install:watch above: 90 is a bound on
-          # patience, not a progress denominator, and the real fraction is right after it.
-          # Elapsed is time actually slept so far (before this poll), which stays accurate even
-          # though individual sleeps vary between INTERVAL and CONFIRM_INTERVAL below.
-          apl_info "(+$((ELAPSED/60))m$((ELAPSED%60))s) argocd: ${OK}/${TOTAL} apps Synced+Healthy | pods ${P}/${T}"
+          # `[OK/TOTAL]` up front, matching apl_run's own "[k/N] ▶ label" counted-step look -- see
+          # install:watch's comment on why it's the pod/app count, not "[i/90]".
+          printf '[%s/%s] ▶ apps Synced+Healthy | pods %s/%s\n' "$OK" "$TOTAL" "$P" "$T"
           printf '%s ok=%s/%s pods=%s/%s\n%s\n' "$(date -Is)" "$OK" "$TOTAL" "$P" "$T" "$NOTOK" >> "$LOG"
           # The names of what is still lagging are signal, not noise -- but only under VERBOSE,
           # since early in an install this is many lines a minute. The log always has them.
@@ -425,7 +507,6 @@ tasks:
             SLEEP=$INTERVAL
           fi
           sleep "$SLEEP"
-          ELAPSED=$((ELAPSED+SLEEP))
         done
         apl_fail "Argo CD did not fully converge within 30 minutes -- poll history: $LOG"
         apl_fail "run 'task verify:platform' to see what is stuck"

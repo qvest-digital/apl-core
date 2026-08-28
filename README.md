@@ -58,25 +58,31 @@ otomi:
   coreImagePullPolicy: IfNotPresent
 ```
 
-### Recommended: let Claude drive it
+### Recommended: `task setup`
 
-For this fork the recommended way to bring up a local lab is to point Claude Code at `SETUP.md` and
-let it run:
+For this fork the local `kind` lab is fully automated with [`go-task`](https://taskfile.dev/) —
+`Taskfile.yml` plus `.taskfiles/*.yml` encode every step of `SETUP.md`, including the traps that are
+expensive to rediscover. It no longer needs an agent driving `kubectl`/`docker`/`helm` by hand:
 
 ```bash
-claude --dangerously-skip-permissions
+task setup                       # interactive: one Y/n per optional app, Enter accepts the default
+NONINTERACTIVE=true task setup   # no prompts -- for CI, scripts, and agents
+task verify:platform             # re-runnable health checks against an already-up cluster
+task down CONFIRM=yes            # destructive: deletes the cluster
+task --list                      # everything else
 ```
 
-then ask it to work through `SETUP.md` from the top. `CLAUDE.md` in this repository gives it the
-operational rules it needs — bounded timeouts, verifying artifacts instead of exit codes, building
-from a clean context — so it reaches a working platform without rediscovering the traps.
+The installed binary is not always named `task` (Arch/CachyOS's `go-task` package installs
+`go-task`) — check `which task go-task`. Answering "no" to an app is not a dead end; it can be
+activated from the Console later. The one exception is Turnstone's Anthropic API key, which is
+sealed only at initial install — `task setup` therefore asks for it unconditionally, and it is worth
+supplying even if you leave Turnstone off.
 
-Use that mode on a disposable machine or VM. It executes commands without asking, which is the point
-here, and is not something you want pointed at a workstation you care about.
-
-`SETUP.md` documents the whole path end to end, including the cluster prerequisites, MetalLB, the
-CNI, and why each step is necessary. It is written to be followed literally, by a person or an
-agent.
+`SETUP.md` documents the whole path end to end — the cluster prerequisites, MetalLB, the CNI, and
+*why* each step is necessary. Read it when `task setup` fails, or when changing what the lab does.
+If you do drive it by hand, or with an agent, read `CLAUDE.md` first: it carries the operational
+rules (bounded timeouts, verifying artifacts instead of exit codes, building from a clean context)
+that keep the traps from being rediscovered.
 
 Everything below this section is upstream's documentation and describes the published chart.
 

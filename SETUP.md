@@ -4,7 +4,9 @@ Brings up Akamai App Platform on a local `kind` cluster, installed **from this f
 operator image you build yourself.
 
 Takes roughly **15 minutes**, most of it the image build and the platform install. Needs ~30 GB free
-disk, 6+ vCPU, 12+ GB RAM.
+disk, 6+ vCPU, and **12 GB RAM only for a true minimal install** — the fork's own defaults need
+more, and Prometheus on top of them needs more again. See the measured figures under "Measured RAM"
+below before assuming a 16 GB machine is comfortable.
 
 **Status legend:** ✅ verified on this machine · ⬜ written but not yet executed
 
@@ -27,8 +29,12 @@ platform admin, a team admin and a plain team member.
 
 ⬜ Still unproven: one real agent turn against the Claude API, and the remaining §11.7 checks.
 
-If you only want the previously-verified lab, set `apps.turnstone.enabled: false` and skip 6b and
-6c entirely; nothing else in this file depends on them.
+If you only want the previously-verified lab, set `apps.turnstone.enabled: false`; nothing else in
+this file depends on Turnstone. **Do 6b and 6c anyway.** Both are install-time-only: the root CA
+cannot be retrofitted onto a bootstrapped cluster (step 7), and the API key is sealed exactly once,
+at this initial install, regardless of `apps.turnstone.enabled`. Skip either and the only way to
+turn Turnstone on later is to recreate the cluster. `task setup` asks the API key question
+unconditionally for exactly this reason, and always generates the CA.
 
 If you are an agent working through this file, read [`CLAUDE.md`](CLAUDE.md) first — it carries the
 operational rules and the traps that are expensive to rediscover.
@@ -51,10 +57,20 @@ task setup TURNSTONE_ENABLED=false    # answers just that one prompt for you, no
 NONINTERACTIVE=true task setup        # no prompts at all -- every *_ENABLED var falls back to
                                        # its documented default (see .taskfiles/install.yml's
                                        # `prompt` task for the full app list and defaults)
+RUN_OPERATOR_TESTS=true task setup    # also run the operator image's test:ci suite -- SKIPPED by
+                                       # default for setup speed; opt in before a PR
+VERBOSE=true task setup               # stream every command live instead of capturing it
 task verify:platform                  # re-run the health checks any time against an up cluster
+task verify:vikunja / task verify:turnstone   # the per-app non-browser checklists (steps 10, 11)
 task down CONFIRM=yes                 # destructive: deletes the cluster and generated local state
 task --list                           # every other sub-task (build one image, watch the install, ...)
 ```
+
+Output is quiet by default: one `> doing X ... OK (Ns)` line per step, each step's raw output
+captured to `.taskfiles/state/logs/<step>.log`, and the last 40 lines printed inline if a step
+fails. `task setup` prints nothing after the final credentials block — the log directory is
+announced at the top of the run instead. It does **not** run `task verify:platform` for you; run it
+yourself once the cluster is up.
 
 `task setup` prompts once per optional app (`install:prompt`, run before `cluster:create`) unless
 stdin isn't a terminal or `NONINTERACTIVE=true` is passed, in which case it silently falls back to
@@ -63,6 +79,19 @@ each `*_ENABLED` var's default -- so CI and scripted invocations are unaffected 
 you and is never asked interactively. Saying "no" to an app here is not a dead end: it can be
 switched on later, once the platform is up, from the Console (or a commit to the values git repo)
 -- see "Changing values after install" below and `CLAUDE.md` rule 6.
+
+⚠ **One exception, and it is the reason `install:prompt` asks for the Anthropic API key even when
+you answer "no" to Turnstone:** flipping an app on later cannot seal a *secret*. The key is written
+into the bootstrap `values.yaml` and sealed by `bootstrapSealedSecrets` exactly once, at the initial
+`helm install`, independent of `apps.turnstone.enabled`; the operator's ongoing git-poll reconcile
+loop never re-runs it. Answer that question (blank is fine only if you accept the consequence) —
+skipping it means the only way to add a key later is `task down CONFIRM=yes` and a full re-`setup`.
+
+Two other things `install:prompt` will not ask you about: **git-server and metrics-server are always
+installed** (this lab's GitOps values repo has nowhere else to live; without metrics-server the HPAs
+this fork configures sit `ScalingActive=False`, which Argo CD reads as Degraded and which hangs
+`install:watch-argocd`). **`promtail` is not a toggle at all** in this fork today — nothing in
+`helmfile.d` gates on `apps.promtail.enabled`, so the value has no effect either way.
 
 Installing `go-task`: see the [official install docs](https://taskfile.dev/installation/) for your
 platform. **The installed binary is not always named `task`** — e.g. Arch/CachyOS's `go-task`
@@ -210,14 +239,19 @@ openssl rsa -traditional -in /tmp/apl-ca.key -out /tmp/apl-ca.pkcs1.key   # matc
 openssl x509 -in /tmp/apl-ca.crt -noout -text | grep -q 'Subject Key Identifier' \
   && echo "CA has a subjectKeyIdentifier -- good" || echo "CA IS WRONG, Turnstone SSO will fail"
 
-# 6c. your Anthropic API key -- REQUIRED if you enable Turnstone.
+# 6c. your Anthropic API key -- optional, but worth supplying even if you're not enabling
+#     Turnstone right now (see below).
 #     Turnstone talks to the Claude API and there is nothing to generate here: this is the one
-#     value you have to supply yourself. Without it the install still completes and SSO still
-#     works, but the turnstone-anthropic-key ExternalSecret never syncs and both Turnstone pods
-#     sit in CreateContainerConfigError.
+#     value you have to supply yourself. Without it Turnstone still starts and SSO still works --
+#     the ANTHROPIC_API_KEY env var is wired up as `optional: true`, so a missing/unsynced
+#     turnstone-anthropic-key ExternalSecret no longer blocks the container -- but every chat
+#     prompt fails until a key is set (values/turnstone/turnstone.gotmpl).
+#     Worth answering even with Turnstone off: the platform seals this value exactly once, at
+#     this initial install, with no dependency on apps.turnstone.enabled -- so skipping it here
+#     because Turnstone is off today means the only way to add it later is to recreate the
+#     cluster. Answering now means turning Turnstone on afterwards from the Console just works.
 #     Get one at https://console.anthropic.com/settings/keys -- it starts with `sk-ant-`.
-read -rsp 'Anthropic API key (sk-ant-...): ' ANTHROPIC_API_KEY; echo
-[ -n "$ANTHROPIC_API_KEY" ] || echo "empty -- Turnstone will not start; set apps.turnstone.enabled: false instead"
+read -rsp 'Anthropic API key (sk-ant-..., blank to skip): ' ANTHROPIC_API_KEY; echo
 
 # 7. values + install
 #    NOTE: values.yaml carries two secrets now (the CA private key and your API key), which is why
@@ -313,6 +347,25 @@ kubectl get cm apl-installation-status -n apl-operator -o jsonpath='{.data}'
 
 Done when `status` reads `completed`. On a 12-vCPU machine that took **~4 minutes** and **1 attempt**.
 
+**Measured RAM**, `docker stats` on the kind node container, measured on 2026-08-28 shortly after
+`status: completed`:
+
+| install | resident on the kind node |
+|---|---|
+| true minimal (every `task setup` app prompt answered "no" -- only git-server + metrics-server + the always-on core) | **~7.5-7.9 GiB** (46 pods / 16 namespaces / 37 Argo CD Applications) |
+| this fork's defaults (gitea, harbor, tekton, vikunja, turnstone) | **~9.6-9.9 GiB** |
+| fork defaults **plus Prometheus** | another **~2.36 GiB reserved** on top |
+
+The Prometheus figure is *reservation*, not live usage: `prometheus-po-prometheus-0` alone requests
+`2Gi` and limits at `3Gi`, and that request is what the scheduler holds. Actual usage on an empty
+test cluster was only ~500 Mi across all five kube-prometheus-stack pods — but the reservation is
+what decides whether anything else fits.
+
+Read together: the 12 GB floor below covers the *minimal* install only. On the fork's defaults plus
+Prometheus a **16 GB machine is tight, not comfortable**, and adding further optional apps on top of
+that will not fit. Expect all of this to drift as apps/versions change; re-measure with
+`docker stats --no-stream <kind-node-container>` rather than trusting these numbers long-term.
+
 ---
 
 ## 0. Prerequisites ✅
@@ -320,7 +373,7 @@ Done when `status` reads `completed`. On a 12-vCPU machine that took **~4 minute
 | Needed | This machine |
 |---|---|
 | Kubernetes ≥ 1.33 | kind v0.32.0 → node image v1.36.1 |
-| 6 vCPU / 12 GB RAM | 12 / 31 GB |
+| 6 vCPU / 12 GB RAM (minimal install only — see "Measured RAM" above) | 12 / 31 GB |
 | Default StorageClass | kind ships `standard` (`rancher.io/local-path`) |
 | LoadBalancer with external IP | **not in kind** → MetalLB, step 3 |
 | netpol-capable CNI | **not in kind** → Calico, step 4 |
@@ -725,9 +778,16 @@ The `values.yaml` from the Quickstart. Eight things in it are load-bearing:
 
   It never reaches Turnstone's database either — the model definition stores the literal
   `${ANTHROPIC_API_KEY}` and Turnstone expands it from the pod environment when it builds its model
-  registry. Omit it and the install still completes and SSO still works, but both Turnstone pods
-  stay in `CreateContainerConfigError` because the ExternalSecret has nothing to sync. If you do not
-  have a key, set `apps.turnstone.enabled: false` rather than leaving the field blank.
+  registry. Omit it and the install still completes, SSO still works, and Turnstone's pods still
+  come up — the env var is wired as `optional: true` (`values/turnstone/turnstone.gotmpl`), so a
+  missing/unsynced `turnstone-anthropic-key` ExternalSecret no longer blocks the container. Only
+  the chat feature itself fails until a key is set.
+
+  Worth supplying even with `apps.turnstone.enabled: false`: `bootstrapSealedSecrets` seals every
+  `x-secret` exactly once, at this initial install, independent of any app's `enabled` flag. Skip
+  this because Turnstone is off today and the only way to add it later is recreating the cluster —
+  turning Turnstone on afterwards from the Console flips `enabled` alone, it can't retroactively
+  seal a secret.
 
 - **`apps.gitea.enabled` / `apps.harbor.enabled` / `apps.tekton.enabled`** ⬜ — all default to
   `false` (`helmfile.d/snippets/defaults.yaml`), so without these lines the platform installs
@@ -1439,13 +1499,15 @@ D=$(kubectl get httproute turnstone -n turnstone -o jsonpath='{.spec.hostnames[0
 # 1. the app itself
 kubectl get pods -n turnstone                       # server + console Running; migrate Job Completed
 kubectl get cluster -n turnstone                    # CNPG, expect Cluster in healthy state
-kubectl get externalsecrets -n turnstone            # all 4 SecretSynced
+kubectl get externalsecrets -n turnstone            # all 5 SecretSynced (not 4 -- see the note above)
 kubectl get jobs -n turnstone                       # turnstone-bootstrap-admin, 1/1 Complete
 ```
 
-⚠ If both pods are in `CreateContainerConfigError`, check `turnstone-anthropic-key` first — a
-missing or blank `apps.turnstone.anthropicApiKey` leaves that ExternalSecret with nothing to sync,
-and the `secretKeyRef` then blocks the pod. That is step 6c, not a platform fault.
+⚠ A missing/blank `apps.turnstone.anthropicApiKey` no longer causes `CreateContainerConfigError` --
+the env var's `secretKeyRef` is `optional: true` (`values/turnstone/turnstone.gotmpl`), so pods come
+up fine and only the chat feature fails, silently, until a key is set (step 6c). If both pods
+genuinely are in `CreateContainerConfigError`, the cause is something else -- check the usual
+suspects (`kubectl describe pod`) rather than assuming the API key.
 
 ### 2. The certificate chain — check this before blaming OIDC ⬜
 
@@ -1600,7 +1662,8 @@ In rough order of likelihood, with the check that distinguishes each:
    This was observed on a clean install and is what demoted the certificate chain to second place.
 2. **Still no sign-in button, and discovery is genuinely failing.** *Now* it is the certificate
    chain — section 2 above.
-3. **Pods in `CreateContainerConfigError`.** The API key is missing; step 6c.
+3. **Pods in `CreateContainerConfigError`.** No longer the API key -- that's `optional: true` now
+   (step 6c). Check `kubectl describe pod` for the actual missing config/secret.
 4. **Empty Models tab.** The `model =` vs `name =` trap; section 3.
 5. **Bootstrap Job burning retries.** `container not found` means the console never became
    Available. `deployments.apps "turnstone-console" not found` is different and means the *gate*
@@ -1643,6 +1706,15 @@ the note just above, once install is `completed` that *is* where configuration l
 whose chart already exists at the Argo CD-tracked `APPS_REVISION` (e.g. flipping `gitea`/`harbor`/
 `tekton`/`vikunja`/`turnstone`/etc. from `enabled: false` to `true`) this way works live, on an
 already-running cluster, with no rebuild.
+
+⚠ **What this path cannot do is seal a secret.** `bootstrapSealedSecrets` (`src/cmd/bootstrap.ts`,
+`src/common/sealed-secrets.ts`) seals every schema `x-secret` exactly once, at the initial
+`helm install`, and the operator's poll/reconcile loop never re-invokes it. So flipping
+`apps.turnstone.enabled` to `true` later gives you a running, SSO-working Turnstone whose chat
+feature cannot be made to work: `apps.turnstone.anthropicApiKey` had to be present in the bootstrap
+`values.yaml` (step 6c). Adding one afterwards means recreating the cluster —
+`task down CONFIRM=yes`, then `task setup` with the key supplied. Every *other* app enables cleanly
+after the fact; this one value is the exception.
 
 What was tried below, and does not work, is narrower: enabling `apps.vikunja` back when
 `charts/vikunja` **did not exist yet** at the revision Argo CD was already syncing — a chart-existence

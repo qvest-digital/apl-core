@@ -54,7 +54,17 @@ the same way SETUP.md already proved works. Useful sub-tasks (see `task --list`)
   `NONINTERACTIVE=true task setup` instead so every `*_ENABLED` var falls back to its documented
   default without blocking on a terminal read you cannot answer; this is also what CI should use.
   (Passing any `*_ENABLED=` explicitly answers just that one app either way, interactive or not.)
-- `ANTHROPIC_API_KEY=sk-ant-... NONINTERACTIVE=true task setup` — fully unattended, for Turnstone
+- `ANTHROPIC_API_KEY=sk-ant-... NONINTERACTIVE=true task setup` — fully unattended, for Turnstone.
+  ⛔ **Supply the key even if Turnstone is off for this run.** `install:prompt` asks for it
+  unconditionally and `install:values` seals it either way, because `bootstrapSealedSecrets`
+  (`src/cmd/bootstrap.ts`, `src/common/sealed-secrets.ts`) seals every schema `x-secret` exactly
+  once, at the initial `helm install`, independent of any app's `enabled` flag, and the operator's
+  git-poll reconcile loop never re-runs it. This is the **one** exception to "any app can be
+  switched on later from the Console with no extra step": turning Turnstone on afterwards flips
+  `apps.turnstone.enabled` and nothing else — the only way to add a key later is
+  `task down CONFIRM=yes` followed by a fresh `task setup` with the key. Turnstone itself no longer
+  *fails* without one (the env var's `secretKeyRef` is `optional: true`, so the pod starts and SSO
+  works); only chat does.
 - The operator image's test suite is **skipped by default** for setup speed
   (`--build-arg SKIP_TESTS=true`, wired in `.taskfiles/images.yml`'s `build-operator`) — pass
   `RUN_OPERATOR_TESTS=true task setup` to run it instead (e.g. before a PR, or when actually
@@ -301,6 +311,17 @@ git ls-files charts/<name> | grep values.yaml     # must not be empty
 **Generate the chart schema before installing.** `chart/apl/values.schema.json` is gitignored and
 generated. Without it `helm install ./chart/apl` validates **nothing** — silently, with no warning.
 Run `bin/gen-chart-schema.sh`. See `SETUP.md` for why.
+
+**A new Taskfile task that prompts, or that prints progress as it goes, needs
+`interactive: true`.** `Taskfile.yml` sets `output: group` globally — required so that
+`cluster:up` and `images:build-all`, which `cluster-and-images` runs as parallel `deps:`, don't
+interleave their status lines character-by-character. The side effect is that grouping buffers a
+task's **entire** stdout until its script block exits. A prompt inside such a task deadlocks
+silently (the question sits in the buffer while `read -r` waits for an answer nobody can see), and
+a long poll loop prints nothing until it is already over — both indistinguishable from a hang while
+they happen. Marking the task `interactive: true` exempts it from grouping. `install:prompt`,
+`install:values`, `install:watch`, `install:watch-argocd` and `images:load-all` all carry it for
+this reason; any future task of either shape needs it too.
 
 **A half-installed platform is not salvageable.** `helm uninstall apl` removes the operator only;
 every release the *operator* created survives. Delete the cluster instead.

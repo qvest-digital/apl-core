@@ -331,11 +331,23 @@ Both take the identical path afterwards: SealedSecret in `apl-secrets/<app>-secr
 `dns.provider.linode.apiToken`, `obj.provider.linode.secretAccessKey`, `alerts.slack.url`. Turnstone's
 `anthropicApiKey` is one schema entry and nothing else.
 
-⚠ **Say what happens when it is absent, in the schema description and in `SETUP.md`.** A blank
-operator-supplied secret does not fail the install: the ExternalSecret simply never syncs, and the
-pod sits in `CreateContainerConfigError`, which reads like a platform fault rather than "you forgot
-to paste a key". Document the symptom next to the field, and give people the option of disabling the
-app instead.
+⚠ **Say what happens when it is absent, in the schema description and in `SETUP.md`** — and make
+that description true. A blank operator-supplied secret does not fail the install, but by default
+the ExternalSecret never syncs and the pod sits in `CreateContainerConfigError`, which reads like a
+platform fault rather than "you forgot to paste a key". If your schema description claims the app
+degrades gracefully without the key, mark the env var's `secretKeyRef` **`optional: true`** so it
+actually does: Turnstone's `ANTHROPIC_API_KEY` in `values/turnstone/turnstone.gotmpl` does exactly
+this, so the pod starts and SSO works with only the chat feature failing. Otherwise, document the
+symptom next to the field and give people the option of disabling the app instead.
+
+⛔ **A secret cannot be added after install — plan the question accordingly.**
+`bootstrapSealedSecrets` (`src/cmd/bootstrap.ts`, `src/common/sealed-secrets.ts`) seals every
+`x-secret` exactly once, at the initial `helm install`, independent of any app's `enabled` flag, and
+the operator's git-poll reconcile loop never re-invokes it. So the usual reassurance — "leave the
+app off, activate it from the Console later" — does **not** extend to its operator-supplied secret:
+enabling the app later flips `enabled` and nothing else. `install:prompt` in `.taskfiles/install.yml`
+therefore asks for the Anthropic key unconditionally, regardless of the Turnstone answer, and seals
+it either way. Do the same for any app you add that needs one.
 
 ⛔ **Prefer a config file over a bootstrap API call, if the app reads one.** The obvious way to seed
 app-side configuration is a Job that logs in and POSTs it. That path is long: mint a token with the
@@ -669,7 +681,8 @@ Each of these cost real time. The first four are fatal-but-silent.
 | An upstream chart with no `extraEnv`/`volumes` hooks | nothing to override — no config file can be mounted and no flag passed; found late if not grepped in Phase 0 |
 | A `-raw` object colliding with a chart object name | two releases fight over one object; `helm template` finds it in seconds |
 | Seeding app config through its admin API | needs a scoped token, a permission, *and* a fan-out reload — omit the reload and one process sees the change while another does not |
-| An operator-supplied secret left blank | ExternalSecret never syncs, pod sits in `CreateContainerConfigError`, reads like a platform fault |
+| An operator-supplied secret left blank, with no `optional: true` on the `secretKeyRef` | ExternalSecret never syncs, pod sits in `CreateContainerConfigError`, reads like a platform fault |
+| Not asking for an operator-supplied secret because the app is off | `bootstrapSealedSecrets` seals every `x-secret` once, at initial install only — enabling the app later cannot add one; the cluster has to be recreated |
 | Planning a team-sync operator before checking the app has teams | an operator with nothing to push into; claim-driven role mapping was the answer and deletes the phase |
 | App missing from `defaults.gotmpl`'s database list | install dies rendering `<app>-otomi-db` |
 | A fixture supplying what production derives | suite goes green on a branch whose install cannot render |

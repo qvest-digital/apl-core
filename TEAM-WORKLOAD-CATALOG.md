@@ -171,8 +171,9 @@ out-of-band in the target namespace — never committed to this repo.
 file, and the `env/teams/labteam/workloads/agenticbaseline.yaml` file all live in git repos that are
 themselves recreated empty by a fresh `kind` cluster install (Gitea starts with no repos; the
 `otomi/values` repo is bootstrapped fresh from `values.yaml` + `values.env.yaml`, not from a
-snapshot of a previous cluster's edits). A `kind delete cluster` + reinstall per `SETUP.md` loses
-all three files above, exactly the same caveat `VIKUNJA-TURNSTONE-PIPELINE.md` already carries for
-the pipeline these charts are built from. If this is ever meant to persist across rebuilds, the real
-fix is a `SETUP.md` step (or a small bootstrap script) that recreates the Gitea repo, pushes
-`charts/agentic-sdlc`, and writes both env files — not a manual redo each time.
+snapshot of a previous cluster's edits). A `task down CONFIRM=yes` + `task setup` (or a manual
+`kind delete cluster` + reinstall per `SETUP.md`) loses all three files above, exactly the same
+caveat `VIKUNJA-TURNSTONE-PIPELINE.md` already carries for the pipeline these charts are built from.
+If this is ever meant to persist across rebuilds, the real fix is a new task in `.taskfiles/`
+(documented alongside the matching `SETUP.md` step, as every other task is) that recreates the Gitea
+repo, pushes `charts/agentic-sdlc`, and writes both env files — not a manual redo each time.

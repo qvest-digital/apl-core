@@ -26,7 +26,9 @@ platform's single Keycloak OIDC client (`otomi`).
   (`values/vikunja/vikunja-raw.gotmpl` — the chart's own `additionalObjects:` hook fails
   `helm lint`, see the comment there), wrapped in `supergateway` to speak HTTP since it's
   npm-only and stdio-only. Image: `vikunja-mcp/Dockerfile` in this repo, built and `kind load`ed
-  like `apl-tools-local` — see `SETUP.md`'s "Vikunja MCP" step.
+  like the other locally-built images. **`task setup` does this for you** —
+  `.taskfiles/images.yml`'s `build-vikunja-mcp` builds it whenever `VIKUNJA_ENABLED` is true and
+  `load-all` loads it; see `SETUP.md`'s "Vikunja MCP" step only if you are building it by hand.
 - **NetworkPolicy**: `charts/apl-network-policies/templates/networkpolicies/gitea.yaml` has a new
   ingress block admitting the `turnstone` namespace/pod label. Vikunja has **no NetworkPolicy at
   all** today (confirmed live — `kubectl get networkpolicy -n vikunja` returns nothing), so

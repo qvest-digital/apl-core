@@ -22,6 +22,13 @@ patch first — `apl-api.patch` here has `- vikunja` in its context lines and wi
 
 ## apl-api — required
 
+> **You normally do not run any of this by hand.** `.taskfiles/images.yml`'s `build-api` /
+> `build-console` tasks already clone both repos, apply the vikunja patch then this one, sync the
+> schema, build and `kind load`, tagging both images `v0.0.0-turnstone`. The commands here are the
+> manual equivalent, for debugging the Taskfile or re-rolling a patch. Note that `npm` must run
+> inside `linode/apl-tools` rather than on the host — see `CLAUDE.md` and `SETUP.md`'s "Do not run
+> npm on the host".
+
 ```bash
 git clone https://github.com/linode/apl-api.git && cd apl-api
 git apply /path/to/apl-core/vikunja-patches/apl-api.patch

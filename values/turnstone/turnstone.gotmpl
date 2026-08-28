@@ -273,6 +273,11 @@ extraEnv:
       secretKeyRef:
         name: turnstone-anthropic-key
         key: ANTHROPIC_API_KEY
+        # No key supplied at setup time -- or Turnstone enabled later via the Console without one
+        # -- means this Secret never gets created (its ExternalSecret has nothing to sync). Without
+        # `optional: true` that's a hard `CreateContainerConfigError`, not the degraded-but-running
+        # state the app's own schema description promises ("still starts... every prompt fails").
+        optional: true
 
   {{- /*
     TURNSTONE_TOOLS_SEARCH ("off", the workaround for Anthropic's native tool-search /

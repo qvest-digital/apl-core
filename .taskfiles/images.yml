@@ -191,6 +191,12 @@ tasks:
 
   load-all:
     desc: "Load every built image into the kind cluster"
+    # Same root cause as install:watch's `interactive: true` (see its comment): this whole task
+    # is ONE script block (the header print + the entire loop below), and Taskfile.yml's
+    # top-level `output: group` buffers a block's output until it exits -- so nothing printed,
+    # not even the "Loading images into kind" header, until every image finished loading
+    # (~60-70s of apparent silence, confirmed live). `interactive: true` exempts it from grouping.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
