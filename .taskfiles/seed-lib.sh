@@ -1272,6 +1272,53 @@ runner_drain_queued() {
   return "$_rdq_rc"
 }
 
+# runner_rerun_stale_failures <team> <repo> <pat> -- reruns a CI run that failed only because it
+# raced the chart it depends on.
+#
+# seed:apps' push does two things at once: it updates .gitea/runner/chart AND triggers CI. Gitea
+# starts the run in about a second; Argo CD needs a few more to apply the new chart to the
+# EventListener's TriggerTemplate. A run that starts inside that window gets a runner built from
+# the PREVIOUS template. Observed live 2026-08-29: a run started 6s before Argo applied a pod
+# annotation it needed, so its runner came up with an Istio sidecar, every `pip install` was reset
+# by the mesh, and the run failed -- while the very next run on the same commit passed.
+#
+# Deliberately NOT a blanket retry-on-red: it only reruns a failure that finished BEFORE the
+# ci-runner app's last sync completed, i.e. one provably executed against a superseded template.
+# A genuinely red build finishes after that sync and is left exactly as it is.
+runner_rerun_stale_failures() {
+  _rrs_team=$1; _rrs_repo=$2; _rrs_pat=$3
+  _rrs_sync=$(kubectl --context "$KIND_CTX" --request-timeout=15s -n argocd \
+    get application "team-$_rrs_team-ci-runner" \
+    -o jsonpath='{.status.operationState.finishedAt}' 2>/dev/null || true)
+  if [ -z "$_rrs_sync" ]; then
+    echo "  no recorded ci-runner sync time for team-$_rrs_team -- skipping stale-failure check"
+    return 0
+  fi
+  _rrs_stale=$(curl -sk --max-time 20 \
+    "https://gitea.$DOMAIN/api/v1/repos/team-$_rrs_team/$_rrs_repo/actions/runs?limit=20" \
+    -H "Authorization: token $_rrs_pat" 2>/dev/null \
+    | jq -r --arg sync "$_rrs_sync" \
+        '[.workflow_runs[]?
+          | select(.conclusion=="failure")
+          # A run with NO usable timestamp is skipped, never rerun: an empty string sorts before
+          # every real time, so a `// ""` fallback here would silently turn this into the blanket
+          # retry-on-red this function exists to avoid.
+          | select((.started_at // "") != "")
+          | select(.started_at < $sync)
+          | .id] | join(" ")' 2>/dev/null || true)
+  [ -n "$_rrs_stale" ] || return 0
+  for _rrs_id in $_rrs_stale; do
+    _rrs_http=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST \
+      "https://gitea.$DOMAIN/api/v1/repos/team-$_rrs_team/$_rrs_repo/actions/runs/$_rrs_id/rerun" \
+      -H "Authorization: token $_rrs_pat")
+    case "$_rrs_http" in
+      20*) echo "  rerunning run $_rrs_id -- it finished before the runner chart synced (HTTP $_rrs_http)" ;;
+      *)   echo "  warning: rerun of stale run $_rrs_id returned HTTP $_rrs_http" >&2 ;;
+    esac
+  done
+  return 0
+}
+
 # gitea_unprotect_branch <org> <repo> <pat> [branch] -- removes the branch protection rule if one
 # exists. 404 is success (nothing to remove).
 #

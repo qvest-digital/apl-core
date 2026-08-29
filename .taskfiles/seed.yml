@@ -1184,6 +1184,25 @@ tasks:
           # change, Gitea restarting mid-delivery), which is why this is a reusable function rather
           # than something inlined here.
           runner_drain_queued "$_team" "$_repo" "$GITEA_PAT" || return 1
+
+          # Wait for Argo to have applied the pushed chart before judging any CI result. The
+          # EventListener being Available says a sink is answering, NOT that it is answering with
+          # the current template -- those are different facts, and only the second one matters for
+          # what a runner pod ends up looking like.
+          _cra="team-$_team-ci-runner"
+          _cs_i=0
+          while [ "$_cs_i" -lt 30 ]; do
+            _cs_i=$((_cs_i + 1))
+            _cs=$(kubectl --context "$KIND_CTX" --request-timeout=15s -n argocd \
+              get application "$_cra" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            [ "$_cs" = "Synced" ] && break
+            [ $((_cs_i % 6)) -eq 0 ] && echo "  waiting for $_cra to report Synced (${_cs_i}/30, last: ${_cs:-unknown})"
+            sleep 5
+          done
+          [ "$_cs" = "Synced" ] || echo "  warning: $_cra is ${_cs:-unknown}, not Synced -- a runner may use a stale template" >&2
+
+          # Then replay anything that failed against the template it superseded.
+          runner_rerun_stale_failures "$_team" "$_repo" "$GITEA_PAT" || return 1
         }
 
         # apl_run_parallel hands each item to the function as ONE argument, so this adapter splits

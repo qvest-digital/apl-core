@@ -412,6 +412,24 @@ comparing a failing pod against a working one, check the annotations before anyt
 `kubectl get pod <p> -o json | jq .metadata.annotations` answered this in one command after a long
 detour through mesh config and network policies.
 
+**18. Changing the runner chart makes the next CI run race the chart it depends on.**
+`seed:apps`' push does two things at once: it updates `.gitea/runner/chart` AND triggers CI. Gitea
+starts the run in about a second; Argo needs a few more to apply the new chart to the
+TriggerTemplate. A run that starts inside that window gets a runner built from the *previous*
+template. Observed live 2026-08-29: a run started at 20:56:52Z, Argo applied the chart at
+20:56:58Z, and the run failed for want of the pod annotation in trap 17 -- while the very next run
+on the same commit passed. Note what this defeats: waiting for the EventListener to be Available
+proves a sink is answering, not that it is answering with the current template.
+
+Handled by `runner_rerun_stale_failures`, which reruns only a failure that finished BEFORE the
+`ci-runner` app's last sync -- provably executed against a superseded template. It is deliberately
+not a retry-on-red: a genuinely red build finishes after that sync and is left alone, and a run
+with no usable timestamp is skipped rather than rerun (an empty string sorts before every real
+time, so a `// ""` fallback would quietly turn this into the blanket retry it exists to avoid).
+This only affects the edit-a-chart-and-reseed loop. A fresh cluster cannot hit it: `seed:apps`
+pushes before any EventListener exists, so the run simply queues (trap 12) and `seed:runners`
+creates the template fresh before draining.
+
 ## What the seed leaves behind
 
 All four repos end with CI **green on `main`** and `main` protected — no open PRs, deliberately, so
