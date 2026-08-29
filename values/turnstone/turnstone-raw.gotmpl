@@ -106,6 +106,23 @@ resources:
       context_window = 200000
       api_key = "${ANTHROPIC_API_KEY}"
 
+      # A cheap model alongside the default, for trivial work: smoke-testing a new node, asking
+      # which host it is on, checking a tool is wired up. Those cost the same as real work when the
+      # only model on offer is the expensive one, and on this lab they are most of the traffic.
+      # Selectable per conversation in the console; the default below is unchanged, so nothing picks
+      # this up by accident.
+      #
+      # base_url and context_window are spelled out for the same reasons as the entry above: without
+      # base_url the loader falls back to a localhost vLLM convention and every request fails with
+      # connection refused, and without context_window it inherits a 32768 default that silently
+      # drops tool results once a session outgrows it.
+      [models.claude-haiku-4-5]
+      provider = "anthropic"
+      model = "claude-haiku-4-5-20251001"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+
       [model]
       default = "{{ $model }}"
 - apiVersion: external-secrets.io/v1
@@ -360,7 +377,14 @@ resources:
                     "read,write,conversation.modify,"
                     "workstreams.create,workstreams.close,"
                     "project.create,project.read,project.write,project.delete,"
-                    "persona.read,tools.approve"
+                    # "approve" is the SCOPE the approval endpoint gates on, and it is NOT implied by
+                    # "tools.approve". Turnstone derives scopes in core/auth.py:_permissions_to_scopes, which
+                    # only promotes a permission literally named read/write/approve, or any admin.* one --
+                    # "tools.approve" matches neither and contributes nothing. Without the bare "approve" a team
+                    # admin sees the approval prompt, clicks it, and the POST to .../workstreams/<id>/approve
+                    # returns 403 with nothing surfaced in the UI: the tool call never runs and the conversation
+                    # hangs. Verified live 2026-08-29 on Turnstone 1.8.1.
+                    "persona.read,tools.approve,approve"
                 )
                 now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
                 engine = sa.create_engine(os.environ["TURNSTONE_DB_URL"])
