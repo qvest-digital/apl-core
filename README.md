@@ -84,6 +84,49 @@ If you do drive it by hand, or with an agent, read `CLAUDE.md` first: it carries
 rules (bounded timeouts, verifying artifacts instead of exit codes, building from a clean context)
 that keep the traps from being rediscovered.
 
+### The demo: four teams, four services, a real merge gate
+
+`task setup` gives you an empty platform. The demo on top of it is a **separate, opt-in step** and
+is never part of setup:
+
+```bash
+go-task seed:demo        # ~12 min on an already-installed platform
+```
+
+It builds, on top of a running lab: four teams (`prodpage`, `details`, `reviews`, `ratings`) with
+three users each, one Istio Bookinfo microservice per team wired to the others, and a per-team
+**merge gate** — a Gitea Actions lint+build check, a CI runner whose image this platform builds
+itself, and `main` protected behind that check. Vikunja projects are provisioned last.
+
+Bringing the whole thing up from nothing:
+
+```bash
+go-task down CONFIRM=yes                                   # if a lab is already running
+ANTHROPIC_API_KEY=sk-ant-... NONINTERACTIVE=true go-task setup
+go-task seed:demo
+go-task verify:platform && go-task verify:ci               # read-only, re-runnable
+```
+
+Note the binary name: on some machines `task` is Taskwarrior, so `go-task` is the safe form (see
+above). The seed needs no API key — that is sealed at install time only.
+
+The sub-tasks are independently re-runnable, which is how you iterate without rebuilding:
+`seed:apps` (repos, builds, workloads, cross-team network policies) → `seed:runners` (each team's
+CI runner trigger) → `seed:gates` (wait for CI green, then protect `main`) → `seed:vikunja`.
+
+**CI runners are created on demand and are gone when idle.** A queued job produces a Kubernetes Job
+via a `workflow_job` webhook, which runs once and is collected by `ttlSecondsAfterFinished`, so at
+rest a team has **zero** runner pods and no registered runners. `verify:ci` therefore checks that
+the *trigger* is wired, not that a runner is online — at rest the honest answer to that is no.
+
+To see the gate actually fire, open a pull request against any team's repo and watch the check run.
+The seeded end state is deliberately PR-free so it is deterministic, which means the gate is
+provable by inspection but never seen firing on its own.
+
+`GITEA-ACTIONS-CI.md` explains why the gate is built this way and lists the traps found building it;
+`EPHEMERAL-AND-TEAM-WORKLOADS.md` covers the reusable parts — ephemeral pods, per-team resources,
+and the order to diagnose them in.
+
 Everything below this section is upstream's documentation and describes the published chart.
 
 ## Getting started
