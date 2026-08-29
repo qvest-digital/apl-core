@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ci-runner
+description: Ephemeral Gitea Actions runner for this team's CI
+type: application
+version: 0.1.0
+appVersion: "3.3.1"

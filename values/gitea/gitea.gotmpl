@@ -196,8 +196,8 @@ valkey:
 {{- /*
   gitea-mcp lets an MCP client (e.g. a Turnstone agent) talk to this Gitea instance. It runs as a
   sidecar so it can reach Gitea over plain localhost HTTP -- no CA trust needed, unlike every
-  other in-cluster caller of Gitea's external HTTPS endpoint (see POD-EGRESS-INVESTIGATION.md and
-  the otomi-api git-CLI trust gap found while integrating Tekton). It carries no baked-in
+  other in-cluster caller of Gitea's external HTTPS endpoint (see CLAUDE.md's CA note and the
+  otomi-api git-CLI trust gap found while integrating Tekton). It carries no baked-in
   credential: gitea-mcp supports per-request `Authorization: Bearer <token>` passthrough, so each
   caller supplies whichever Gitea personal access token is appropriate for that call -- verified
   live against docker.gitea.com/gitea-mcp-server:latest (v1.6.0), which accepts /mcp requests with

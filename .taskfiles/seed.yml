@@ -37,15 +37,16 @@
 # Each service's source is the real, unmodified upstream tree from github.com/istio/istio at
 # branch `master` -- sparse-cloned on the HOST (which has internet access; pods do not) and
 # force-pushed into that team's Gitea repo as dev-<team>, over HTTPS, with that user's own PAT.
-# See seed-lib.sh's upstream_sparse_subdir / gitea_push_tree. Everything below is done AS
+# See seed-lib.sh's stage_service_tree / gitea_push_tree. Everything below is done AS
 # dev-<team>, never as platform-admin, except the one thing a team admin genuinely may not do
 # (writing network policies -- see the netpols step).
 #
 # Getting dev-<team> a Gitea credential needs a real Keycloak SSO login (Gitea accounts are
 # OIDC-JIT-provisioned, never created proactively) -- fully scripted with curl, no browser, see
-# seed-lib.sh's gitea_oidc_login. The sslVerify/skip-tls-verify fixes POD-EGRESS-INVESTIGATION.md
-# says a webhook-triggered Tekton build needs are already baked into every build this platform
-# creates (charts/team-ns/templates/builds/docker.yaml), so no patch is needed here.
+# seed-lib.sh's gitea_oidc_login. The sslVerify/skip-tls-verify CA-trust settings a
+# webhook-triggered Tekton build needs (CLAUDE.md, "Every Tekton Task on this lab needs two
+# CA-trust settings") are already baked into every build this platform creates
+# (charts/team-ns/templates/builds/docker.yaml), so no patch is needed here.
 #
 # Unlike the retired canary demo, no base image is mirrored into Harbor: Bookinfo's Dockerfiles
 # keep their upstream public `FROM` lines and kaniko pulled all of them fine (confirmed live
@@ -113,15 +114,29 @@ vars:
   # and UPSTREAM-SYNC.md §4b), so all four services go through the exact same webhook-triggered
   # build path.
   SEED_BOOKINFO_SERVICES: >-
-    productpage:prodpage:productpage:samples/bookinfo/src/productpage
-    details:details:details:samples/bookinfo/src/details
-    reviews:reviews:reviews:samples/bookinfo/src/reviews
-    ratings:ratings:ratings:samples/bookinfo/src/ratings
-  SEED_BOOKINFO_UPSTREAM: "https://github.com/istio/istio.git"
-  # `master`, deliberately not a release tag: a tag and the default branch disagree about these
-  # Dockerfiles' base images, and reading one while cloning the other costs an afternoon. One ref,
-  # used for everything.
-  SEED_BOOKINFO_REF: master
+    productpage:prodpage:productpage
+    details:details:details
+    reviews:reviews:reviews
+    ratings:ratings:ratings
+  # The pushed source is VENDORED in this repo, not cloned from istio/istio at seed time. It is the
+  # upstream Bookinfo tree plus the CI the demo is here to show: a .gitea/workflows/ci.yml lint+build
+  # gate, its lint config, the source fixes that gate demanded, and the .gitea/runner/ build context
+  # for the team's own Actions runner. Vendoring makes the seed deterministic (no network, no
+  # upstream drift mid-demo) and is why there is no longer an upstream ref pinned here.
+  SEED_BOOKINFO_VENDOR: "demo-seed/bookinfo"
+
+  # --- Gitea Actions runners ------------------------------------------------------------------
+  # gitea.com/gitea/runner ("act_runner"). Downloaded ON THE HOST and checksum-verified, then
+  # pushed inside each team's repo so the Dockerfile only has to COPY it -- the one artifact where
+  # a silent substitution would be worst is therefore never fetched at image-build time.
+  SEED_RUNNER_VERSION: "3.3.1"
+  SEED_RUNNER_URL: "https://gitea.com/gitea/runner/releases/download/v3.3.1/gitea-runner-3.3.1-linux-amd64.xz"
+  SEED_RUNNER_SHA256: "0cccfbb0333b2126b66b331b94e36bf74f034037add09c4a9ff3fb042968cba6"
+  # Second AplTeamBuild per repo, building .gitea/runner/Dockerfile into this image name.
+  SEED_RUNNER_IMAGE_NAME: ci-runner
+  # The status check branch protection requires. "<workflow name> / <job id> (<event>)" -- all four
+  # workflows are `name: ci` with a single job `ci`, deliberately, so this one string fits them all.
+  SEED_CI_STATUS_CONTEXT: "ci / ci (pull_request)"
   # caller:callee, by TEAM ID. Drives two things at once: the caller workload's
   # <CALLEE>_HOSTNAME/<CALLEE>_SERVICE_PORT env vars (the <CALLEE> prefix is the callee's ROLE
   # name, uppercased -- PRODPAGE is never a callee, so the prodpage/productpage split never shows
@@ -166,6 +181,16 @@ vars:
 tasks:
   fix-first-login:
     desc: "Make the platform-admin's initial password permanent (Keycloak forces UPDATE_PASSWORD on first login)"
+    # interactive: true on EVERY task in this file, not just the ones that prompt or poll.
+    # Taskfile.yml sets `output: group` globally, which buffers a task's whole stdout until its
+    # script block exits. Mixing grouped and ungrouped tasks in one run means a grouped task's
+    # buffer flushes whenever it happens to finish -- which lands MID-LINE in an ungrouped task
+    # that is streaming. Observed live: the word "any", a fragment of enable-apps' own label
+    # ("Enabling any of gitea/harbor/tekton..."), appeared inside seed:apps' progress line as
+    # "... (as dev-reviews) ... any(171s)". Grouping buys nothing here anyway: apl_run already
+    # captures each step's real output to .taskfiles/state/logs/<slug>.log, and no seed task runs
+    # as a parallel `deps:` the way cluster:up and images:build-all do.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
@@ -202,6 +227,8 @@ tasks:
   auth:
     desc: "Fetch a platform-admin Keycloak access token via the Resource Owner Password grant (proves login works; NOT cached for later use -- see teams/users, which re-fetch fresh)"
     deps: [fix-first-login]
+    # See fix-first-login for why every task in this file is interactive: true.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
@@ -229,6 +256,8 @@ tasks:
   enable-apps:
     desc: "Enable gitea/harbor/tekton if a minimal install left them off (same PUT the Console's Apps dashboard uses)"
     deps: [auth]
+    # See fix-first-login for why every task in this file is interactive: true.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
@@ -297,6 +326,8 @@ tasks:
     # service creation 403s with "User not allowed to perform \"create\" on \"Service\" resource"
     # no matter how privileged dev-<team> is.
     deps: [enable-apps]
+    # See fix-first-login for why every task in this file is interactive: true.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
@@ -373,6 +404,8 @@ tasks:
   users:
     desc: "Create the demo users (po/dev/agent per team), then make all their passwords permanent in one pass"
     deps: [teams]
+    # See fix-first-login for why every task in this file is interactive: true.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
@@ -532,6 +565,12 @@ tasks:
         KIND_CTX="{{.KIND_CONTEXT}}"
         DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
         API="https://console.$DOMAIN/api"
+        # Consumed by seed-lib.sh's stage_service_tree / runner_fetch_binary. Exported rather than
+        # interpolated at each call site because every cmds block runs in its own shell.
+        export SEED_VENDOR_DIR="{{.ROOT_DIR}}/{{.SEED_BOOKINFO_VENDOR}}"
+        export SEED_RUNNER_URL="{{.SEED_RUNNER_URL}}"
+        export SEED_RUNNER_SHA256="{{.SEED_RUNNER_SHA256}}"
+        export SEED_RUNNER_VERSION="{{.SEED_RUNNER_VERSION}}"
         # Needed by harbor_has_tag below -- "is there already an image for this repo?" is what
         # decides whether an unchanged source tree still needs a build.
         HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
@@ -641,7 +680,6 @@ tasks:
           _role=$1
           _team=$2
           _repo=$3
-          _subdir=$4
           _email="dev-$_team@$DOMAIN"
           _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
 
@@ -661,11 +699,17 @@ tasks:
           _agent_gitea_pat=$(gitea_mint_pat "$_agent_gitea_user" "read:user,read:organization")
           gitea_wait_for_org_permission "$_agent_gitea_user" "team-$_team" "$_agent_gitea_pat" "can_read"
 
-          # The real upstream tree, sparse-cloned on the host. Cached across all four services --
-          # one clone of istio/istio for the whole run.
-          _src=$(upstream_sparse_subdir "{{.SEED_BOOKINFO_UPSTREAM}}" "{{.SEED_BOOKINFO_REF}}" "$_subdir")
+          # The vendored tree (upstream Bookinfo + this demo's CI), staged with the verified
+          # gitea-runner binary dropped into .gitea/runner/ so the runner image can be built
+          # in-cluster from this same repo. No network, no upstream drift.
+          _src=$(stage_service_tree "$_role")
 
           gitea_create_org_repo "team-$_team" "$_repo" "$GITEA_PAT"
+
+          # Branch protection blocks the force-push below (enable_push:false). On a first run there
+          # is nothing to remove; on a re-run against a cluster this seed already protected, this
+          # is what stops the push from failing. Re-applied after the push, in seed:gates.
+          gitea_unprotect_branch "team-$_team" "$_repo" "$GITEA_PAT"
 
           _pushed=false
           # Captured immediately before the push, and only ever moved forward by push_source: this
@@ -676,7 +720,7 @@ tasks:
             _push_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             _ps_rc=0
             gitea_push_tree "team-$_team" "$_repo" "$GITEA_PAT" "$GITEA_USER" "$_src" \
-              "Bookinfo $_role, from {{.SEED_BOOKINFO_UPSTREAM}}@{{.SEED_BOOKINFO_REF}}:$_subdir" || _ps_rc=$?
+              "Bookinfo $_role, with lint+build CI and its Actions runner build context" || _ps_rc=$?
             case "$_ps_rc" in
               0) _pushed=true ;;
               2) _pushed=false ;;
@@ -830,14 +874,23 @@ tasks:
           [ "$_code" = "200" ] || { echo "error: https://{{.SEED_WORKLOAD_NAME}}-$_team.$DOMAIN/health never returned 200 (last: $_code)" >&2; return 1; }
         }
 
-        for SPEC in {{.SEED_BOOKINFO_SERVICES}}; do
-          ROLE=$(printf '%s' "$SPEC" | cut -d: -f1)
-          TEAM=$(printf '%s' "$SPEC" | cut -d: -f2)
-          REPO=$(printf '%s' "$SPEC" | cut -d: -f3)
-          SUBDIR=$(printf '%s' "$SPEC" | cut -d: -f4)
-          apl_run "seed-apps-$TEAM" "Setting up Bookinfo's '$ROLE' microservice in team $TEAM (as dev-$TEAM)" \
-            setup_team_service "$ROLE" "$TEAM" "$REPO" "$SUBDIR" || exit $?
-        done
+        # See seed:runners for why this is an adapter rather than a signature change.
+        setup_team_service_spec() {
+          setup_team_service \
+            "$(printf '%s' "$1" | cut -d: -f1)" \
+            "$(printf '%s' "$1" | cut -d: -f2)" \
+            "$(printf '%s' "$1" | cut -d: -f3)"
+        }
+
+        # Was a serial loop: 196+109+171+114 = 590s. Every one of those numbers is dominated by
+        # WAITING -- up to 180s for the Gitea webhook to appear, 90s for the EventListener, minutes
+        # for the build, up to 300s for the health check -- against four independent namespaces.
+        # The only shared resource is the git values repo behind apl-api, and every write to it
+        # goes through apl_create_if_missing, which now takes a lock.
+        #
+        # NOT wrapped in apl_run: see apl_run_parallel's comment in lib.sh.
+        apl_run_parallel seed-apps "Setting up each team's Bookinfo microservice (as its own dev user)" \
+          setup_team_service_spec {{.SEED_BOOKINFO_SERVICES}} || exit $?
         apl_ok "bookinfo microservices live: $(for S in {{.SEED_BOOKINFO_SERVICES}}; do printf 'https://{{.SEED_WORKLOAD_NAME}}-%s.%s/ ' "$(printf '%s' "$S" | cut -d: -f2)" "$DOMAIN"; done)"
       - |
         . "{{.LIB}}"
@@ -936,9 +989,270 @@ tasks:
           verify_bookinfo || exit $?
         apl_ok "bookinfo demo verified end to end: https://{{.SEED_WORKLOAD_NAME}}-$PRODPAGE_TEAM.$DOMAIN/productpage"
 
+  runners:
+    desc: "Per-team ephemeral Gitea Actions runner: image built by this platform's own Tekton pipeline, deployed as a team workload"
+    deps: [apps]
+    # Polls four Tekton builds and four runner registrations, printing progress as it goes --
+    # Taskfile.yml's global `output: group` would buffer all of it until the task ended. See
+    # CLAUDE.md's note on `interactive: true`.
+    interactive: true
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        API="https://console.$DOMAIN/api"
+        export SEED_VENDOR_DIR="{{.ROOT_DIR}}/{{.SEED_BOOKINFO_VENDOR}}"
+        export SEED_RUNNER_URL="{{.SEED_RUNNER_URL}}"
+        export SEED_RUNNER_SHA256="{{.SEED_RUNNER_SHA256}}"
+        export SEED_RUNNER_VERSION="{{.SEED_RUNNER_VERSION}}"
+
+        # Same 60-second-token discipline as seed:apps -- this task waits minutes for image builds,
+        # so a token fetched up front would be long dead by the time it is used.
+        dev_team_token() {
+          _team=$1
+          _email="dev-$_team@$DOMAIN"
+          _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
+          _client_ns=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret -A \
+            --field-selector "metadata.name={{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}" \
+            -o jsonpath='{.items[0].metadata.namespace}')
+          _client_id=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret {{.OAUTH2_PROXY_CLIENT_SECRET_NAME}} \
+            -n "$_client_ns" -o jsonpath='{.data.client-id}' | base64 -d)
+          _client_secret=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret {{.OAUTH2_PROXY_CLIENT_SECRET_NAME}} \
+            -n "$_client_ns" -o jsonpath='{.data.client-secret}' | base64 -d)
+          _tok_resp=$(curl -sk --max-time 15 "https://keycloak.$DOMAIN{{.KEYCLOAK_REALM_PATH}}/protocol/openid-connect/token" \
+            --data-urlencode grant_type=password --data-urlencode client_id="$_client_id" --data-urlencode client_secret="$_client_secret" \
+            --data-urlencode username="$_email" --data-urlencode password="$_password" --data-urlencode scope=openid)
+          _tok=$(printf '%s' "$_tok_resp" | jq -r '.access_token // empty' 2>/dev/null || true)
+          [ -n "$_tok" ] || { echo "error: no access token for $_email -- Keycloak said: $(printf '%s' "$_tok_resp" | head -c 300)" >&2; return 1; }
+          printf '%s' "$_tok"
+        }
+
+        # wait_for_runner_build <team> <build-name> -- bounded wait on the ONE-SHOT PipelineRun a
+        # `trigger: false` build renders (ArgoCD creates it at sync-wave 5, named after the build,
+        # not generateName'd like the webhook-triggered ones).
+        wait_for_runner_build() {
+          _wrb_team=$1
+          _wrb_name=$2
+          _wrb_pr="docker-build-$_wrb_name"
+          _wrb_i=0
+          # 90 x 20s = 30 minutes: the reviews runner is a ~700MB Java image and this cluster
+          # builds it from scratch the first time.
+          while [ "$_wrb_i" -lt 90 ]; do
+            _wrb_i=$((_wrb_i + 1))
+            _wrb_status=$(kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_wrb_team" \
+              get pipelinerun "$_wrb_pr" -o jsonpath='{.status.conditions[0].reason}' 2>/dev/null || true)
+            case "$_wrb_status" in
+              Succeeded | Completed) echo "  build $_wrb_pr succeeded"; return 0 ;;
+              Failed | PipelineRunTimeout | CouldntGetPipeline | PipelineRunCouldntCancel)
+                echo "error: PipelineRun $_wrb_pr ended '$_wrb_status' in team-$_wrb_team" >&2
+                kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_wrb_team" \
+                  get pipelinerun "$_wrb_pr" -o jsonpath='{.status.conditions[0].message}' >&2 2>/dev/null || true
+                return 1 ;;
+              *) : ;;
+            esac
+            [ $((_wrb_i % 3)) -eq 0 ] && echo "  building $_wrb_pr (${_wrb_status:-not created yet}, ${_wrb_i}/90)"
+            sleep 20
+          done
+          echo "error: PipelineRun $_wrb_pr never completed in team-$_wrb_team" >&2
+          return 1
+        }
+
+        # setup_team_runner <role> <team> <repo> -- the team's own CI runner, end to end:
+        # a second build off the repo it already owns, a registration token, and a workload.
+        setup_team_runner() {
+          set -euo pipefail
+          _role=$1
+          _team=$2
+          _repo=$3
+          _build="$_repo-runner"
+          _image_repo="harbor.$DOMAIN/team-$_team/{{.SEED_RUNNER_IMAGE_NAME}}"
+
+          API_TOKEN=$(dev_team_token "$_team")
+
+          # trigger:false, unlike the app build. Two reasons, both deliberate:
+          #   * with a webhook trigger, EVERY app commit would rebuild the runner image and roll
+          #     the runner pods mid-demo, for a Dockerfile that did not change;
+          #   * a trigger:false build renders a plain one-shot PipelineRun instead of an
+          #     EventListener, which is all this needs.
+          # It is created AFTER seed:apps has pushed, because that PipelineRun starts as soon as
+          # ArgoCD syncs and would fail against an empty repo.
+          apl_create_if_missing \
+            "$API/v2/teams/$_team/builds/$_build" "$API/v2/teams/$_team/builds" "$API_TOKEN" \
+            "$(jq -n --arg name "$_build" --arg image "{{.SEED_RUNNER_IMAGE_NAME}}" \
+                --arg url "https://gitea.$DOMAIN/team-$_team/$_repo.git" \
+              '{kind:"AplTeamBuild", metadata:{name:$name}, spec:{imageName:$image, tag:"main", trigger:false, scanSource:false, mode:{type:"docker", docker:{repoUrl:$url, path:"./.gitea/runner/Dockerfile", revision:"main"}}}}')" \
+            "runner build $_build ($_team)"
+
+          if harbor_has_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main; then
+            apl_skip "runner image already in Harbor for team-$_team"
+          else
+            wait_for_runner_build "$_team" "$_build"
+          fi
+
+          # The registration token is a runtime credential for demo content, NOT platform
+          # configuration -- CLAUDE.md rule 6 ("configuration lives in the git values repo") does
+          # not apply, and there is no values-repo mechanism for this. It is reusable across every
+          # re-registration an ephemeral runner performs, which is what lets one Secret serve the
+          # whole recycling loop.
+          _email="dev-$_team@$DOMAIN"
+          _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
+          GITEA_USER=$(gitea_oidc_login "$_email" "$_password")
+          GITEA_PAT=$(gitea_mint_pat "$GITEA_USER" "read:user,write:repository,write:organization,read:organization")
+          # No Argo CD repo credential is needed to sync the runner workload: the team repos are
+          # created readable (gitea_create_org_repo), so Argo CD clones the chart anonymously.
+          # Write access is still limited to the team, via Gitea org membership. See that
+          # function's comment for why this is both more realistic and one fewer secret.
+          _reg_token=$(gitea_mint_runner_token "team-$_team" "$GITEA_PAT")
+          kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_team" \
+            create secret generic gitea-actions-runner-token \
+            --from-literal=token="$_reg_token" --dry-run=client -o yaml \
+            | kubectl --context "$KIND_CTX" --request-timeout=15s apply -f - >/dev/null
+          echo "registration token stored in team-$_team/gitea-actions-runner-token"
+
+          API_TOKEN=$(dev_team_token "$_team")
+          # image is the repo WITHOUT a tag; the chart joins it with imageTag.
+          #
+          # Deliberately NO imageUpdateStrategy on this workload, unlike the app workload. Digest
+          # pinning is the wrong model for a CI runner: it freezes the pod on one build, and a
+          # rebuilt runner image then never reaches the cluster. Confirmed live -- after a rebuild
+          # Harbor's :main pointed at a new digest while the Deployment stayed pinned to the old
+          # one (which no longer even carried a tag), and the image updater logged
+          # "images_considered=2 images_updated=0".
+          #
+          # Instead the runner tracks the mutable :main tag with imagePullPolicy: Always. Every job
+          # runs in a BRAND-NEW pod (see the chart), so each one re-resolves the tag on creation
+          # and a rebuilt image is picked up by the next job with nothing else in the loop. The app
+          # workload keeps its digest pinning; a deployed application genuinely does want a
+          # reproducible, pinned image, which is the opposite requirement.
+          RUNNER_VALUES=$(printf 'teamId: %s\nimage: %s\nimageTag: main\ngiteaInstanceUrl: https://gitea.%s\n' \
+            "$_team" "$_image_repo" "$DOMAIN")
+          # The chart lives in the team's OWN repo, next to the Dockerfile it deploys -- one repo
+          # holding both halves of the runner.
+          #
+          # Two things about re-runs, both learned the hard way:
+          #   * apl_create_if_missing SKIPS an existing workload, so edits to RUNNER_VALUES below
+          #     do not reach a cluster that already has this workload. The chart itself is read
+          #     from git on every sync, so chart edits do land -- it is only the values that are
+          #     sticky. To change values on an existing cluster, delete the workload first.
+          #   * the runner build is trigger:false, so pushing a new Dockerfile or runner config
+          #     rebuilds NOTHING. To force one: push first, then DELETE THIS BUILD via apl-api
+          #     (DELETE /v2/teams/<team>/builds/<repo>-runner) and re-run this task. Deleting the
+          #     rendered PipelineRun and waiting for ArgoCD to restore it does not reliably work --
+          #     the team-ns Application goes OutOfSync and names that exact resource, selfHeal is
+          #     on, and a sync still completes "Succeeded" without recreating it (seen on three of
+          #     four teams; the fourth healed normally). Full account in GITEA-ACTIONS-CI.md.
+          apl_create_if_missing \
+            "$API/v2/teams/$_team/workloads/{{.SEED_RUNNER_IMAGE_NAME}}" "$API/v2/teams/$_team/workloads" "$API_TOKEN" \
+            "$(jq -n --arg name "{{.SEED_RUNNER_IMAGE_NAME}}" --arg values "$RUNNER_VALUES" \
+                --arg url "https://gitea.$DOMAIN/team-$_team/$_repo.git" \
+              '{kind:"AplTeamWorkload", metadata:{name:$name}, spec:{url:$url, chartProvider:"git", path:".gitea/runner/chart", revision:"main", values:$values}}')" \
+            "runner workload ($_team)"
+
+          # There is NO runner to wait for now -- at rest a team has zero runner pods, by design.
+          # What must exist instead is the EventListener that turns a queued job into one. Gate on
+          # its Deployment becoming Available: until it is, Gitea's delivery gets no answer, and
+          # because Gitea does NOT retry a failed delivery that job never gets a runner at all.
+          _el="el-gitea-workflowjob-$_team"
+          _we_i=0
+          while [ "$_we_i" -lt 60 ]; do
+            _we_i=$((_we_i + 1))
+            _avail=$(kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_team" \
+              get deploy "$_el" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)
+            [ "${_avail:-0}" -ge 1 ] 2>/dev/null && break
+            [ $((_we_i % 6)) -eq 0 ] && echo "  waiting for $_el to become Available (${_we_i}/60)"
+            sleep 10
+          done
+          [ "${_avail:-0}" -ge 1 ] 2>/dev/null \
+            || { echo "error: $_el never became Available in team-$_team" >&2; return 1; }
+          echo "$_el is Available -- queued jobs will now create runners on demand"
+
+          # The webhook that feeds it. SEPARATE from the build webhook the AplTeamBuild creates:
+          # that one is push-only, and this one must not be, so they cannot be merged.
+          gitea_ensure_workflowjob_hook "team-$_team" "$_repo" "$GITEA_PAT" "$_el" || return 1
+
+          # Drain whatever queued before any of the above existed.
+          #
+          # Not a bootstrap hack -- it is the permanent recovery path. seed:apps pushes to main
+          # long before this task runs, so that push's CI job is already queued while there is no
+          # webhook and no EventListener to hear about it. Gitea fires `workflow_job` exactly once
+          # and never retries, so without this the very first CI run of every team would sit
+          # queued forever and seed:gates would block until it timed out.
+          #
+          # The same applies any time a delivery is lost (EventListener restarting, a netpol
+          # change, Gitea restarting mid-delivery), which is why this is a reusable function rather
+          # than something inlined here.
+          runner_drain_queued "$_team" "$_repo" "$GITEA_PAT" || return 1
+        }
+
+        # apl_run_parallel hands each item to the function as ONE argument, so this adapter splits
+        # the "role:team:repo" spec rather than changing setup_team_runner's signature.
+        setup_team_runner_spec() {
+          setup_team_runner \
+            "$(printf '%s' "$1" | cut -d: -f1)" \
+            "$(printf '%s' "$1" | cut -d: -f2)" \
+            "$(printf '%s' "$1" | cut -d: -f3)"
+        }
+
+        apl_header "Gitea Actions runners"
+
+        # Was a serial loop: 124+185+154+114 = 577s, i.e. nearly ten minutes of mostly waiting.
+        # Each team's runner is an independent image build in its own namespace and Gitea org, and
+        # the apl-api writes inside are serialised by apl_create_if_missing's own lock, so there is
+        # nothing to order between them.
+        #
+        # NOT wrapped in apl_run -- that would capture the heartbeat into a log file and leave the
+        # terminal silent for the whole run. See apl_run_parallel's comment in lib.sh.
+        apl_run_parallel seed-runner "Wiring each team's on-demand CI runner (image + trigger)" \
+          setup_team_runner_spec {{.SEED_BOOKINFO_SERVICES}} || exit $?
+        apl_ok "all four teams create a CI runner on demand -- zero idle runner pods"
+
+  gates:
+    desc: "Wait for each team's lint+build check to go green on main, then protect main behind it"
+    deps: [runners]
+    # Long polling loops with per-repo progress -- see CLAUDE.md on `interactive: true`.
+    interactive: true
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+
+        # protect_team_repo <team> <repo> -- wait for CI to pass on main, then require it.
+        #
+        # ORDER IS LOAD-BEARING. The rule sets enable_push:false, which would block the seed's own
+        # force-push, so protection is applied only here, after seed:apps has pushed. seed:apps
+        # symmetrically removes any existing rule before pushing, so a re-run converges instead of
+        # failing.
+        protect_team_repo() {
+          set -euo pipefail
+          _team=$1
+          _repo=$2
+          _email="dev-$_team@$DOMAIN"
+          _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
+          GITEA_USER=$(gitea_oidc_login "$_email" "$_password")
+          GITEA_PAT=$(gitea_mint_pat "$GITEA_USER" "read:user,write:repository,write:organization,read:organization")
+
+          _sha=$(gitea_head_sha "team-$_team" "$_repo" "$GITEA_PAT")
+          [ -n "$_sha" ] || { echo "error: could not read main's HEAD sha for team-$_team/$_repo" >&2; return 1; }
+          gitea_wait_actions_run "team-$_team" "$_repo" "$GITEA_PAT" "$_sha" || return 1
+          gitea_protect_branch "team-$_team" "$_repo" "$GITEA_PAT" "{{.SEED_CI_STATUS_CONTEXT}}"
+        }
+
+        apl_header "Merge gates"
+        for SPEC in {{.SEED_BOOKINFO_SERVICES}}; do
+          TEAM=$(printf '%s' "$SPEC" | cut -d: -f2)
+          REPO=$(printf '%s' "$SPEC" | cut -d: -f3)
+          apl_run "seed-gate-$TEAM" "Waiting for team $TEAM's CI to pass, then protecting main" \
+            protect_team_repo "$TEAM" "$REPO" || exit $?
+        done
+        apl_ok "all four repos: CI green on main, main protected behind the 'ci' check"
+
   vikunja:
     desc: "Provision po/dev/agent in Vikunja via OIDC claim-driven team sync; po's project shared with the team"
-    deps: [apps]
+    deps: [gates]
     # Same reasoning as apps' interactive: true -- this task's rate-limit-pacing waits (can be
     # 60s+ per team) print live progress that global `output: group` would otherwise buffer until
     # the whole task exits.
@@ -1067,6 +1381,8 @@ tasks:
   demo:
     desc: "Seed the demo: the four Bookinfo teams, three users each, one live microservice per team wired to the others, and Vikunja provisioning"
     deps: [vikunja]
+    # See fix-first-login for why every task in this file is interactive: true.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"

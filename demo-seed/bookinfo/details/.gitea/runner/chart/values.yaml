@@ -1,0 +1,39 @@
+# All of these are supplied by the AplTeamWorkload the seed creates -- the defaults here exist so
+# `helm lint`/`helm template` work standalone, not because any of them is a sensible runtime value.
+teamId: ""
+# Repository WITHOUT the tag, e.g. harbor.<domain>/team-details/ci-runner. Split from the tag
+# because an AplTeamWorkload's imageUpdateStrategy rewrites them as two separate values -- a single
+# combined ref would lose its tag the first time the ArgoCD Image Updater fired.
+#
+# This workload deliberately carries NO imageUpdateStrategy. Digest pinning is wrong for a CI
+# runner: it freezes it on one build, and a rebuilt runner image never reaches the cluster.
+# Tracking the mutable :main tag works here because every job runs in a brand-new pod, which
+# re-resolves the tag on creation.
+image: ""
+imageTag: main
+# e.g. https://gitea.<domain>
+giteaInstanceUrl: ""
+# "<label>:<executor>" -- host means the job runs as a plain process on the runner pod, no Docker
+# and no privileges. The label half is also what the EventListener's CEL filter matches against the
+# queued job's requested labels, so this single value decides both what we register as and which
+# jobs we will spawn a runner for.
+runnerLabels: "ubuntu-latest:host"
+# Secret holding the reusable org-level registration token, key "token".
+tokenSecretName: gitea-actions-runner-token
+
+# How long a finished runner Job (and its pod) survives before Kubernetes' TTL controller removes
+# it. Not 0: a few minutes leaves `kubectl get pods` and `kubectl logs` usable for someone
+# debugging a failed job, which is the only reason to keep a corpse at all.
+ttlSecondsAfterFinished: 300
+# Upper bound on one runner's whole life: registration, waiting to be handed its job, and running
+# it. Generous because it must exceed the slowest real CI job (reviews' gradle build is the long
+# pole), but finite so a runner that is never handed a job cannot idle forever.
+activeDeadlineSeconds: 3600
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi

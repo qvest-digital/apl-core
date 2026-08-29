@@ -106,9 +106,10 @@ safe bet.** `apl-api` fetches catalog chart listings itself (`getBYOWorkloadCata
 `otomi` namespace, not from a browser. Confirmed live: `gitea-http.gitea.svc.cluster.local:3000`
 (the Gitea Service's own ClusterIP DNS, plain HTTP, no TLS) works cleanly (`kubectl exec` into
 `otomi-api` and `wget` the `git-upload-pack` refs endpoint returned a real response); the public
-`https://gitea.<domainSuffix>/...` route was never actually tested against `apl-api`, but per
-`POD-EGRESS-INVESTIGATION.md`'s pattern of pods hairpinning badly through the cluster's own external
-IP, the in-cluster Service DNS is the one to reach for by default, not the ingress route.
+`https://gitea.<domainSuffix>/...` route was never actually tested against `apl-api`. A pod
+reaching its own cluster's public ingress IP has to hairpin back in through the external IP, which
+is fragile and gains nothing here, so the in-cluster Service DNS is the one to reach for by
+default, not the ingress route.
 
 **2. The chart's `icon:` field takes any string that's a valid `<img src>`, including a `data:`
 URI.** `CatalogCard.tsx` in `apl-console` just does `<img src={img} onError={... fallback ...}>` —
@@ -129,10 +130,14 @@ tiles than the repo actually has) for an indeterminate time after a push.
 run them on any new chart before pushing (see the "Build from a clean context" trap in `CLAUDE.md`,
 same principle: verify the artifact, don't assume the YAML is right because it looks right).
 
-**5. A Task's container image is subject to the same pod-egress rule as everything else on this
-lab.** `hello-world` and `scheduled-cleanup` both needed a plain `alpine:3.20` — pulling that
-straight from Docker Hub inside a pod fails per `POD-EGRESS-INVESTIGATION.md`. Mirrored it into
-Harbor from the host first:
+**5. A Task's container image was mirrored into Harbor — which is no longer necessary.**
+`hello-world` and `scheduled-cleanup` both needed a plain `alpine:3.20`, and at the time that was
+mirrored into Harbor from the host on the belief that pulling it straight from Docker Hub inside a
+pod would fail. **That belief no longer holds**: confirmed live 2026-08-29, kaniko pulls public base
+images directly and in-cluster builds install packages over the network fine (see CLAUDE.md). A new
+Task can reference a public image directly. The mirroring recipe below is kept as the documented
+fallback if some future cluster does fail such a pull; the helpers for it are
+`harbor_ensure_project` / `harbor_mirror` in `.taskfiles/seed-lib.sh`.
 
 ```bash
 docker run --rm --network host quay.io/skopeo/stable:latest copy --dest-tls-verify=false \

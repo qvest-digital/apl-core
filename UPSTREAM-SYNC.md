@@ -68,6 +68,8 @@ protecting when you resolve):
 | `src/operator/installer.ts` (+ its `.test.ts`) | `bbed462e7` | honours `INSTALL_RETRIES` instead of retrying forever |
 | `Dockerfile` | `72e3c3b29`, `1adee6dc4` | toolchain base image and chart source overridable |
 | `chart/apl/templates/deployment.yaml`, `post-job.yaml` | `651782eaf` | image repo/pull-policy settable |
+| `charts/team-ns/templates/builds/docker.yaml` | kaniko/CA-trust comment commits | comment-only in the fork: the `sslVerify: false` / `--skip-tls-verify` block now cites `CLAUDE.md`'s CA-trust section rather than the deleted `POD-EGRESS-INVESTIGATION.md`. Trivial to resolve — keep upstream's logic, keep the fork's comment |
+| `values/gitea/gitea.gotmpl`, `values/argocd-image-updater/*.gotmpl` | same | comment-only, same reason as above |
 | `.cspell.json` | several docs commits | fork-only jargon (Vikunja, Turnstone, etc.) — trivial, always keep both sides' words |
 
 Two of these are the ones actually likely to fight upstream line-for-line, because they are places

@@ -20,10 +20,10 @@ wrong one for the task wastes a session.
 | `VIKUNJA.md` | the worked example behind that playbook — a record of one real integration | you need the concrete detail a rule in the playbook is abbreviating |
 | `TURNSTONE.md` | a second worked example — an app needing an upstream LLM API, and the certificate trap that came with it | your app is not a Go web app, or anything TLS fails in a way `openssl` says is fine |
 | `UPSTREAM-SYNC.md` | an executable runbook: pull new commits from `linode/apl-core` into this fork | you are asked to merge in, sync with, or catch up on upstream |
-| `POD-EGRESS-INVESTIGATION.md` | pods cannot reach the public internet, cause unknown — but has a proven, mandatory workaround for Tekton | you are building/running any Tekton pipeline, or asked to re-test the bug itself |
 | `MCP.md` | a record of deploying MCP servers for Gitea and Vikunja, and every credential/session trap proving them live turned up | you are touching either app's MCP server, wiring an MCP client (Turnstone or otherwise) to them, or need a platform-user credential neither app's OIDC login hands you directly |
 | `VIKUNJA-TURNSTONE-PIPELINE.md` | a proof-of-flow: a Vikunja webhook triggers a Tekton pipeline that calls Turnstone through its real Python SDK | you are wiring any app event to trigger a Tekton pipeline, or need a working example of the `turnstone` PyPI SDK from inside a pod |
 | `TEAM-WORKLOAD-CATALOG.md` | the preferred, correct way to give a team a pipeline or other workload: a git-tracked chart + the platform's own `workloads`/`catalogs` mechanism, not raw `kubectl apply` | you are asked to add a pipeline, a workload, or anything a team should own and iterate on going forward |
+| `GITEA-ACTIONS-CI.md` | why the demo teams' lint/build merge gate is built the way it is: Actions rather than Tekton, ephemeral host-mode runners, runner images built by the platform itself | you are touching `seed:runners`/`seed:gates`, any `demo-seed/bookinfo/*/.gitea/` file, or branch protection |
 
 The distinction that matters: **`SETUP.md` and `INTEGRATING-AN-APP.md` are instructions to follow.
 `VIKUNJA.md` is evidence, not a plan** — its work is already done and on `feat/vikunja-integration`.
@@ -88,6 +88,49 @@ Taskfile itself if the fix is real and generalizes, and re-run. Only fall back t
 happens, that's itself a gap worth fixing in `Taskfile.yml`/`.taskfiles/*.yml`, not just working
 around once.
 
+## The task, if you were asked to seed or demo the lab
+
+`go-task seed:demo` — note **`go-task`**, not `task`: on this machine `/usr/bin/task` is
+Taskwarrior and will print somebody's personal todo list at you.
+
+It is explicitly opt-in and never part of `task setup`. It builds the whole demo on top of a
+running platform: four teams (`prodpage`, `details`, `reviews`, `ratings`), three users each, one
+Istio Bookinfo microservice per team wired to the others, and — added later — a real per-team
+**merge gate**: a Gitea Actions lint+build check, an ephemeral runner whose image this platform
+builds itself, and `main` protected behind that check. Vikunja provisioning runs last.
+
+Sub-tasks, each independently re-runnable (`seed:apps` → `seed:runners` → `seed:gates`):
+
+- `seed:apps` — repos, Tekton builds, workloads, public services, cross-team netpols
+- `seed:runners` — each team's ephemeral Actions runner: second `AplTeamBuild` off the same repo,
+  registration token, workload. The workload deploys an **EventListener, not a Deployment** —
+  runners are created one-pod-per-job from Gitea's `workflow_job: queued` webhook and deleted by
+  `ttlSecondsAfterFinished` when the job ends, so at rest a team has **zero** runner pods and no
+  registered runners. `verify:ci` checks the trigger, not "is a runner online", because at rest the
+  honest answer to that is no. Why it is not a Deployment (a clean exit still earning
+  CrashLoopBackOff, and why `restartPolicyRules` does not help) is in `GITEA-ACTIONS-CI.md`.
+- `seed:gates` — wait for CI green on `main`, then protect `main` behind it
+
+The pushed source is **vendored** at `demo-seed/bookinfo/<role>/`, not cloned from istio/istio at
+seed time — deterministic, and it carries the CI the demo exists to show. Change the demo by
+editing those trees; the seed force-pushes them.
+
+To run a team's real workflow locally before seeding — same engine the cluster runner uses, since
+`gitea-runner` vendors nektos/act:
+
+```bash
+./demo-seed/ci-local.sh            # all four teams
+./demo-seed/ci-local.sh ratings    # one team
+```
+
+**This requires `act` on PATH** (https://github.com/nektos/act) — a global tool, deliberately not
+vendored here — plus Docker and a running, seeded lab (the workflow's checkout clones from this
+lab's Gitea).
+
+Everything about *why* the gate is shaped this way — Actions rather than Tekton, why a shared
+Docker daemon was rejected, what ephemeral does and does not buy, and ten traps that cost real time
+— is in `GITEA-ACTIONS-CI.md`. Read it before changing any of it.
+
 ## The task, if you were pointed at SETUP.md directly
 
 Only read this top-to-bottom if you're debugging the Taskfile itself, changing what the lab does,
@@ -110,30 +153,28 @@ files most likely to conflict and why the fork touched them, and why the merge m
 (this fork's feature branches are built on `main` and rebasing it would orphan them). Do not try to
 reconstruct that file list from `git log` yourself before reading it — it is already there.
 
-## The task, if you were pointed at POD-EGRESS-INVESTIGATION.md
+## Every Tekton Task on this lab needs two CA-trust settings
 
-Pods on this lab cannot reliably reach the public internet — confirmed again on a fresh cluster on
-2026-08-26, not just an old-cluster artifact. The cause is still unknown after an exhaustive
-elimination pass (see that file's "already ruled out" table); do not re-open the investigation
-without genuinely new evidence, and do not re-spend time re-testing MTU, NetworkPolicy, Istio,
-`kindnetd`/Calico NAT races, conntrack exhaustion, or any of the dozen-plus other things already
-checked with direct evidence, not just reasoned about.
+Not egress — **CA trust**. The platform's self-signed root CA is not in any build tool's trust
+store, so a Tekton Task acting as a TLS client against Harbor or Gitea fails with
+`certificate signed by unknown authority` unless verification is skipped. The two settings are
+already baked into every build this platform creates
+(`charts/team-ns/templates/builds/docker.yaml`), unconditionally, so a normal pipeline needs no
+action:
 
-**If your actual goal is building or running a Tekton pipeline, you do not need to solve this — the
-workaround is proven and is not optional.** Any Dockerfile's `FROM` must resolve to an image already
-mirrored into Harbor, not a public registry — mirror it from the **host** (which has working egress)
-with `skopeo` over `--network host`, then point `FROM` at the Harbor copy. Full recipe, plus the two
-CA-trust settings every Tekton Task on this lab also needs (`git-clone`'s `sslVerify: false`,
-`kaniko`'s `EXTRA_ARGS: [--skip-tls-verify, --skip-tls-verify-pull]`), is at the top of
-`POD-EGRESS-INVESTIGATION.md` under "The workaround". Apply it by default to any pipeline you build
-here — do not treat it as a one-off hack to rediscover each time.
+- `git-clone`'s `sslVerify: "false"`
+- `kaniko`'s `EXTRA_ARGS: [--skip-tls-verify, --skip-tls-verify-pull]`
 
-If you *are* specifically asked to re-test whether the egress bug itself still reproduces, run the
-reproduction steps at the top of that file. If it does not reproduce, say so plainly and stop; do not
-go looking for what "fixed" it, since nothing tracked in this repo changed as a result of the
-investigation — and note that a clean "yes it reproduced" result minutes after install has already
-flipped to "no" and back to "yes" again within the same 40-minute-old cluster once, so a single
-negative result early in a session is weak evidence either way.
+Carry them into any Tekton Task you write by hand. Same root cause as the Python CA trap above; see
+also `TURNSTONE.md` §3.
+
+Base images do **not** need mirroring into Harbor first. Bookinfo's four Dockerfiles keep their
+upstream public `FROM` lines and kaniko pulls every one straight from the public registry, and those
+builds also `pip install` / `bundle install` / `npm install` / `gradle build` over the network —
+confirmed live 2026-08-29 across all four `docker-trigger-build-*` PipelineRuns. If a fresh cluster
+ever *does* fail pulling a base image, the mirroring recipe is preserved as
+`harbor_ensure_project` + `harbor_mirror` in `.taskfiles/seed-lib.sh`, kept deliberately unused for
+exactly that case.
 
 ## The task, if you were pointed at MCP.md
 
@@ -354,6 +395,35 @@ scanning on). See `UPSTREAM-SYNC.md` §4b for the general pattern — upstream s
 any of this, so a future merge won't reintroduce these specific versions but could easily
 reintroduce staleness elsewhere in the same directory; check every pinned image in that directory
 any time you're already in there for a sync, not just kaniko.
+
+**A local edit under `charts/` does nothing until it is committed AND pushed.** Argo CD renders
+every chart in `charts/` from the *public GitHub repo*, at the commit `APPS_REVISION` pins:
+
+```
+repoURL: https://github.com/qvest-digital/apl-core.git
+path:    charts/team-ns
+targetRevision: <APPS_REVISION>
+```
+
+Working-tree state is irrelevant to the cluster, and so is the operator image — **Argo does not read
+these charts from the image**, so verifying that a chart file is baked into `apl-core-local` proves
+nothing. `helm lint` and `helm template` also pass happily on a change the cluster will never see.
+
+This fails silently and mimics an unrelated bug. Confirmed live 2026-08-29: a Role in
+`charts/team-ns/templates/rbac.yaml` granting the team EventListener `jobs.batch` was verified
+present *inside the operator image*, while the Argo app reported `Synced` + `Healthy` and the Role
+did not exist on the cluster. The visible symptom was a CI run stuck `queued` and
+`jobs.batch is forbidden` in the EventListener log — which reads like a webhook, CEL or trigger
+fault, not a missing commit. It cost a full rebuild cycle to find.
+
+So: **commit and push any `charts/` change before testing it**, and let the run pin `APPS_REVISION`
+to that commit (a fresh `task setup` pins current HEAD). When a chart-defined object is missing from
+a running cluster, check the source revision *first*:
+
+```bash
+kubectl get application <app> -n argocd -o jsonpath='{.spec.source.targetRevision}'
+git diff <that-revision> -- charts/<name>      # non-empty = the cluster cannot see your change
+```
 
 **Never run `docker system prune -a`.** It will destroy unrelated containers, images and volumes
 belonging to other projects on this machine. If you need disk, `docker builder prune` is safe.

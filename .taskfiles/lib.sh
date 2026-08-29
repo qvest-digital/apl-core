@@ -192,3 +192,191 @@ apl_show_log() {
   [ -f "$1" ] || return 0
   sed 's/^/   | /' "$1"
 }
+
+# --- running N independent items at once ----------------------------------------------------
+# usage: apl_run_parallel <log-slug-prefix> <label> <fn> <item> [item...]
+#
+# Runs <fn> once per <item>, all at the same time, each item's output captured to its own
+# .taskfiles/state/logs/<prefix>-<key>.log. Returns non-zero if ANY item failed.
+#
+# ⚠ CALL THIS DIRECTLY FROM A TASK'S cmds: BLOCK. Never wrap it in apl_run.
+#
+# That is not style, it is the whole reason this function exists separately. In quiet mode
+# apl_run redirects everything its command prints into a log file (see _apl_run_impl above:
+# `( "$@" ) >> "$_log" 2>&1`). A progress heartbeat printed from inside an apl_run'd function
+# therefore goes to the LOG, and the terminal is left showing `▶ label ... ` with no newline and
+# nothing after it for as long as the work takes. That failure -- a run that looks hung for
+# minutes while it is in fact perfectly healthy -- has been re-introduced repeatedly. It is
+# indistinguishable from a real hang, to a human and to an agent, and it wastes a session every
+# time. apl_run_parallel prints its own progress to the task's real stdout instead, which is why
+# it must not be nested inside the wrapper that would capture it.
+#
+# Two further rules this function follows, for the same reason:
+#   * It only ever prints COMPLETE lines. apl_run's `▶ label ... ` (deliberately unterminated,
+#     so the ✅ lands on the same line) cannot work when several things finish at once -- the
+#     interleaving corrupts it. Concurrency and partial lines are incompatible; pick complete
+#     lines.
+#   * Its heartbeat reports FAILURE, not just progress (CLAUDE.md rule 1b). A watcher that only
+#     ever prints good news stays silent through a crash, and silence reads as "still working".
+#
+# The task calling this must also be `interactive: true`, or Taskfile.yml's global
+# `output: group` buffers the whole block until the script exits and re-creates the same symptom
+# from the other direction. Every task in seed.yml carries it.
+APL_PARALLEL_TICK=${APL_PARALLEL_TICK:-20}
+apl_run_parallel() {
+  _arp_slug=$1; shift
+  _arp_label=$1; shift
+  _arp_fn=$1; shift
+
+  _arp_stat=$(mktemp -d)
+  _arp_start=$(date +%s)
+  _arp_n=0
+  _arp_keys=""
+  for _arp_item in "$@"; do
+    _arp_n=$((_arp_n + 1))
+    # Display/log key: the middle field of a "role:team:repo" spec is the team, which is what a
+    # human reading this actually tracks. Falls back to the whole item, sanitised for a filename.
+    _arp_key=$(printf '%s' "$_arp_item" | cut -d: -f2)
+    [ -n "$_arp_key" ] || _arp_key=$(printf '%s' "$_arp_item" | tr -c 'a-zA-Z0-9_-' '-')
+    _arp_keys="$_arp_keys $_arp_key"
+    _arp_log=$(apl_logfile "$_arp_slug-$_arp_key")
+    : > "$_arp_log"
+    # The item's own output goes to its log; only the exit status and elapsed time come back, via
+    # a file rather than a pid, so this needs no job-control builtins (the Taskfile runs under
+    # mvdan/sh, not bash).
+    (
+      _arp_t0=$(date +%s)
+      # Quoted: the item is passed as exactly ONE argument. Unquoted it would also be glob-expanded,
+      # so an item that happened to contain a metacharacter would silently become a different
+      # argument list, or none.
+      #
+      # Wrapped in `if`, never called bare. A bare call is fatal under `set -e`: errexit aborts
+      # this subshell the instant the item fails, BEFORE the status file below is written -- so
+      # the item never reports, the heartbeat prints "running: <item>" forever, and the driver
+      # waits on a status that can never appear. Observed live 2026-08-29: `ratings` died at
+      # 21:36:20 and was still being announced as running 10 minutes later, with the whole seed
+      # hung behind it. A command inside an `if` condition is exempt from errexit, so failure
+      # reaches the status file instead of killing the worker.
+      if "$_arp_fn" "$_arp_item" > "$_arp_log" 2>&1; then _arp_rc=0; else _arp_rc=$?; fi
+      # Written to a temp name and MOVED into place, never straight to the final path. `>` creates
+      # and truncates the file before printf writes to it, so a plain redirect leaves a window in
+      # which the file exists and is EMPTY -- and the heartbeat, reading it in that window, gets
+      # no status and reports the item as failed. Observed live: a healthy item was announced as
+      # "FAILED" mid-run and then finished ✅, which is worse than no heartbeat at all. rename(2)
+      # is atomic, so the file only ever appears complete.
+      printf '%s %s\n' "$_arp_rc" "$(( $(date +%s) - _arp_t0 ))" > "$_arp_stat/.$_arp_key.tmp"
+      mv "$_arp_stat/.$_arp_key.tmp" "$_arp_stat/$_arp_key"
+    ) &
+  done
+
+  printf '▶ %s%s%s -- %s in parallel, one log each\n' "$APL_B" "$_arp_label" "$APL_R" "$_arp_n"
+
+  # Heartbeat. Prints one complete line per tick naming what is still running AND what has
+  # already failed, so a dead item surfaces at the next tick instead of at the end.
+  while :; do
+    _arp_done=0; _arp_busy=""; _arp_bad=""
+    for _arp_key in $_arp_keys; do
+      if [ -f "$_arp_stat/$_arp_key" ]; then
+        _arp_done=$((_arp_done + 1))
+        # Cleared before every read: a failed read leaves the PREVIOUS item's status in place,
+        # which silently attributes one item's outcome to another.
+        _arp_rc=""; _arp_el=""
+        read -r _arp_rc _arp_el < "$_arp_stat/$_arp_key" || true
+        [ "${_arp_rc:-1}" -eq 0 ] || _arp_bad="$_arp_bad $_arp_key"
+      else
+        _arp_busy="$_arp_busy$_arp_key "
+      fi
+    done
+    [ "$_arp_done" -ge "$_arp_n" ] && break
+    printf '   [%ss] %s/%s done%s | running: %s\n' \
+      "$(( $(date +%s) - _arp_start ))" "$_arp_done" "$_arp_n" \
+      "$([ -n "$_arp_bad" ] && printf ', FAILED:%s' "$_arp_bad")" "$_arp_busy"
+    sleep "$APL_PARALLEL_TICK"
+  done
+  wait
+
+  # One complete result line per item, in the order they were given rather than the order they
+  # finished, so two runs are diffable.
+  _arp_rc_all=0
+  for _arp_key in $_arp_keys; do
+    _arp_rc=""; _arp_el=""
+    read -r _arp_rc _arp_el < "$_arp_stat/$_arp_key" || true
+    _arp_log=$(apl_logfile "$_arp_slug-$_arp_key")
+    if [ "${_arp_rc:-1}" -eq 0 ]; then
+      printf '   ✅ %-12s (%ss)\n' "$_arp_key" "$_arp_el"
+    else
+      _arp_rc_all=$_arp_rc
+      printf '   ❌ %-12s failed (%ss, exit %s)\n' "$_arp_key" "$_arp_el" "$_arp_rc" >&2
+      if [ -f "$_arp_log" ]; then
+        printf '      last %s lines of %s:\n' "$APL_TAIL" "$_arp_log" >&2
+        tail -n "$APL_TAIL" "$_arp_log" | sed 's/^/      | /' >&2
+      fi
+    fi
+  done
+  rm -rf "$_arp_stat"
+  printf '   %s total: %ss wall clock\n' "$_arp_label" "$(( $(date +%s) - _arp_start ))"
+  return "$_arp_rc_all"
+}
+
+# --- serialising the parts of a parallel item that must not overlap -------------------------
+# usage: apl_with_api_lock <command> [args...]
+#
+# Wraps a mutating apl-api call so only one runs at a time across concurrent items.
+#
+# Every team's setup writes to the SAME git values repo through apl-api (team, build, workload,
+# service, netpol). Four of those landing at once is a push race on one repository. The waits
+# around them -- 180s for a webhook, 90s for an EventListener, minutes for a build -- are what
+# actually take the time and are perfectly safe to overlap, so the lock is held for seconds and
+# the parallelism is kept.
+#
+# flock(1) is from util-linux and is present on any Linux host that can run the rest of this
+# lab; there is no attempt to emulate it, because a silent no-op lock would be worse than a
+# hard failure.
+#
+# Implemented with `mkdir`, not flock, and NOT because flock is unavailable -- it is installed.
+# Neither flock form works here:
+#   * `flock <file> <command>` EXECs its command, so it cannot run a shell function, and every
+#     caller of this is a function.
+#   * `( flock 9; ... ) 9>>lock` -- the usual workaround -- fails under go-task. Taskfile.yml runs
+#     commands through mvdan/sh, which honours the `9>>` redirect for its own builtins but does
+#     NOT pass fd 9 to an exec'd binary, so flock exits 1 having seen no such descriptor.
+#     Verified live: the redirect succeeds and `flock 9` immediately after it fails.
+#
+# `mkdir` is atomic on any POSIX filesystem and needs no descriptor, so it works identically under
+# bash and mvdan/sh. No subshell either, which means the wrapped command's exit status and any
+# variables it sets are the caller's, matching how apl_run behaves.
+APL_LOCK_STALE=${APL_LOCK_STALE:-120}
+# apl_with_lock <lock-name> <stale-seconds> <command> [args...] -- run <command> holding a named
+# mutex. Used for any resource that parallel seed items share and that cannot take concurrent
+# writers: the apl-api values repo, and the single shared gitea-runner download.
+apl_with_lock() {
+  _awl_name=$1; shift
+  _awl_stale=$1; shift
+  _awl_dir="${APL_STATE_DIR:-.taskfiles/state}/.$_awl_name.lock.d"
+  mkdir -p "${APL_STATE_DIR:-.taskfiles/state}"
+  _awl_waited=0
+  while ! mkdir "$_awl_dir" 2>/dev/null; do
+    # A holder that died leaves the directory behind and would deadlock every other item forever,
+    # so a lock older than its stale window is treated as abandoned rather than slow.
+    if [ "$_awl_waited" -ge "$_awl_stale" ]; then
+      printf '⚠️  %s lock held for %ss -- assuming a dead holder and taking it\n' "$_awl_name" "$_awl_waited" >&2
+      rm -rf "$_awl_dir"
+      _awl_waited=0
+      continue
+    fi
+    sleep 1
+    _awl_waited=$((_awl_waited + 1))
+  done
+  # `if`, not a bare call: under `set -e` a failing command would abort this function before the
+  # release below, stranding the lock until its stale window expires. Same errexit trap that hung
+  # apl_run_parallel -- see the comment on its worker subshell.
+  if "$@"; then _awl_rc=0; else _awl_rc=$?; fi
+  rmdir "$_awl_dir" 2>/dev/null || rm -rf "$_awl_dir" 2>/dev/null || true
+  return "$_awl_rc"
+}
+
+apl_with_api_lock() {
+  # The critical section is two curl calls with --max-time 15, so anything older than
+  # APL_LOCK_STALE is not slow, it is gone.
+  apl_with_lock api "$APL_LOCK_STALE" "$@"
+}

@@ -147,11 +147,9 @@ equivalent bot-account concept; a PAT tied to a real human account is the only n
 
 **Vikunja MCP (`democratize-technology/vikunja-mcp@0.2.0`, via `supergateway`):**
 - Ships no Docker image, stdio-only. `vikunja-mcp/Dockerfile` installs the npm package **at image
-  build time** (`npm install -g ...`) rather than the upstream-suggested `npx -y ...` at runtime —
-  not because of `POD-EGRESS-INVESTIGATION.md`'s Tekton-specific egress bug (that bug does **not**
-  apply to a normal Deployment's own image pulls or a running pod's regular outbound calls — this
-  was checked and corrected mid-session, don't re-cite it here), but so every pod restart runs one
-  pinned, known-good version instead of re-resolving `latest` from the npm registry each time.
+  build time** (`npm install -g ...`) rather than the upstream-suggested `npx -y ...` at runtime,
+  so every pod restart runs one pinned, known-good version instead of re-resolving `latest` from
+  the npm registry each time.
   Verified live with `--network none` that the built image starts cleanly with zero runtime
   network access.
 - Exposes a `vikunja_auth` tool (`connect` / `status` / `refresh` / `disconnect`, taking

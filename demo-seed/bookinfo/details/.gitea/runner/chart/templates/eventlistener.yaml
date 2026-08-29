@@ -1,0 +1,140 @@
+{{- /*
+On-demand ephemeral Actions runners.
+
+This chart used to deploy a Deployment holding ONE always-running ephemeral runner. That shape had
+three problems, all of which came from running a one-shot workload under a controller built for
+long-lived ones:
+
+  * A Deployment forces restartPolicy: Always, and the kubelet applies CrashLoopBackOff to ANY
+    repeated restart regardless of exit code. The runner exits 0 after each job and was still
+    penalised -- verified live: a pod exiting 0 every time reached `CrashLoopBackOff` with 5
+    restarts, and the delay grows to a 5-minute cap. On a busy repo a job could sit `queued` for
+    minutes with a healthy runner and no error anywhere.
+  * `restartPolicyRules` (new in k8s 1.32+) does NOT help: it decides WHETHER to restart, not how
+    the restart is accounted. Verified live -- a pod with an explicit "restart on exit 0" rule
+    accrued exactly the same backoff as one without.
+  * One idle pod per team, permanently, and only ever one job at a time.
+
+Instead: create nothing until Gitea says a job is queued. Gitea emits a `workflow_job` webhook
+(added in Gitea 1.24, go-gitea/gitea#33694) whose payload carries `action: queued` and the job's
+requested labels. That fires this EventListener, which creates a Kubernetes Job running exactly one
+ephemeral runner.
+
+A Job is the right noun: its pod uses restartPolicy: Never, so a clean exit is a COMPLETION and
+there is nothing for CrashLoopBackOff to apply to; and `ttlSecondsAfterFinished` makes Kubernetes'
+own TTL controller delete the Job and its pod when it finishes -- event-driven, no CronJob, no
+reaper, no extra RBAC on the runner itself. Deployments deliberately have no equivalent, which is
+the clue that one-shot work was never meant to run under one.
+
+The runner image, entrypoint.sh, --ephemeral registration and the reusable org token are all
+UNCHANGED. Only what creates the runner changed.
+*/ -}}
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: TriggerBinding
+metadata:
+  name: gitea-workflowjob-{{ .Values.teamId }}
+spec:
+  params:
+    # Traceability only -- the Job is named after the Gitea run that caused it, so a pod in this
+    # namespace can be traced back to a workflow run without reading logs.
+    - name: runid
+      value: $(body.workflow_job.run_id)
+---
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: TriggerTemplate
+metadata:
+  name: gitea-workflowjob-{{ .Values.teamId }}
+spec:
+  params:
+    - name: runid
+      description: Gitea Actions run id that queued this job
+  resourcetemplates:
+    - apiVersion: batch/v1
+      kind: Job
+      metadata:
+        # generateName, not name: several jobs can be queued at once and each gets its own runner.
+        # That is the autoscaling the old single-replica Deployment could not do at all.
+        generateName: ci-runner-$(tt.params.runid)-
+        labels:
+          app: ci-runner
+          ci-runner/run-id: "$(tt.params.runid)"
+      spec:
+        # Kubernetes' own event-driven cleanup. Verified live: Job and pod both gone within the
+        # TTL of finishing, leaving zero pods behind.
+        ttlSecondsAfterFinished: {{ .Values.ttlSecondsAfterFinished }}
+        # 0, not the default 6: a runner that cannot register must not be retried into a hot loop.
+        # The job it was created for stays queued and the next webhook (or the drain in
+        # seed:runners) is the recovery path.
+        backoffLimit: 0
+        # Bounds a runner that registers but is never handed its job, so it cannot sit forever.
+        activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+        template:
+          metadata:
+            labels:
+              app: ci-runner
+          spec:
+            # The entire point: a clean exit is a completion, not a restart.
+            restartPolicy: Never
+            # The runner executes arbitrary CI code in host mode, in this same container. It has no
+            # reason to hold a Kubernetes credential, and not mounting one means a workflow cannot
+            # reach the API server with the pod's identity.
+            automountServiceAccountToken: false
+            containers:
+              - name: runner
+                image: "{{ .Values.image }}:{{ .Values.imageTag }}"
+                # Always + a mutable tag: every Job is a fresh pod, so each one re-resolves :main
+                # and a rebuilt runner image is picked up by the next job with nothing else in the
+                # loop. (Rebuilding that image is still a deliberate, manual act -- the runner
+                # build carries trigger:false so unrelated app pushes do not rebuild it.)
+                imagePullPolicy: Always
+                env:
+                  - name: GITEA_INSTANCE_URL
+                    value: {{ .Values.giteaInstanceUrl | quote }}
+                  # Unique per run: an ephemeral runner deregisters itself server-side after its
+                  # single job, so reusing one name across concurrent runners would have two live
+                  # registrations fighting over the same identity.
+                  - name: RUNNER_NAME
+                    value: "{{ .Values.teamId }}-$(tt.params.runid)"
+                  - name: RUNNER_LABELS
+                    value: {{ .Values.runnerLabels | quote }}
+                  - name: GITEA_RUNNER_REGISTRATION_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: {{ .Values.tokenSecretName }}
+                        key: token
+                resources: {{- toYaml .Values.resources | nindent 18 }}
+---
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: EventListener
+metadata:
+  name: gitea-workflowjob-{{ .Values.teamId }}
+  labels:
+    # REQUIRED, not decoration: the platform's `default-from-gitea` NetworkPolicy admits traffic
+    # from the gitea namespace ONLY to pods carrying this label. Without it Gitea's delivery times
+    # out with `context deadline exceeded` and, because Gitea does not retry a failed delivery, the
+    # queued job is simply never served. Confirmed live while building this.
+    app.kubernetes.io/managed-by: EventListener
+spec:
+  serviceAccountName: tekton-triggers-team-{{ .Values.teamId }}
+  triggers:
+    - name: workflow-job-queued
+      interceptors:
+        - name: only-queued-jobs-for-our-labels
+          ref:
+            name: cel
+            kind: ClusterInterceptor
+          params:
+            # Two filters, both load-bearing. `action == 'queued'` because the same hook also
+            # fires on in_progress/completed, and acting on those would create runners for jobs
+            # that already have one. The label check because a runner registered with our labels
+            # can only serve jobs that asked for them -- creating one for a job we cannot serve
+            # would spawn a pod that idles until activeDeadlineSeconds and never helps anyone.
+            - name: filter
+              value: >-
+                body.action == 'queued' &&
+                {{ .Values.runnerLabels | splitList ":" | first | quote }} in body.workflow_job.labels
+      bindings:
+        - kind: TriggerBinding
+          ref: gitea-workflowjob-{{ .Values.teamId }}
+      template:
+        ref: gitea-workflowjob-{{ .Values.teamId }}

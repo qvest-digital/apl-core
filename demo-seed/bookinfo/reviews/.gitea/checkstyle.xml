@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+<!--
+  Minimal, targeted Checkstyle ruleset for team-reviews' reviews-application.
+
+  Deliberately small: rather than the bundled google_checks/sun_checks (which flag
+  100+ findings on this file, mostly re litigating its pre existing 8-space
+  indentation style against a 2- or 4-space convention it never claimed to follow),
+  this checks for a short list of genuinely objective style bugs, such as inconsistent
+  tabs/spaces, missing whitespace, and missing trailing newline, that are real,
+  worth fixing, and few enough to review individually.
+-->
+<module name="Checker">
+  <module name="NewlineAtEndOfFile"/>
+  <module name="FileTabCharacter"/>
+  <module name="TreeWalker">
+    <module name="WhitespaceAfter">
+      <property name="tokens" value="COMMA, SEMI"/>
+    </module>
+    <module name="WhitespaceAround">
+      <property name="tokens" value="LCURLY"/>
+    </module>
+    <module name="EmptyLineSeparator">
+      <property name="tokens" value="IMPORT"/>
+    </module>
+    <module name="RightCurly"/>
+    <module name="RedundantImport"/>
+    <module name="UnusedImports"/>
+  </module>
+</module>

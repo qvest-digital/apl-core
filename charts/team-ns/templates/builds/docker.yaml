@@ -39,7 +39,7 @@ spec:
     # The platform's self-signed CA has no Authority Key Identifier (see CLAUDE.md), which every
     # in-cluster client this side of Go chokes on. This lab's git-init and kaniko builds are TLS
     # clients that fail against it too, so skip verification rather than trust it -- see
-    # POD-EGRESS-INVESTIGATION.md's Tekton workaround.
+    # CLAUDE.md's "Every Tekton Task on this lab needs two CA-trust settings".
     - name: sslVerify
       value: "false"
   {{- if .scanSource }}

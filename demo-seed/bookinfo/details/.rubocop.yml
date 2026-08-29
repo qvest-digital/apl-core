@@ -1,0 +1,46 @@
+AllCops:
+  NewCops: disable
+
+Metrics:
+  Enabled: false
+
+# Layout/Naming are pure formatting-convention drift on this vendored Istio sample --
+# indentation width, hash-literal spacing, snake_case naming, etc. None of it is a bug.
+Layout:
+  Enabled: false
+
+Naming:
+  Enabled: false
+
+Style/FrozenStringLiteralComment:
+  Enabled: false
+
+Style/ZeroLengthPredicate:
+  Enabled: false
+
+Style/MultilineIfThen:
+  Enabled: false
+
+Style/HashSyntax:
+  Enabled: false
+
+Style/TrailingCommaInArguments:
+  Enabled: false
+
+Style/BlockDelimiters:
+  Enabled: false
+
+Style/RescueStandardError:
+  Enabled: false
+
+Style/RedundantReturn:
+  Enabled: false
+
+Style/StringConcatenation:
+  Enabled: false
+
+Style/IfUnlessModifier:
+  Enabled: false
+
+Lint/UnusedBlockArgument:
+  Enabled: false

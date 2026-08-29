@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# This runner is registered in host mode: no Docker, no per-step containers. Every step below runs
+# as a plain process directly on the team's gitea-actions-runner pod, from an image built by this
+# platform's own Tekton pipeline (see .gitea/runner/). Marketplace actions (actions/checkout
+# included) are Node.js-based and this image has no Node on PATH, so checkout is a plain `git
+# clone` using Gitea's own per-job token.
+#
+# The checkout step below is deliberately IDENTICAL across all four Bookinfo team repos -- keep it
+# that way, and change all four together.
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          rm -rf checkout
+          SERVER="${GITHUB_SERVER_URL#https://}"
+          # sslVerify=false: this lab's Gitea serves a cert from its own auto-generated root CA,
+          # which no runner's system trust store carries. See CLAUDE.md's CA note.
+          git -c http.sslVerify=false clone --quiet \
+            "https://x-access-token:${GH_TOKEN}@${SERVER}/${GITHUB_REPOSITORY}.git" checkout
+          cd checkout
+          git -c http.sslVerify=false fetch --quiet origin "${GITHUB_SHA}"
+          git checkout --quiet "${GITHUB_SHA}"
+          echo "checked out $(git rev-parse HEAD)"
+
+      - name: lint
+        run: |
+          set -eu
+          # Checkstyle 14.0.0 is compiled for Java 21, but this image's DEFAULT jdk is 8 because
+          # the reviews app itself must build under 8 (gradle:8.13.0-jdk8). The JRE 21 is baked in
+          # alongside and invoked by explicit path here, so `java`/JAVA_HOME stay on 8 for the
+          # gradle build below. Do not "simplify" this to a bare `java -jar`.
+          /usr/lib/jvm/java-21-openjdk-amd64/bin/java -jar /opt/checkstyle.jar \
+            -c checkout/.gitea/checkstyle.xml \
+            checkout/reviews-application/src/main/java
+
+      - name: build
+        working-directory: checkout
+        run: gradle build --console=plain

@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# This runner is registered in host mode: no Docker, no per-step containers. Every step below runs
+# as a plain process directly on the team's gitea-actions-runner pod, from an image built by this
+# platform's own Tekton pipeline (see .gitea/runner/). Marketplace actions (actions/checkout
+# included) are Node.js-based and this image has no Node on PATH, so checkout is a plain `git
+# clone` using Gitea's own per-job token.
+#
+# The checkout step below is deliberately IDENTICAL across all four Bookinfo team repos -- keep it
+# that way, and change all four together.
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          rm -rf checkout
+          SERVER="${GITHUB_SERVER_URL#https://}"
+          # sslVerify=false: this lab's Gitea serves a cert from its own auto-generated root CA,
+          # which no runner's system trust store carries. See CLAUDE.md's CA note.
+          git -c http.sslVerify=false clone --quiet \
+            "https://x-access-token:${GH_TOKEN}@${SERVER}/${GITHUB_REPOSITORY}.git" checkout
+          cd checkout
+          git -c http.sslVerify=false fetch --quiet origin "${GITHUB_SHA}"
+          git checkout --quiet "${GITHUB_SHA}"
+          echo "checked out $(git rev-parse HEAD)"
+
+      - name: lint
+        working-directory: checkout
+        run: ruff check --select=E4,E7,E9,F .
+
+      - name: build
+        working-directory: checkout
+        run: |
+          set -eu
+          # requirements.txt and test-requirements.txt are independently pip-compiled lock files
+          # (test-requirements.in only locks requests-mock), so they pin conflicting exact versions
+          # of shared transitive deps (certifi, requests). Installing them together in ONE pip
+          # invocation makes pip's resolver refuse both pins at once (ResolutionImpossible).
+          # Installing sequentially lets the second install's pins win for anything shared -- fine
+          # here, nothing in the app or its tests depends on an exact certifi/requests version at
+          # import time.
+          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir -r test-requirements.txt
+          python -m unittest discover tests/unit

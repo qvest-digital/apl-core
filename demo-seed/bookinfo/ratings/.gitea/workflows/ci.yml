@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# This runner is registered in host mode: no Docker, no per-step containers. Every step below runs
+# as a plain process directly on the team's gitea-actions-runner pod, from an image built by this
+# platform's own Tekton pipeline (see .gitea/runner/). Marketplace actions (actions/checkout
+# included) are Node.js-based and resolve against github.com, which is not what this lab's Gitea
+# serves, so checkout is a plain `git clone` using Gitea's own per-job token.
+#
+# The checkout step below is deliberately IDENTICAL across all four Bookinfo team repos -- keep it
+# that way, and change all four together.
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          rm -rf checkout
+          SERVER="${GITHUB_SERVER_URL#https://}"
+          # sslVerify=false: this lab's Gitea serves a cert from its own auto-generated root CA,
+          # which no runner's system trust store carries. See CLAUDE.md's CA note.
+          git -c http.sslVerify=false clone --quiet \
+            "https://x-access-token:${GH_TOKEN}@${SERVER}/${GITHUB_REPOSITORY}.git" checkout
+          cd checkout
+          git -c http.sslVerify=false fetch --quiet origin "${GITHUB_SHA}"
+          git checkout --quiet "${GITHUB_SHA}"
+          echo "checked out $(git rev-parse HEAD)"
+
+      - name: lint
+        working-directory: checkout
+        # eslint.config.js requires @eslint/js and globals, which are installed GLOBALLY in this
+        # runner image (npm root -g), not locally under the checkout -- Node's require() does not
+        # search the global npm folder unless NODE_PATH points at it.
+        run: NODE_PATH="$(npm root -g)" eslint ratings.js
+
+      - name: build
+        working-directory: checkout
+        run: npm install

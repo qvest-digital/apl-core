@@ -718,9 +718,7 @@ in the same commit.
 
 The npm package (`@democratize-technology/vikunja-mcp`) is installed **at image build time**, not
 fetched by the running pod, so every restart runs one pinned, known-good version instead of
-re-resolving `latest` from the npm registry each time — this is unrelated to
-`POD-EGRESS-INVESTIGATION.md`'s Tekton-specific egress bug, which does not affect a normal
-Deployment's own image pulls or a running pod's regular outbound calls.
+re-resolving `latest` from the npm registry each time.
 
 No credential needs provisioning for this one. The server carries no static token — a caller
 authenticates per MCP session via the `vikunja_auth` tool (`connect`, passing its own `apiToken`),
@@ -815,10 +813,10 @@ The `values.yaml` from the Quickstart. Eight things in it are load-bearing:
   and Argo CD do, and needs no `path:` deep link in `core.yaml` — unlike Turnstone and Vikunja,
   which do their own OIDC.
 
-  **Docker-mode build pipelines need the pod-egress CA workaround too, and it's already baked
-  in.** `charts/team-ns/templates/builds/docker.yaml` sets `sslVerify: false` on `git-clone` and
-  `--skip-tls-verify`/`--skip-tls-verify-pull` on kaniko unconditionally, for exactly the reason
-  `POD-EGRESS-INVESTIGATION.md`'s Tekton workaround section gives — without it, every
+  **Docker-mode build pipelines need the two Tekton CA-trust settings too, and they're already
+  baked in.** `charts/team-ns/templates/builds/docker.yaml` sets `sslVerify: false` on `git-clone`
+  and `--skip-tls-verify`/`--skip-tls-verify-pull` on kaniko unconditionally, for exactly the
+  reason CLAUDE.md's "Every Tekton Task on this lab needs two CA-trust settings" gives — without it, every
   console-triggered docker build fails at either the clone or the push step against this
   platform's self-signed CA. Nothing needs doing for a fresh install: step 5's `APPS_REVISION` is
   derived from `git rev-parse HEAD`, so any install built from a commit at or after this one gets

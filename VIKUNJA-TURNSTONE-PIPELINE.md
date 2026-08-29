@@ -107,13 +107,17 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir turnstone==1.8.1
 ```
 
-**Built on the host and pushed with `skopeo`, never pulled by a pod from PyPI or Docker Hub** —
-the same `POD-EGRESS-INVESTIGATION.md` workaround as every other image on this lab. `docker push`
-itself doesn't work here either: the host's Docker daemon doesn't trust the platform's custom CA any
-more than a pod does, so pushing needs `skopeo copy docker-daemon:... docker://harbor.../...
---dest-tls-verify=false`, not a plain `docker push` (which fails with the same
-`certificate signed by unknown authority` this whole platform's self-signed CA always produces
-outside Go clients — see `CLAUDE.md`'s CA note).
+**Built on the host and pushed with `skopeo`.** At the time this was done on the belief that a pod
+could not pull from PyPI or Docker Hub at all; **that no longer holds** — confirmed live
+2026-08-29, in-cluster kaniko builds pull public base images and install packages over the network
+fine (see `CLAUDE.md`). A pipeline written today can build this image in-cluster like any other.
+
+The `skopeo` part is still right for a host-side push, though, and for its own reason: `docker push`
+does not work here because the host's Docker daemon doesn't trust the platform's custom CA any more
+than a pod does, so pushing needs `skopeo copy docker-daemon:... docker://harbor.../...
+--dest-tls-verify=false` (a plain `docker push` fails with the same
+`certificate signed by unknown authority` this platform's self-signed CA always produces outside Go
+clients — see `CLAUDE.md`'s CA note).
 
 Pin the version (`turnstone==1.8.1`) to whatever this cluster's Turnstone chart is actually running
 (`kubectl get deploy turnstone-server -n turnstone -o jsonpath='{..image}'` will show the tag) — the

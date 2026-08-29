@@ -178,3 +178,105 @@ tasks:
         apl_section "not covered here (browser-only, SETUP.md step 11 sections 5-7)"
         apl_dim "the console tile, the otomi-idp SSO round-trip, role mapping after a real login,"
         apl_dim "and an actual chat turn against the Claude API."
+
+  ci:
+    desc: "Gitea Actions merge gates: on-demand runner trigger wired, CI green on main, main protected (see GITEA-ACTIONS-CI.md)"
+    cmds:
+      - |
+        . "{{.LIB}}"
+        set -uo pipefail
+        apl_header "Gitea Actions CI verification"
+
+        D=$(kubectl get httproute gitea -n gitea -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null | sed 's/^gitea\.//')
+        [ -n "$D" ] || { apl_fail "could not derive domain from the gitea httproute"; exit 1; }
+        GU=$(kubectl get secret gitea-admin-secret -n gitea -o jsonpath='{.data.username}' | base64 -d)
+        GP=$(kubectl get secret gitea-admin-secret -n gitea -o jsonpath='{.data.password}' | base64 -d)
+        API="https://gitea.$D/api/v1"
+        RC=0
+
+        # team:repo -- the four Bookinfo repos seed:apps creates. Kept in step with
+        # .taskfiles/seed.yml's SEED_BOOKINFO_SERVICES.
+        for PAIR in prodpage:productpage details:details reviews:reviews ratings:ratings; do
+          TEAM=${PAIR%%:*}
+          REPO=${PAIR##*:}
+          apl_section "team-$TEAM/$REPO"
+
+          # "Is a runner online?" is the WRONG question now. Runners are created on demand from a
+          # `workflow_job: queued` webhook and deleted when they finish, so at rest a healthy team
+          # has ZERO runners and zero runner pods -- the old check would fail on a perfectly
+          # working cluster. What must be true at rest is that the machinery to create one exists.
+          EL="el-gitea-workflowjob-$TEAM"
+          ELAVAIL=$(kubectl get deploy "$EL" -n "team-$TEAM" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)
+          if [ "${ELAVAIL:-0}" -ge 1 ]; then
+            apl_ok "on-demand trigger ready ($EL Available)"
+          else
+            apl_fail "$EL is not Available in team-$TEAM -- queued jobs will never get a runner"; RC=1
+          fi
+
+          # The webhook that feeds it. Present but pointing somewhere else is just as dead as
+          # absent, so match the target URL rather than merely counting hooks.
+          HOOKS=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/hooks")
+          if printf '%s' "$HOOKS" | jq -e --arg u "http://$EL.team-$TEAM.svc.cluster.local:8080/" \
+               '[.[]? | select(.config.url==$u and .active==true and (.events|index("workflow_job")))] | length >= 1' >/dev/null 2>&1; then
+            apl_ok "workflow_job webhook active and pointed at $EL"
+          else
+            apl_fail "no active workflow_job webhook targeting $EL on team-$TEAM/$REPO"; RC=1
+          fi
+
+          # Leftover runner pods are the failure mode this design exists to remove, so assert it
+          # directly: anything Running here is a runner that outlived its job, and anything left
+          # Succeeded means ttlSecondsAfterFinished is not doing its job.
+          LEFT=$(kubectl get pods -n "team-$TEAM" -l app=ci-runner --no-headers 2>/dev/null | wc -l)
+          BUSY=$(kubectl get pods -n "team-$TEAM" -l app=ci-runner --no-headers 2>/dev/null | grep -c 'Running' || true)
+          if [ "${LEFT:-0}" -eq 0 ]; then
+            apl_ok "no runner pods at rest (on-demand, nothing idling)"
+          elif [ "${BUSY:-0}" -ge 1 ]; then
+            apl_warn "$LEFT runner pod(s) present, $BUSY running -- a job is in flight, re-run to confirm they clear"
+          else
+            apl_warn "$LEFT finished runner pod(s) still present -- within ttlSecondsAfterFinished, or TTL is not firing"
+          fi
+
+          SHA=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/branches/main" | jq -r '.commit.id // empty')
+          if [ -n "$SHA" ]; then
+            # `.conclusion`, not `.status`: a finished run reports status "completed" and carries
+            # its pass/fail in conclusion. Checking status would never match "success" and would
+            # report every green repo as broken. Filtered by sha client-side rather than trusting
+            # a head_sha query parameter.
+            STATUS=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/actions/runs?limit=20" \
+              | jq -r --arg s "$SHA" '[.workflow_runs[]? | select(.head_sha==$s)] | .[0] | (.conclusion // .status) // "none"' 2>/dev/null || echo none)
+            case "$STATUS" in
+              success) apl_ok "CI green on main ($(printf '%s' "$SHA" | cut -c1-7))" ;;
+              none)    apl_fail "no Actions run recorded for main"; RC=1 ;;
+              *)       apl_fail "CI on main is '$STATUS'"; RC=1 ;;
+            esac
+          else
+            apl_fail "could not read main's HEAD sha"; RC=1
+          fi
+
+          PROT=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/branch_protections")
+          CTX=$(printf '%s' "$PROT" | jq -r '.[0].status_check_contexts[0] // empty' 2>/dev/null || true)
+          # NOT `// empty`: jq's alternative operator falls through on false as well as null, so a
+          # correctly-disabled push would read as missing and this check would fail on a healthy repo.
+          PUSH=$(printf '%s' "$PROT" | jq -r '.[0].enable_push' 2>/dev/null || true)
+          if [ -n "$CTX" ] && [ "$PUSH" = "false" ]; then
+            apl_ok "main protected, requires '$CTX'"
+          else
+            apl_fail "main not protected as expected (context='${CTX:-none}', enable_push='${PUSH:-?}')"; RC=1
+          fi
+
+          if kubectl get deploy "$REPO-runner" -n "team-$TEAM" >/dev/null 2>&1 \
+             || kubectl get pipelinerun "docker-build-$REPO-runner" -n "team-$TEAM" >/dev/null 2>&1; then
+            PRS=$(kubectl get pipelinerun "docker-build-$REPO-runner" -n "team-$TEAM" \
+              -o jsonpath='{.status.conditions[0].reason}' 2>/dev/null || true)
+            [ "$PRS" = "Succeeded" ] && apl_ok "runner image build Succeeded" \
+              || apl_warn "runner image PipelineRun reason='${PRS:-absent}' (fine if the image was already in Harbor)"
+          fi
+        done
+
+        apl_section "summary"
+        if [ "$RC" -eq 0 ]; then
+          apl_ok "all four teams: on-demand runner trigger wired, CI green on main, main protected"
+        else
+          apl_fail "one or more checks failed -- see above, and GITEA-ACTIONS-CI.md for what each means"
+        fi
+        exit $RC

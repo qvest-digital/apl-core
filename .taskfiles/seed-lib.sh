@@ -359,14 +359,23 @@ gitea_ensure_team_credentials() {
 # harbor_ensure_project / harbor_mirror are NOT used by the Bookinfo seed below: Bookinfo's four
 # Dockerfiles keep their upstream public `FROM` lines (python/ruby/node/gradle/open-liberty) and
 # kaniko pulled every one of them straight from the public registry, confirmed live 2026-08-29 --
-# all four `docker-trigger-build-*` PipelineRuns Succeeded. That is a deviation from
-# POD-EGRESS-INVESTIGATION.md's blanket "mirror every FROM into Harbor first" rule, kept because
-# the unmodified upstream source IS the demo content; rewriting `FROM` would make it a fork.
+# all four `docker-trigger-build-*` PipelineRuns Succeeded. Those same builds also install packages
+# over the network (pip/bundle/npm/gradle/featureUtility), so in-cluster builds on this lab reach
+# both public registries and public package indexes fine.
 #
-# These two are kept deliberately, unused, because they are exactly that documented workaround:
-# if a fresh cluster's builds ever fail pulling a base image, the first thing to try is
-# harbor_ensure_project + harbor_mirror for each base image, then a `sed` on the pushed
-# Dockerfile's FROM. Do not delete them just because nothing calls them today.
+# These two are kept deliberately, unused, as the ready-made fallback if that ever stops being
+# true on some future cluster. The recipe, in full, so it does not depend on any other file:
+#
+#   1. harbor_ensure_project "<project>"                       # e.g. the team's own project
+#   2. harbor_mirror "python:3.13.3-slim" "<project>/python:3.13.3-slim"   # once per base image,
+#                                                              # run from the HOST, which has
+#                                                              # unrestricted egress
+#   3. sed -i "s|^FROM python:3.13.3-slim|FROM harbor.$DOMAIN/<project>/python:3.13.3-slim|" \
+#        <pushed Dockerfile>                                   # repoint FROM at the Harbor copy
+#
+# Do not delete them just because nothing calls them today: rediscovering this costs an afternoon,
+# and the seed deliberately does not rewrite `FROM` because the unmodified upstream source IS the
+# demo content -- rewriting it would make the demo a fork of Bookinfo rather than a copy of it.
 
 # harbor_ensure_project <project> -- creates a public Harbor project if it doesn't already exist.
 harbor_ensure_project() {
@@ -382,8 +391,10 @@ harbor_ensure_project() {
 }
 
 # harbor_mirror <source-image> <dest-repo:tag> -- mirrors a public image into Harbor from the
-# HOST's network (pods can't reach the public internet -- see POD-EGRESS-INVESTIGATION.md; the
-# host can). Idempotent: skopeo copy overwrites the same tag either way.
+# HOST's network, for the fallback described above. Idempotent: skopeo copy overwrites the same tag
+# either way. Note `--dest-tls-verify=false`: the host's Docker daemon does not trust the
+# platform's self-signed CA any more than a pod does, which is also why a plain `docker push` fails
+# here (see CLAUDE.md's CA note).
 harbor_mirror() {
   _source=$1
   _dest=$2
@@ -422,6 +433,18 @@ harbor_has_tag() {
 # a 9-team rollout with nothing in the log to explain it. Every HTTP-code variable is now
 # validated as exactly 3 digits before being compared or trusted.
 apl_create_if_missing() {
+  # Serialised across concurrent teams. Every object this creates is a COMMIT to the one shared
+  # git values repo behind apl-api, so four teams calling this at once is a push race on a single
+  # repository. The lock also makes the check-then-act below atomic, which it never was: two
+  # callers could both see 404 and both POST.
+  #
+  # The lock is held for the two HTTP calls only -- seconds. What actually takes the time in a
+  # parallel seed is the waiting around them (180s for a webhook, 90s for an EventListener,
+  # minutes for a build), and none of that is serialised.
+  apl_with_api_lock _apl_create_if_missing_locked "$@"
+}
+
+_apl_create_if_missing_locked() {
   _get_url=$1
   _post_url=$2
   _token=$3
@@ -453,9 +476,31 @@ apl_create_if_missing() {
 
 # --- Gitea: repo content ----------------------------------------------------------------------
 
-# gitea_create_org_repo <org> <repo> <pat> -- creates a private repo under a team's Gitea org,
-# auto-initialized (gets a main branch immediately, needed before anything can be pushed to it).
-# Idempotent: an already-existing repo (409/422) is treated as success, not an error.
+# gitea_create_org_repo <org> <repo> <pat> -- creates a repo under a team's Gitea org, auto-
+# initialized (gets a main branch immediately, needed before anything can be pushed to it).
+# Idempotent: an already-existing repo (409/422) is treated as success, and its visibility is
+# re-asserted below either way, so a repo left private by an older seed converges on a re-run.
+#
+# `private: false`, deliberately, and it is load-bearing in two ways.
+#
+# It models what this demo is simulating. In a real engineering org every team can READ every other
+# team's source; only the owning team can WRITE. Gitea gives exactly that here without any extra
+# machinery, because write permission comes from ORG MEMBERSHIP -- which the platform already drives
+# from each user's Keycloak group claims on every OIDC login (Gitea's --group-team-map). So flipping
+# visibility changes only the read side. Private repos would instead mean team-ratings cannot read
+# team-reviews' code, which is a strange thing to demonstrate.
+#
+# And it removes a credential entirely. Argo CD clones these repos to sync the runner workload whose
+# chart lives in them; against a private repo that needs a stored Gitea credential in the argocd
+# namespace, and since a repo-creds entry matches by URL PREFIX, one entry would need a credential
+# able to read every org -- i.e. the Gitea admin, handed permanent instance-wide access to read four
+# repos. A public repo is cloned anonymously. The best fix for a credential is not needing one.
+#
+# Note what "public" does and does not mean on this lab: gitea.gotmpl sets service.REQUIRE_SIGNIN_VIEW
+# false but service.explore.REQUIRE_SIGNIN_VIEW true, so these repos are not discoverable by browsing
+# without signing in, but are readable by anyone holding the URL who can reach the ingress. Gitea has
+# no true "internal" visibility tier. Making it strictly internal means instance-wide
+# REQUIRE_SIGNIN_VIEW, which would put Argo CD back to needing a credential.
 gitea_create_org_repo() {
   _org=$1
   _repo=$2
@@ -463,54 +508,100 @@ gitea_create_org_repo() {
   _out=$(mktemp)
   _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X POST "https://gitea.$DOMAIN/api/v1/org/$_org/repos" \
     -H "Authorization: token $_pat" -H "Content-Type: application/json" \
-    -d "{\"name\":\"$_repo\",\"private\":true,\"auto_init\":true}")
+    -d "{\"name\":\"$_repo\",\"private\":false,\"auto_init\":true}")
   case "$_http" in
-    201) echo "created Gitea repo $_org/$_repo" ;;
+    201) echo "created Gitea repo $_org/$_repo (readable org-wide, writable by team-$_org members)" ;;
     409 | 422) echo "Gitea repo $_org/$_repo already exists" ;;
     *) echo "error: creating Gitea repo $_org/$_repo returned HTTP $_http: $(cat "$_out")" >&2; rm -f "$_out"; return 1 ;;
   esac
+  # Re-asserted unconditionally so a repo an older seed created private becomes readable on re-run.
+  _vis_http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X PATCH "https://gitea.$DOMAIN/api/v1/repos/$_org/$_repo" \
+    -H "Authorization: token $_pat" -H "Content-Type: application/json" -d '{"private":false}')
+  [ "$_vis_http" = "200" ] \
+    || { echo "error: making $_org/$_repo readable returned HTTP $_vis_http: $(cat "$_out")" >&2; rm -f "$_out"; return 1; }
   rm -f "$_out"
 }
 
-# upstream_sparse_subdir <git-url> <ref> <subdir> -- prints a local path holding that ONE
-# subdirectory's contents, checked out from a public upstream repository.
+# stage_service_tree <role> -- prints a local path holding the exact tree to push for that
+# Bookinfo service: the vendored source from demo-seed/bookinfo/<role> PLUS the gitea-runner
+# binary dropped into .gitea/runner/.
 #
-# Why not the Gitea contents API (which the retired blue/green demo used, one REST call per
-# file): Bookinfo's productpage is ~11 files across three subdirectories and reviews is a ~17-file
-# Gradle project. One-file-per-call does not scale to that and is not atomic. A real clone + a
-# real push is both simpler and closer to what a human would actually do.
+# The source is vendored in this repo rather than cloned from istio/istio at seed time. It is the
+# upstream Bookinfo tree plus the CI this demo exists to show (.gitea/workflows/ci.yml, the lint
+# config it needs, the source fixes that gate demanded, and .gitea/runner/ for the team's own
+# Actions runner image). That makes the seed deterministic: no network on the critical path and no
+# chance of upstream drift changing the demo mid-run.
 #
-# Runs on the HOST, which has real, unrestricted internet access -- the same reason harbor_mirror
-# can use `docker run --network host` (POD-EGRESS-INVESTIGATION.md). Nothing in a pod ever fetches
-# from github.com here.
+# The runner BINARY is deliberately not vendored -- it is an 18MB release artifact, so it is
+# fetched once on the host by runner_fetch_binary, checksum-verified, and copied in here. Staging
+# into the state dir (rather than mutating demo-seed/ in place) keeps the checkout clean, which
+# matters because a stray binary under demo-seed/ would end up inside the operator image build.
+stage_service_tree() {
+  _sst_role=$1
+  _sst_vendor="${SEED_VENDOR_DIR:-demo-seed/bookinfo}/$_sst_role"
+  [ -d "$_sst_vendor" ] || { echo "error: vendored tree $_sst_vendor does not exist" >&2; return 1; }
+  _sst_bin=$(runner_fetch_binary) || return 1
+  _sst_dir="${APL_STATE_DIR:-.taskfiles/state}/seed_tree_$_sst_role"
+  rm -rf "$_sst_dir"
+  mkdir -p "$_sst_dir"
+  cp -a "$_sst_vendor/." "$_sst_dir/"
+  # Prune build/lint artifacts a developer's local run may have left in the vendored tree. This
+  # copies the WORKING tree, not `git ls-files`, on purpose -- iterating on the demo should not
+  # require staging every edit first -- so anything on disk would otherwise be force-pushed into
+  # the team's repo. Root-owned junk has actually appeared here (a containerised ruff run left a
+  # root-owned .ruff_cache under productpage/). Prune by name rather than by gitignore status:
+  # ruff and pytest write self-ignoring caches, so `git status` shows a clean tree either way.
+  for _sst_junk in .ruff_cache .pytest_cache __pycache__ node_modules .gradle build .bundle vendor; do
+    find "$_sst_dir" -name "$_sst_junk" -prune -exec rm -rf {} + 2>/dev/null
+  done
+  [ -f "$_sst_dir/.gitea/runner/Dockerfile" ] \
+    || { echo "error: $_sst_vendor has no .gitea/runner/Dockerfile" >&2; return 1; }
+  cp "$_sst_bin" "$_sst_dir/.gitea/runner/gitea-runner"
+  chmod +x "$_sst_dir/.gitea/runner/gitea-runner"
+  printf '%s' "$_sst_dir"
+}
+
+# runner_fetch_binary -- prints the path to a verified gitea-runner binary, downloading it once
+# per state dir and reusing it for all four teams.
 #
-# `--depth 1 --filter=blob:none --sparse` keeps istio/istio (a very large repository) down to the
-# few files actually wanted, and the clone is CACHED under the state dir and reused: seeding four
-# services costs one clone, not four. Subsequent services just `sparse-checkout add` their own
-# subdirectory to the existing checkout.
-#
-# Always the SAME ref for reading and for cloning (the seed pins `master`, not a release tag). A
-# tag and the default branch disagree about these Dockerfiles' base images, and mixing the two
-# produces a build failure that looks nothing like a version mismatch.
-upstream_sparse_subdir() {
-  _uc_url=$1
-  _uc_ref=$2
-  _uc_subdir=$3
-  _uc_key=$(printf '%s@%s' "$_uc_url" "$_uc_ref" | tr -c 'A-Za-z0-9._-' '_')
-  _uc_dir="${APL_STATE_DIR:-.taskfiles/state}/seed_src_$_uc_key"
-  if [ ! -d "$_uc_dir/.git" ]; then
-    rm -rf "$_uc_dir"
-    mkdir -p "${APL_STATE_DIR:-.taskfiles/state}"
-    # Bounded (CLAUDE.md rule 1): git has no timeout of its own and a stalled fetch would hang here.
-    timeout 300 git clone --quiet --depth 1 --filter=blob:none --sparse \
-      --branch "$_uc_ref" "$_uc_url" "$_uc_dir" >&2 \
-      || { echo "error: cloning $_uc_url@$_uc_ref failed" >&2; rm -rf "$_uc_dir"; return 1; }
+# Runs on the HOST, which has unrestricted internet access. Verified against a pinned sha256:
+# this binary is COPYed straight into an image that then executes CI jobs, so an unverified
+# download here would be the single worst place on this lab to accept whatever the network
+# returned.
+runner_fetch_binary() {
+  # Serialized: the cache path below is SHARED by all four teams, and seed:apps/seed:runners now
+  # run them in parallel. Unserialized, every team curl'd the same file at once and one team
+  # verified bytes another was still writing -- observed live 2026-08-29, `ratings` failed with a
+  # sha256 mismatch mid-seed. 600s because this is a ~5MB download over an unknown link, not the
+  # two fast API calls the api lock guards.
+  apl_with_lock runner-download 600 _runner_fetch_binary_locked
+}
+
+_runner_fetch_binary_locked() {
+  _rfb_dir="${APL_STATE_DIR:-.taskfiles/state}/seed_runner"
+  _rfb_bin="$_rfb_dir/gitea-runner"
+  if [ -f "$_rfb_bin" ] \
+     && printf '%s  %s\n' "$SEED_RUNNER_SHA256" "$_rfb_dir/gitea-runner.xz" | sha256sum -c - >/dev/null 2>&1; then
+    printf '%s' "$_rfb_bin"; return 0
   fi
-  timeout 120 git -C "$_uc_dir" sparse-checkout add "$_uc_subdir" >&2 \
-    || { echo "error: sparse-checkout add $_uc_subdir failed in $_uc_dir" >&2; return 1; }
-  [ -d "$_uc_dir/$_uc_subdir" ] \
-    || { echo "error: $_uc_subdir does not exist in $_uc_url@$_uc_ref" >&2; return 1; }
-  printf '%s' "$_uc_dir/$_uc_subdir"
+  mkdir -p "$_rfb_dir"
+  # Downloaded to a PID-unique temp and only renamed into the cache path once it has been verified.
+  # The lock alone would be enough today, but a partial file must never be reachable under the real
+  # name -- a stale-lock steal, or any future caller that skips the lock, would otherwise find a
+  # truncated archive and trust it.
+  _rfb_tmp="$_rfb_dir/.gitea-runner.xz.$$"
+  # Bounded (CLAUDE.md rule 1): curl gets an explicit timeout, this is a ~5MB download.
+  timeout 300 curl -fsSL --max-time 280 -o "$_rfb_tmp" "$SEED_RUNNER_URL" \
+    || { rm -f "$_rfb_tmp"; echo "error: downloading gitea-runner from $SEED_RUNNER_URL failed" >&2; return 1; }
+  printf '%s  %s\n' "$SEED_RUNNER_SHA256" "$_rfb_tmp" | sha256sum -c - >/dev/null 2>&1 \
+    || { echo "error: gitea-runner checksum mismatch -- refusing to use it. Expected $SEED_RUNNER_SHA256, got $(sha256sum "$_rfb_tmp" | cut -d" " -f1)" >&2; rm -f "$_rfb_tmp"; return 1; }
+  mv "$_rfb_tmp" "$_rfb_dir/gitea-runner.xz"
+  rm -f "$_rfb_bin"
+  xz -dk -c "$_rfb_dir/gitea-runner.xz" > "$_rfb_bin" \
+    || { echo "error: decompressing gitea-runner failed" >&2; return 1; }
+  chmod +x "$_rfb_bin"
+  echo "downloaded and verified gitea-runner $SEED_RUNNER_VERSION" >&2
+  printf '%s' "$_rfb_bin"
 }
 
 # gitea_push_tree <org> <repo> <pat> <gitea-username> <srcdir> <message> -- force-pushes the whole
@@ -1039,4 +1130,237 @@ vikunja_share_with_team_if_missing() {
   fi
   rm -f "$_st_out"
   echo "shared project $_project_id with team $_team_id (permission $_permission)"
+}
+
+# --- Gitea Actions: runner registration, branch protection, run status -------------------------
+
+# gitea_mint_runner_token <org> <pat> -- prints a runner registration token for that ORG.
+#
+# Org-scoped on purpose, not instance-scoped: each team registers its own runner, and the
+# instance-level endpoint (/api/v1/admin/runners) is not reachable with a team dev's PAT anyway.
+#
+# The token is REUSABLE across many registrations -- verified live 2026-08-29 by registering two
+# runners from one token, both coming back "ephemeral": true. That is what makes an ephemeral
+# runner viable here: every pod restart re-registers with this same stored token, so a single
+# long-lived Secret serves the whole recycling loop.
+gitea_mint_runner_token() {
+  _mrt_org=$1
+  _mrt_pat=$2
+  _mrt_out=$(mktemp)
+  _mrt_http=$(curl -sk --max-time 20 -o "$_mrt_out" -w '%{http_code}' -X POST \
+    "https://gitea.$DOMAIN/api/v1/orgs/$_mrt_org/actions/runners/registration-token" \
+    -H "Authorization: token $_mrt_pat" -H "Content-Type: application/json")
+  if [ "$_mrt_http" != "200" ] && [ "$_mrt_http" != "201" ]; then
+    echo "error: minting runner registration token for $_mrt_org returned HTTP $_mrt_http: $(cat "$_mrt_out")" >&2
+    rm -f "$_mrt_out"; return 1
+  fi
+  _mrt_token=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' "$_mrt_out")
+  rm -f "$_mrt_out"
+  [ -n "$_mrt_token" ] || { echo "error: no token in registration-token response for $_mrt_org" >&2; return 1; }
+  printf '%s' "$_mrt_token"
+}
+
+# gitea_ensure_workflowjob_hook <org> <repo> <pat> <el-name> -- idempotently ensures a repo webhook
+# delivering `workflow_job` to the on-demand runner's EventListener.
+#
+# This is the trigger the whole on-demand runner design hangs on: Gitea fires `workflow_job` with
+# `action: queued` the moment a job needs a runner, and that event is what creates one. The event
+# type arrived in Gitea 1.24 (go-gitea/gitea#33694); this lab runs 1.26.
+#
+# SEPARATE from the webhook the AplTeamBuild creates. That one is push-only and is reconciled by
+# the operator -- adding an event to it would be reverted, and pointing it at a second target is
+# not possible. Two hooks on one repo is the supported shape.
+#
+# The target must be the EventListener's own Service. The platform's `default-from-gitea`
+# NetworkPolicy admits traffic from the gitea namespace ONLY to pods labelled
+# `app.kubernetes.io/managed-by: EventListener`, which Tekton sets and the chart re-asserts.
+gitea_ensure_workflowjob_hook() {
+  _ewh_org=$1; _ewh_repo=$2; _ewh_pat=$3; _ewh_el=$4
+  _ewh_url="http://$_ewh_el.$_ewh_org.svc.cluster.local:8080/"
+  _ewh_out=$(mktemp)
+  # Idempotent by TARGET URL, not by id: re-running this task must not pile up duplicate hooks,
+  # and a duplicate would create two runners for every queued job.
+  if curl -sk --max-time 20 "https://gitea.$DOMAIN/api/v1/repos/$_ewh_org/$_ewh_repo/hooks" \
+       -H "Authorization: token $_ewh_pat" 2>/dev/null | grep -qF "$_ewh_url"; then
+    echo "workflow_job webhook already present on $_ewh_org/$_ewh_repo"
+    rm -f "$_ewh_out"; return 0
+  fi
+  _ewh_http=$(curl -sk --max-time 20 -o "$_ewh_out" -w '%{http_code}' -X POST \
+    "https://gitea.$DOMAIN/api/v1/repos/$_ewh_org/$_ewh_repo/hooks" \
+    -H "Authorization: token $_ewh_pat" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg url "$_ewh_url" \
+      '{type:"gitea", active:true, events:["workflow_job"],
+        config:{url:$url, content_type:"json"}}')")
+  if [ "$_ewh_http" != "201" ]; then
+    echo "error: creating workflow_job webhook on $_ewh_org/$_ewh_repo returned HTTP $_ewh_http: $(head -c 300 "$_ewh_out")" >&2
+    rm -f "$_ewh_out"; return 1
+  fi
+  echo "workflow_job webhook -> $_ewh_url"
+  rm -f "$_ewh_out"
+}
+
+# runner_drain_queued <team> <repo> <pat> -- create a runner for every job already sitting queued.
+#
+# Gitea fires `workflow_job` EXACTLY ONCE per job and never retries a failed or unrouted delivery
+# (the same no-retry behaviour that cost a whole PipelineRun in GITEA-ACTIONS-CI.md's trap 8). So
+# any job queued before the webhook and EventListener existed -- which on a fresh seed is every
+# team's first CI run, queued by seed:apps minutes earlier -- would otherwise wait forever.
+#
+# Rather than duplicating the Job spec here (which would then drift from the chart), this REPLAYS a
+# synthetic `workflow_job queued` payload at the team's own EventListener. The CEL filter, the
+# TriggerBinding and the TriggerTemplate all run exactly as they would for a real delivery, so this
+# path cannot silently diverge from the production one.
+#
+# Reaching the EventListener goes through `kubectl port-forward`, not a pod in the namespace: the
+# team namespace has a default-deny ingress policy, so a scratch pod there could not reach the
+# EventListener, while port-forward goes API server -> kubelet -> pod and bypasses NetworkPolicy.
+runner_drain_queued() {
+  _rdq_team=$1; _rdq_repo=$2; _rdq_pat=$3
+  _rdq_el="el-gitea-workflowjob-$_rdq_team"
+  _rdq_runs=$(curl -sk --max-time 20 \
+    "https://gitea.$DOMAIN/api/v1/repos/team-$_rdq_team/$_rdq_repo/actions/runs?limit=50" \
+    -H "Authorization: token $_rdq_pat" 2>/dev/null \
+    | jq -r '[.workflow_runs[]?|select(.status=="queued")|.id]|join(" ")' 2>/dev/null || true)
+  if [ -z "$_rdq_runs" ]; then
+    echo "nothing queued in team-$_rdq_team/$_rdq_repo -- no drain needed"
+    return 0
+  fi
+  echo "draining queued run(s) in team-$_rdq_team: $_rdq_runs"
+  # Port 0 lets the kernel pick a free local port, so four teams draining in parallel (once
+  # seed:runners is parallelised) cannot collide on a fixed one.
+  _rdq_pf_log=$(mktemp)
+  kubectl --context "$KIND_CTX" -n "team-$_rdq_team" port-forward "svc/$_rdq_el" :8080 \
+    >"$_rdq_pf_log" 2>&1 &
+  _rdq_pf_pid=$!
+  # shellcheck disable=SC2064
+  # EXIT only. mvdan/sh -- the shell go-task runs -- rejects INT with
+  # "trap: INT: invalid signal specification" (rc 2), and that aborts the whole trap command, so
+  # `EXIT INT TERM` installs NO handler at all, not even the EXIT one. Observed live 2026-08-29:
+  # every team leaked its `kubectl port-forward` for the rest of the seed. EXIT alone is honoured
+  # and is what actually matters here; on a Ctrl-C the port-forward dies with the process group.
+  trap "kill $_rdq_pf_pid 2>/dev/null || true" EXIT
+  _rdq_port=""
+  _rdq_i=0
+  while [ "$_rdq_i" -lt 30 ]; do
+    _rdq_i=$((_rdq_i + 1))
+    _rdq_port=$(sed -n 's/.*127\.0\.0\.1:\([0-9]*\).*/\1/p' "$_rdq_pf_log" | head -1)
+    [ -n "$_rdq_port" ] && break
+    sleep 1
+  done
+  if [ -z "$_rdq_port" ]; then
+    echo "error: port-forward to $_rdq_el never reported a local port: $(head -c 300 "$_rdq_pf_log")" >&2
+    kill "$_rdq_pf_pid" 2>/dev/null || true; trap - EXIT; rm -f "$_rdq_pf_log"; return 1
+  fi
+  _rdq_rc=0
+  for _rdq_run in $_rdq_runs; do
+    # Only the fields the TriggerBinding and the CEL filter actually read. The label must match
+    # what the chart registers with, or the filter correctly refuses to make a runner.
+    _rdq_http=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' \
+      -X POST "http://127.0.0.1:$_rdq_port/" -H "Content-Type: application/json" \
+      -d "$(jq -n --argjson rid "$_rdq_run" --arg repo "team-$_rdq_team/$_rdq_repo" \
+        '{action:"queued",
+          workflow_job:{run_id:$rid, status:"queued", labels:["ubuntu-latest"]},
+          repository:{full_name:$repo}}')")
+    case "$_rdq_http" in
+      20*|202) echo "  replayed run $_rdq_run -> HTTP $_rdq_http" ;;
+      *) echo "error: replaying run $_rdq_run to $_rdq_el returned HTTP $_rdq_http" >&2; _rdq_rc=1 ;;
+    esac
+  done
+  kill "$_rdq_pf_pid" 2>/dev/null || true
+  trap - EXIT
+  rm -f "$_rdq_pf_log"
+  return "$_rdq_rc"
+}
+
+# gitea_unprotect_branch <org> <repo> <pat> [branch] -- removes the branch protection rule if one
+# exists. 404 is success (nothing to remove).
+#
+# This exists because of a genuine ordering hazard: gitea_push_tree force-pushes to `main`, and the
+# protection rule this seed installs sets enable_push:false, which blocks exactly that. On a FIRST
+# run the repo is unprotected and nothing is needed; on a RE-RUN against an existing cluster the
+# rule is already there and the push would fail. So every push is bracketed
+# unprotect -> push -> protect.
+gitea_unprotect_branch() {
+  _ub_org=$1; _ub_repo=$2; _ub_pat=$3; _ub_branch=${4:-main}
+  _ub_http=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X DELETE \
+    "https://gitea.$DOMAIN/api/v1/repos/$_ub_org/$_ub_repo/branch_protections/$_ub_branch" \
+    -H "Authorization: token $_ub_pat")
+  case "$_ub_http" in
+    204 | 404) return 0 ;;
+    *) echo "error: removing branch protection on $_ub_org/$_ub_repo:$_ub_branch returned HTTP $_ub_http" >&2; return 1 ;;
+  esac
+}
+
+# gitea_protect_branch <org> <repo> <pat> <status-check-context> [branch] -- requires a passing
+# status check before <branch> can be merged into, and forbids pushing to it directly.
+#
+# required_approvals is 0 deliberately: the point being demonstrated is an automated merge GATE,
+# and a demo where a single-person team can never merge its own PR demonstrates the wrong thing.
+gitea_protect_branch() {
+  _pb_org=$1; _pb_repo=$2; _pb_pat=$3; _pb_ctx=$4; _pb_branch=${5:-main}
+  _pb_body=$(printf '{"branch_name":"%s","rule_name":"%s","enable_push":false,"enable_force_push":false,"enable_status_check":true,"status_check_contexts":["%s"],"required_approvals":0}' \
+    "$_pb_branch" "$_pb_branch" "$_pb_ctx")
+  _pb_out=$(mktemp)
+  _pb_http=$(curl -sk --max-time 20 -o "$_pb_out" -w '%{http_code}' -X POST \
+    "https://gitea.$DOMAIN/api/v1/repos/$_pb_org/$_pb_repo/branch_protections" \
+    -H "Authorization: token $_pb_pat" -H "Content-Type: application/json" -d "$_pb_body")
+  case "$_pb_http" in
+    200 | 201) echo "protected $_pb_org/$_pb_repo:$_pb_branch requiring '$_pb_ctx'" ;;
+    # 403/409 means a rule already exists -- patch it so re-runs converge on the same rule rather
+    # than leaving whatever an older seed installed.
+    403 | 409 | 422)
+      _pb_http2=$(curl -sk --max-time 20 -o "$_pb_out" -w '%{http_code}' -X PATCH \
+        "https://gitea.$DOMAIN/api/v1/repos/$_pb_org/$_pb_repo/branch_protections/$_pb_branch" \
+        -H "Authorization: token $_pb_pat" -H "Content-Type: application/json" -d "$_pb_body")
+      [ "$_pb_http2" = "200" ] \
+        || { echo "error: patching branch protection on $_pb_org/$_pb_repo returned HTTP $_pb_http2: $(cat "$_pb_out")" >&2; rm -f "$_pb_out"; return 1; }
+      echo "updated protection on $_pb_org/$_pb_repo:$_pb_branch requiring '$_pb_ctx'" ;;
+    *) echo "error: protecting $_pb_org/$_pb_repo returned HTTP $_pb_http: $(cat "$_pb_out")" >&2; rm -f "$_pb_out"; return 1 ;;
+  esac
+  rm -f "$_pb_out"
+}
+
+# gitea_wait_actions_run <org> <repo> <pat> <sha> [tries] [sleep] -- waits for the Actions run on
+# <sha> to reach a terminal state; returns 0 only on success.
+#
+# Bounded (CLAUDE.md rule 1). Treats "no run found yet" as still-waiting, since the runner may not
+# have picked the job up: Gitea QUEUES a job when no runner is online, which is exactly what makes
+# the ordering here forgiving -- a workflow can land before its runner exists and still run later.
+gitea_wait_actions_run() {
+  _war_org=$1; _war_repo=$2; _war_pat=$3; _war_sha=$4
+  _war_tries=${5:-60}; _war_sleep=${6:-10}
+  _war_out=$(mktemp)
+  _war_i=0
+  while [ "$_war_i" -lt "$_war_tries" ]; do
+    _war_i=$((_war_i + 1))
+    curl -sk --max-time 20 -o "$_war_out" \
+      "https://gitea.$DOMAIN/api/v1/repos/$_war_org/$_war_repo/actions/runs?limit=20" \
+      -H "Authorization: token $_war_pat" >/dev/null 2>&1 || true
+    # Filtered client-side with jq rather than trusting a head_sha query parameter (not relied on
+    # here) and rather than sed: a greedy sed over this JSON matches the LAST "status" in the
+    # payload, not this run's, which is how a passing run can be misread as queued.
+    _war_status=$(jq -r --arg sha "$_war_sha" \
+      '[.workflow_runs[]? | select(.head_sha==$sha)] | .[0] | (.conclusion // .status) // "none"' \
+      "$_war_out" 2>/dev/null || echo none)
+    case "$_war_status" in
+      success) rm -f "$_war_out"; echo "Actions run on $(printf '%s' "$_war_sha" | cut -c1-7) succeeded"; return 0 ;;
+      failure | cancelled)
+        echo "error: Actions run for $_war_org/$_war_repo @ $_war_sha ended '$_war_status'" >&2
+        echo "       see https://gitea.$DOMAIN/$_war_org/$_war_repo/actions" >&2
+        rm -f "$_war_out"; return 1 ;;
+      *) : ;;
+    esac
+    [ $((_war_i % 6)) -eq 0 ] && echo "  waiting for Actions run on $_war_org/$_war_repo ($_war_status, ${_war_i}/${_war_tries})"
+    sleep "$_war_sleep"
+  done
+  echo "error: Actions run for $_war_org/$_war_repo @ $_war_sha never reached a terminal state" >&2
+  rm -f "$_war_out"; return 1
+}
+
+# gitea_head_sha <org> <repo> <pat> [branch] -- prints the current commit sha of <branch>.
+gitea_head_sha() {
+  _hs_org=$1; _hs_repo=$2; _hs_pat=$3; _hs_branch=${4:-main}
+  # jq, not sed: the payload contains several "id" fields and a greedy pattern picks the wrong one.
+  curl -sk --max-time 20 "https://gitea.$DOMAIN/api/v1/repos/$_hs_org/$_hs_repo/branches/$_hs_branch" \
+    -H "Authorization: token $_hs_pat" | jq -r '.commit.id // empty'
 }
