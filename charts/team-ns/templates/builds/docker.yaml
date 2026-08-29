@@ -86,6 +86,13 @@ spec:
       value:
         - --skip-tls-verify
         - --skip-tls-verify-pull
+        # kind bind-mounts /product_uuid from the host; kaniko's stage-cleanup tries to unlink it
+        # between stages of a multi-stage build and kind's mount refuses, failing with
+        # "unlinkat //product_uuid: device or resource busy" -- confirmed live on this cluster,
+        # same root cause as github.com/GoogleContainerTools/kaniko/issues/2164. Single-stage
+        # builds never hit this (nothing to clean up between stages), so it's silent until the
+        # first multi-stage Dockerfile.
+        - --ignore-path=/product_uuid
         {{- with (dig "mode" "docker" "envVars" nil . ) }}
         {{- range . }}
         - --build-arg={{ .name }}={{ .value }}

@@ -5,30 +5,73 @@
 # reconcile the real side effects; apl-api itself only checks that a request carries a valid
 # Keycloak-issued OIDC JWT, it does not care whether that JWT came through oauth2-proxy).
 #
-# Scope so far: `seed:auth` (bearer token, with the forced first-login password change handled),
-# `seed:teams` (SEED_TEAMS demo teams -- any number, any names), `seed:users` (three users per
-# team), and `seed:apps` -- a code
-# repo, a Tekton build with a webhook, a workload, and a public service, per team, done AS that
-# team's dev-<team> user (not platform-admin), following the Akamai docs' own
-# create-code-repositories-and-images / create-workloads-with-argocd / expose-services labs.
+# Scope: `seed:auth` (bearer token, with the forced first-login password change handled),
+# `seed:teams` (SEED_TEAMS demo teams), `seed:users` (three users per team), `seed:apps` (the
+# Bookinfo demo, below), and `seed:vikunja`.
+#
+# THE DEMO: Istio's Bookinfo sample (https://istio.io/latest/docs/examples/bookinfo/), deployed
+# the way a real organisation would run it -- NOT as one team's four-container example, but as
+# FOUR SEPARATE TEAMS, one microservice each, each team owning its own Gitea repository, its own
+# Tekton build, its own workload and its own public URL, and calling each other across namespace
+# boundaries over real in-cluster Service DNS.
+#
+#   role          owning team     repo                        calls
+#   ----------------------------------------------------------------------------------
+#   productpage   prodpage        team-prodpage/productpage    details, reviews
+#   details       details         team-details/details         (leaf)
+#   reviews       reviews         team-reviews/reviews         ratings
+#   ratings       ratings         team-ratings/ratings         (leaf)
+#
+# **`prodpage`, not `productpage`.** apl-api enforces a hard 9-character maximum on team names
+# (confirmed live: `productpage`, 11 characters, is rejected with "Team name must not exceed 9
+# characters"). SEED_BOOKINFO_SERVICES therefore carries the display role name AND the team id
+# separately; everything else derives from that one table.
+#
+# This is a FIXED four-role assignment, not the "same layout for every team, however many you
+# list" shape the retired blue/green canary demo had. SEED_TEAMS still drives seed:teams /
+# seed:users / seed:vikunja generically (each team still gets the same po/dev/agent trio), but
+# seed:apps is driven by SEED_BOOKINFO_SERVICES and expects exactly those four team ids to exist.
+# Changing SEED_TEAMS without changing SEED_BOOKINFO_SERVICES to match will leave the extra teams
+# with users but no app.
+#
+# Each service's source is the real, unmodified upstream tree from github.com/istio/istio at
+# branch `master` -- sparse-cloned on the HOST (which has internet access; pods do not) and
+# force-pushed into that team's Gitea repo as dev-<team>, over HTTPS, with that user's own PAT.
+# See seed-lib.sh's upstream_sparse_subdir / gitea_push_tree. Everything below is done AS
+# dev-<team>, never as platform-admin, except the two things a team admin genuinely may not do
+# (retiring old content, and writing network policies -- see the netpols step).
+#
 # Getting dev-<team> a Gitea credential needs a real Keycloak SSO login (Gitea accounts are
 # OIDC-JIT-provisioned, never created proactively) -- fully scripted with curl, no browser, see
-# seed-lib.sh's gitea_oidc_login. The base image each team's Dockerfile builds FROM is mirrored
-# into a SHARED Harbor project once (not duplicated per team) because pods can't reach the
-# public internet -- see POD-EGRESS-INVESTIGATION.md. The sslVerify/skip-tls-verify fixes that
-# same doc says a webhook-triggered Tekton build needs are already baked into every build this
-# platform creates (charts/team-ns/templates/builds/docker.yaml), so no patch is needed here.
+# seed-lib.sh's gitea_oidc_login. The sslVerify/skip-tls-verify fixes POD-EGRESS-INVESTIGATION.md
+# says a webhook-triggered Tekton build needs are already baked into every build this platform
+# creates (charts/team-ns/templates/builds/docker.yaml), so no patch is needed here.
 #
-# Demo shape: however many teams SEED_TEAMS lists (default two, "green" and "blue"; override with
-# `go-task seed:demo SEED_TEAMS="alpha beta gamma"` for any count/names), each with the same three
-# users --
+# Unlike the retired canary demo, no base image is mirrored into Harbor: Bookinfo's Dockerfiles
+# keep their upstream public `FROM` lines and kaniko pulled all of them fine (confirmed live
+# 2026-08-29). See the note above harbor_ensure_project in seed-lib.sh for what to do if that ever
+# stops being true.
+#
+# CROSS-TEAM CALLS -- the part that is actually hard, and the reason this is a worthwhile demo:
+#   * Bookinfo builds every callee URL as plain `http://{HOSTNAME}:{PORT}/...` and does not follow
+#     redirects. Each team's public route answers HTTP with a 301 to HTTPS, so routing internal
+#     calls through the public hostname produces "Ratings service is currently unavailable" and
+#     nothing else. The wiring therefore points at real in-cluster Service DNS instead --
+#     `app.team-<callee>.svc.cluster.local:9080` -- via each service's own env vars. See
+#     SEED_BOOKINFO_CALLS.
+#   * Every team runs with networkPolicy.ingressPrivate: true (set by seed:teams), which allows
+#     ingress only from istio-system/knative-serving/monitoring/tekton-pipelines -- not from
+#     another team's namespace. The platform's own scoped, self-service mechanism for that is an
+#     AplTeamNetworkControl per callee; see the netpols step for the two traps in writing one.
+#
+# Each team's three users --
 #   po-<team>    : plain team member (isTeamAdmin: false)
 #   dev-<team>   : team admin on the Console for that team ONLY (isTeamAdmin: true,
 #                  isPlatformAdmin: false -- NOT a platform admin)
 #   agent-<team> : plain team member, identical rights to po-<team>
 # Emails are <role>-<team>@<domainSuffix>, matching the platform-admin@<domainSuffix> pattern
 # SETUP.md/install:credentials already uses. firstName/lastName are the role/team capitalized
-# (e.g. "Dev"/"Green") so the Console's user list reads unambiguously.
+# (e.g. "Dev"/"Reviews") so the Console's user list reads unambiguously.
 version: '3'
 silent: true
 
@@ -52,31 +95,76 @@ vars:
   # Read & Write (Vikunja's 0=Read/1=Read&Write/2=Admin) -- the team's default level on its own
   # demo project. Change to 2 if the team should administer the project itself, not just use it.
   SEED_VIKUNJA_TEAM_PERMISSION: 1
-  # Space-separated team names -- the whole demo scales to however many are listed here, from one
-  # team to as many as you want. Override on the command line, e.g.
-  # `go-task seed:demo SEED_TEAMS="alpha beta gamma delta epsilon"`. Every team gets the same
-  # po/dev/agent layout (see SEED_ROLES) -- no per-team customization beyond the name itself.
-  SEED_TEAMS: "green blue"
+  # The four teams that own the four Bookinfo microservices. Team ids only -- the display role
+  # name lives in SEED_BOOKINFO_SERVICES, because apl-api caps team names at 9 characters and
+  # "productpage" does not fit (see the header). seed:teams/seed:users/seed:vikunja iterate this
+  # generically; seed:apps does not -- it iterates SEED_BOOKINFO_SERVICES, so change both together.
+  SEED_TEAMS: "prodpage details reviews ratings"
   # role:isTeamAdmin:FirstName -- one entry per role, applied to every team in SEED_TEAMS.
   SEED_ROLES: "po:false:PO dev:true:Dev agent:false:Agent"
-  # The example Dockerfile's FROM, per the Akamai docs' code-repo lab -- mirrored into Harbor
-  # once (see SEED_HARBOR_SHARED_PROJECT), never pulled directly (pods have no public egress).
-  SEED_BASE_IMAGE: "nginxinc/nginx-unprivileged:stable"
-  SEED_HARBOR_SHARED_PROJECT: shared
-  # Per-team demo app: the Akamai canary-deployment lab
-  # (https://techdocs.akamai.com/app-platform/docs/canary-deployment) -- two Gitea repos, "blue"
-  # (stable) and "green" (canary), each with their own build, combined into ONE workload named
-  # "canary" (chart k8s-deployments-canary -- note plural "deployments", confirmed against
-  # linode/apl-charts source, NOT the singular k8s-deployment chart the old single-app model
-  # used) and ONE service named "canary" with trafficControl enabled. Chart values are
-  # versionOne.image.{repository,tag} (blue) / versionTwo.image.{repository,tag} (green); the
-  # auto image updater watches only versionTwo (the docs' own "canary" side auto-updates on
-  # commit, the stable side does not). Confirmed live against tests/fixtures/env/teams/demo/
-  # services/hello-blue-green.yaml and values-schema.yaml: AplTeamService's trafficControl
-  # defaults are weightV1:90/weightV2:10 -- matches the docs' "use the default weights" -- so
-  # this seed script sets them explicitly to those same defaults rather than omitting the field.
-  SEED_CANARY_CHART_PATH: k8s-deployments-canary
+
+  # --- Bookinfo -------------------------------------------------------------------------------
+  # role:teamId:repoName:upstreamSubdir
+  #
+  # `reviews` (a gradle builder stage feeding an open-liberty runtime stage) is the one
+  # multi-stage Dockerfile among the four -- it needs no special-casing here: the platform's
+  # kaniko default was bumped past the release that fixed building multi-stage Dockerfiles
+  # inside kind (see charts/team-ns/templates/tekton-tasks/kaniko.yaml, CLAUDE.md's kaniko trap,
+  # and UPSTREAM-SYNC.md §4b), so all four services go through the exact same webhook-triggered
+  # build path.
+  SEED_BOOKINFO_SERVICES: >-
+    productpage:prodpage:productpage:samples/bookinfo/src/productpage
+    details:details:details:samples/bookinfo/src/details
+    reviews:reviews:reviews:samples/bookinfo/src/reviews
+    ratings:ratings:ratings:samples/bookinfo/src/ratings
+  SEED_BOOKINFO_UPSTREAM: "https://github.com/istio/istio.git"
+  # `master`, deliberately not a release tag: a tag and the default branch disagree about these
+  # Dockerfiles' base images, and reading one while cloning the other costs an afternoon. One ref,
+  # used for everything.
+  SEED_BOOKINFO_REF: master
+  # caller:callee, by TEAM ID. Drives two things at once: the caller workload's
+  # <CALLEE>_HOSTNAME/<CALLEE>_SERVICE_PORT env vars (the <CALLEE> prefix is the callee's ROLE
+  # name, uppercased -- PRODPAGE is never a callee, so the prodpage/productpage split never shows
+  # up here), and the callee team's AplTeamNetworkControl allowing ingress from the caller's
+  # namespace.
+  # NOTE the separator is ":" and not the ">" that would read more naturally: go-task's shell
+  # (mvdan/sh) parses a bare ">" inside a `for x in ...` word list as a REDIRECTION and refuses
+  # the whole file with "word list can only contain words" -- bash quietly creates a file
+  # instead, which is worse. Confirmed live.
+  SEED_BOOKINFO_CALLS: "prodpage:details prodpage:reviews reviews:ratings"
+  # teamId:NAME=VALUE,NAME=VALUE -- written to AplTeamBuild's spec.mode.docker.envVars, which
+  # charts/team-ns/templates/builds/docker.yaml renders straight into kaniko `--build-arg`s.
+  # v3 is the only reviews version that BOTH calls ratings AND renders the result visibly (red
+  # stars) -- i.e. the only one that exercises all four services end to end.
+  SEED_BOOKINFO_BUILD_ARGS: "reviews:service_version=v3,enable_ratings=true,star_color=red"
+  # Both the AplTeamWorkload and the AplTeamService are named this in EVERY team -- uniformly, not
+  # derived from the team. Two reasons: the public hostname is "<service>-<team>", so a per-team
+  # name gives "app-details-details.<domain>"; and the internal DNS name is then the same
+  # "app.team-<team>.svc.cluster.local" everywhere, which is what SEED_BOOKINFO_CALLS relies on.
+  SEED_WORKLOAD_NAME: app
+  # Singular "k8s-deployment" -- one image, one Deployment. (The retired canary demo used the
+  # plural "k8s-deployments-canary", a different chart entirely.)
+  SEED_WORKLOAD_CHART_PATH: k8s-deployment
   SEED_CATALOG_CHART_URL: "https://github.com/linode/apl-charts.git"
+  # Every Bookinfo service listens on 9080. The k8s-deployment chart's own servicePorts default
+  # points targetPort at a NAMED container port ("http") that is never declared unless
+  # .Values.ports is also set -- overriding servicePorts with a numeric targetPort sidesteps that
+  # entirely, with no `ports:` override needed.
+  SEED_SERVICE_PORT: 9080
+  # The custom pod label every callee workload carries, so an AplTeamNetworkControl has something
+  # to select on. Two traps, both hit live, both encoded here:
+  #   * apl-api validates toLabelName against a pattern that rejects "/", so a normal qualified
+  #     label like app.kubernetes.io/name cannot be used at all -- hence a plain custom label,
+  #     merged onto the pods through the chart's own .Values.podLabels.
+  #   * the VALUE must never be the string "true"/"false": it gets coerced into a real YAML
+  #     boolean somewhere in the values pipeline, and NetworkPolicy.spec.podSelector.matchLabels
+  #     needs a string -- ArgoCD then fails the sync outright with
+  #     `expected string, got &value.valueUnstructured{Value:true}`. Any other token is fine.
+  SEED_NETPOL_LABEL_NAME: bookinfo
+  SEED_NETPOL_LABEL_VALUE: bkflag
+  # Names of the retired blue/green canary demo's resources, removed from every seeded team the
+  # first time the Bookinfo seed runs against a cluster that still has them.
+  SEED_RETIRED_NAMES: "canary blue green"
 
 tasks:
   fix-first-login:
@@ -413,7 +501,7 @@ tasks:
         fi
 
   apps:
-    desc: "Per team, as dev-<team>: blue/green Gitea repos + auto-build + a canary workload/service"
+    desc: "Istio Bookinfo, one microservice per team: Gitea repo + Tekton build + workload + public service, cross-team wired"
     deps: [users]
     cmds:
       - |
@@ -421,16 +509,34 @@ tasks:
         . "{{.SEED_LIB}}"
         KIND_CTX="{{.KIND_CONTEXT}}"
         DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
-        HARBOR_ADMIN_PASSWORD=$(kubectl --context {{.KIND_CONTEXT}} --request-timeout=15s get secret harbor-admin-password \
-          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
-        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
+        API="https://console.$DOMAIN/api"
 
-        mirror_base() {
+        # Retire the blue/green canary demo an earlier version of this seed created. Bookinfo is
+        # the DEFAULT demo content now, not an alternative sitting beside it, so the old resources
+        # go rather than accumulating: two dead ArgoCD Applications and four dead Gitea repos per
+        # team is not a demo anyone wants to be shown.
+        #
+        # As platform-admin, not dev-<team>: this is retiring content, not team self-service, and
+        # it has to work even for a team whose dev user cannot be logged in for some reason. The
+        # Gitea repositories themselves are removed further down, inside setup_team_service, where
+        # that team's own PAT already exists.
+        #
+        # Note the order -- service, then workload, then build, then coderepo: the later ones are
+        # what the earlier ones reference.
+        retire_old_demo() {
           set -euo pipefail
-          harbor_ensure_project "{{.SEED_HARBOR_SHARED_PROJECT}}"
-          harbor_mirror "{{.SEED_BASE_IMAGE}}" "{{.SEED_HARBOR_SHARED_PROJECT}}/nginx-unprivileged:stable"
+          _team=$1
+          _token=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+          for _n in {{.SEED_RETIRED_NAMES}}; do
+            for _kind in services workloads builds coderepos; do
+              apl_delete_if_present "$API/v2/teams/$_team/$_kind/$_n" "$API/v2/teams/$_team/$_kind/$_n" \
+                "$_token" "$_kind/$_n ($_team)"
+            done
+          done
         }
-        apl_run seed-apps-mirror-base "Mirroring {{.SEED_BASE_IMAGE}} into the shared Harbor project" mirror_base || exit $?
+        for TEAM in {{.SEED_TEAMS}}; do
+          apl_run "seed-apps-retire-$TEAM" "Retiring any leftover blue/green canary content in $TEAM" retire_old_demo "$TEAM" || exit $?
+        done
       - |
         . "{{.LIB}}"
         . "{{.SEED_LIB}}"
@@ -456,18 +562,22 @@ tasks:
         KIND_CTX="{{.KIND_CONTEXT}}"
         DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
         API="https://console.$DOMAIN/api"
+        # Needed by harbor_has_tag below -- "is there already an image for this repo?" is what
+        # decides whether an unchanged source tree still needs a build.
+        HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
+          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
+        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
 
         # dev-<team>'s own Keycloak bearer token -- same ROPC pattern seed:auth uses for
         # platform-admin, just with dev-<team>'s own credentials. Everything below runs AS that
-        # user, never platform-admin: the blue setup must be done by the blue dev, the green
-        # setup by the green dev.
+        # user, never platform-admin: each team's own service is set up by that team's own dev.
         #
         # Call this immediately before each group of API calls, never once for the whole
         # function: this realm's accessTokenLifespan is SIXTY SECONDS (confirmed live against
-        # /admin/realms/otomi), and setup_team_app deliberately waits far longer than that
-        # between its two groups of calls -- up to 180s for the Gitea webhook, 90s for the
-        # EventListener and another 180s for the PipelineRun. A token fetched before those waits
-        # is long dead by the time the workload and service are created. Same class of bug as the
+        # /admin/realms/otomi), and setup_team_service deliberately waits far longer than that
+        # between its groups of calls -- up to 180s for the Gitea webhook, 90s for the
+        # EventListener, and up to 15 minutes for a build. A token fetched before those waits is
+        # long dead by the time the workload and service are created. Same class of bug as the
         # platform-admin token that used to be cached across enable-apps's readiness wait; see
         # kc_platform_admin_token's note in seed-lib.sh.
         dev_team_token() {
@@ -492,26 +602,152 @@ tasks:
           printf '%s' "$_tok"
         }
 
-        # build_team_repo <team> <reponame> <html-color> <html-label> -- one repo's worth of the
-        # canary lab's "create-code-repositories-and-images" prerequisite: create the Gitea repo,
-        # register it (coderepo+build) via apl-api, wait for ITS OWN webhook, push a Dockerfile +
-        # index.html, wait for ITS OWN PipelineRun (matched by name prefix, not "whatever's latest
-        # in the namespace" -- two repos now share one team namespace, so that would race).
-        # Reused twice per team (blue, green) since the shape is otherwise identical.
-        build_team_repo() {
+        # bookinfo_role_of <teamId> -- the display role name that team owns ("prodpage" ->
+        # "productpage"). SEED_BOOKINFO_CALLS is written in team ids (that is what a namespace is
+        # named after), but the env vars Bookinfo itself reads are named after the ROLE
+        # (DETAILS_HOSTNAME, REVIEWS_HOSTNAME, RATINGS_HOSTNAME) -- and for one of the four those
+        # two strings differ, because apl-api caps a team name at 9 characters.
+        bookinfo_role_of() {
+          _bro_team=$1
+          for _bro_spec in {{.SEED_BOOKINFO_SERVICES}}; do
+            if [ "$(printf '%s' "$_bro_spec" | cut -d: -f2)" = "$_bro_team" ]; then
+              printf '%s' "$_bro_spec" | cut -d: -f1
+              return 0
+            fi
+          done
+          echo "error: no Bookinfo role owns team '$_bro_team' -- SEED_BOOKINFO_CALLS names a team SEED_BOOKINFO_SERVICES does not" >&2
+          return 1
+        }
+
+        # wait_for_triggered_build <team> <repo> <not-before-rfc3339> -- bounded wait for the
+        # PipelineRun the Gitea webhook just created (observed ~40s-3min depending on the base
+        # image). Matched by THIS build's own name prefix, "docker-trigger-build-<repo>-", not
+        # "whatever's latest in the namespace" -- several repos' builds land in one team namespace.
+        #
+        # The <not-before> argument is NOT optional decoration. Matching on the name prefix alone
+        # also matches PipelineRuns from EARLIER runs of this seed, which Tekton keeps around
+        # indefinitely -- confirmed live 2026-08-29: a rerun against a cluster that still had a
+        # months-old succeeded `docker-trigger-build-productpage-*` returned "True" on the first
+        # poll, before the freshly pushed commit's own build had even been scheduled. The step
+        # passed in under a second and proved nothing at all. The caller captures a UTC timestamp
+        # immediately before pushing and passes it here; RFC3339 UTC strings compare correctly
+        # lexicographically, and the host and the kind node share a clock.
+        #
+        # `|| true` on the pipeline: right after the push Tekton's PipelineRun object often does
+        # not exist yet at all -- a completely normal state this loop exists to wait through. A
+        # transient failure there would otherwise kill the WHOLE function on try 1 through the
+        # caller's `set -euo pipefail`, silently, before the explicit timeout message below could
+        # ever be reached.
+        wait_for_triggered_build() {
+          _wb_team=$1
+          _wb_repo=$2
+          _wb_since=$3
+          _wb_tries=0
+          _wb_status=""
+          while [ "$_wb_tries" -lt 30 ]; do
+            _wb_pr=$(kubectl --context "$KIND_CTX" --request-timeout=15s get pipelinerun -n "team-$_wb_team" -o json 2>/dev/null \
+              | jq -r --arg p "docker-trigger-build-$_wb_repo-" --arg since "$_wb_since" '
+                  [ .items[]
+                    | select(.metadata.name | startswith($p))
+                    | select(.metadata.creationTimestamp >= $since) ]
+                  | sort_by(.metadata.creationTimestamp) | last
+                  | if . == null then "" else "\(.metadata.name) \(.status.conditions[0].status // "Unknown") \(.status.conditions[0].reason // "Pending")" end' 2>/dev/null || true)
+            _wb_status=$(printf '%s' "$_wb_pr" | awk '{print $2}')
+            [ "$_wb_status" = "True" ] && break
+            [ "$_wb_status" = "False" ] && break
+            _wb_tries=$((_wb_tries + 1))
+            echo "waiting for the webhook-triggered build of team-$_wb_team/$_wb_repo (try $_wb_tries/30, last: ${_wb_pr:-no PipelineRun yet})..."
+            sleep 10
+          done
+          [ "$_wb_status" = "True" ] || { echo "error: the build for team-$_wb_team/$_wb_repo did not succeed within 300s (last: ${_wb_pr:-no PipelineRun at all})" >&2; return 1; }
+          echo "webhook-triggered build succeeded: $_wb_pr"
+        }
+
+        # setup_team_service <role> <team> <repo> <upstream-subdir> -- everything one team owns
+        # for its one Bookinfo microservice: its Gitea repo and the real upstream source in it,
+        # its coderepo + auto-triggered Tekton build, its workload, and its public service.
+        setup_team_service() {
           set -euo pipefail
-          _team=$1 _reponame=$2 _color=$3 _label=$4
-          gitea_create_org_repo "team-$_team" "$_reponame" "$GITEA_PAT"
+          _role=$1
+          _team=$2
+          _repo=$3
+          _subdir=$4
+          _email="dev-$_team@$DOMAIN"
+          _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
+
+          GITEA_USER=$(gitea_oidc_login "$_email" "$_password")
+          GITEA_PAT=$(gitea_mint_pat "$GITEA_USER" "read:user,write:repository,write:organization,read:organization")
+          gitea_wait_for_org_permission "$GITEA_USER" "team-$_team" "$GITEA_PAT" "can_create_repository"
+
+          # agent-<team> also provisions itself in Gitea and lands in the team's org -- no repo
+          # creation of its own, dev owns that; this is just "find themselves in their respective
+          # team" (agent's OWN Gitea account + org membership sync, same mechanism as dev's, just
+          # no follow-up repo work).
+          _agent_email="agent-$_team@$DOMAIN"
+          _agent_password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_agent.txt)
+          _agent_gitea_user=$(gitea_oidc_login "$_agent_email" "$_agent_password")
+          # read:user AND read:organization -- the permissions endpoint below 403s without
+          # read:user too (confirmed live, same trap already hit and fixed for dev's PAT scope).
+          _agent_gitea_pat=$(gitea_mint_pat "$_agent_gitea_user" "read:user,read:organization")
+          gitea_wait_for_org_permission "$_agent_gitea_user" "team-$_team" "$_agent_gitea_pat" "can_read"
+
+          # The Gitea half of retiring the blue/green canary demo (the apl-api half ran as
+          # platform-admin in the previous step). Done here because it needs a PAT belonging to
+          # somebody who owns the org, which is exactly the one we just minted.
+          for _old in blue green; do
+            gitea_delete_org_repo_if_present "team-$_team" "$_old" "$GITEA_PAT"
+          done
+
+          # The real upstream tree, sparse-cloned on the host. Cached across all four services --
+          # one clone of istio/istio for the whole run.
+          _src=$(upstream_sparse_subdir "{{.SEED_BOOKINFO_UPSTREAM}}" "{{.SEED_BOOKINFO_REF}}" "$_subdir")
+
+          gitea_create_org_repo "team-$_team" "$_repo" "$GITEA_PAT"
+
+          _pushed=false
+          # Captured immediately before the push, and only ever moved forward by push_source: this
+          # is what stops wait_for_triggered_build from being satisfied by an OLD PipelineRun of
+          # the same build left over from a previous run. See its header comment.
+          _push_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          push_source() {
+            _push_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            _ps_rc=0
+            gitea_push_tree "team-$_team" "$_repo" "$GITEA_PAT" "$GITEA_USER" "$_src" \
+              "Bookinfo $_role, from {{.SEED_BOOKINFO_UPSTREAM}}@{{.SEED_BOOKINFO_REF}}:$_subdir" || _ps_rc=$?
+            case "$_ps_rc" in
+              0) _pushed=true ;;
+              2) _pushed=false ;;
+              *) return 1 ;;
+            esac
+          }
+
+          API_TOKEN=$(dev_team_token "$_team")
 
           apl_create_if_missing \
-            "$API/v2/teams/$_team/coderepos/$_reponame" "$API/v2/teams/$_team/coderepos" "$API_TOKEN" \
-            "{\"kind\":\"AplTeamCodeRepo\",\"metadata\":{\"name\":\"$_reponame\"},\"spec\":{\"gitService\":\"gitea\",\"repositoryUrl\":\"https://gitea.$DOMAIN/team-$_team/$_reponame.git\",\"private\":true}}" \
-            "coderepo $_reponame ($_team)"
+            "$API/v2/teams/$_team/coderepos/$_repo" "$API/v2/teams/$_team/coderepos" "$API_TOKEN" \
+            "{\"kind\":\"AplTeamCodeRepo\",\"metadata\":{\"name\":\"$_repo\"},\"spec\":{\"gitService\":\"gitea\",\"repositoryUrl\":\"https://gitea.$DOMAIN/team-$_team/$_repo.git\",\"private\":true}}" \
+            "coderepo $_repo ($_team)"
 
+          # Docker build args, if this service needs any (reviews does: service_version=v3 etc).
+          # AplTeamBuild's spec.mode.docker.envVars maps 1:1 onto kaniko's --build-arg -- see
+          # charts/team-ns/templates/builds/docker.yaml. No chart change was needed for this.
+          _build_args=""
+          for _spec in {{.SEED_BOOKINFO_BUILD_ARGS}}; do
+            case "$_spec" in
+              "$_team:"*) _build_args=${_spec#*:} ;;
+            esac
+          done
+          _envvars='[]'
+          if [ -n "$_build_args" ]; then
+            _envvars=$(printf '%s' "$_build_args" | tr ',' '\n' \
+              | jq -R 'select(length > 0) | {name: (split("=")[0]), value: (split("=")[1:] | join("="))}' \
+              | jq -sc .)
+          fi
           apl_create_if_missing \
-            "$API/v2/teams/$_team/builds/$_reponame" "$API/v2/teams/$_team/builds" "$API_TOKEN" \
-            "{\"kind\":\"AplTeamBuild\",\"metadata\":{\"name\":\"$_reponame\"},\"spec\":{\"imageName\":\"$_reponame\",\"tag\":\"main\",\"mode\":{\"type\":\"docker\",\"docker\":{\"repoUrl\":\"https://gitea.$DOMAIN/team-$_team/$_reponame.git\",\"path\":\"./Dockerfile\",\"revision\":\"main\"}},\"trigger\":true,\"scanSource\":false}}" \
-            "build $_reponame ($_team)"
+            "$API/v2/teams/$_team/builds/$_repo" "$API/v2/teams/$_team/builds" "$API_TOKEN" \
+            "$(jq -n --arg name "$_repo" --arg url "https://gitea.$DOMAIN/team-$_team/$_repo.git" --argjson env "$_envvars" \
+              '{kind:"AplTeamBuild", metadata:{name:$name}, spec:{imageName:$name, tag:"main", trigger:true, scanSource:false, mode:{type:"docker", docker:({repoUrl:$url, path:"./Dockerfile", revision:"main"} + (if ($env|length) > 0 then {envVars:$env} else {} end))}}}')" \
+            "build $_repo ($_team)"
 
           # Bounded wait for the operator to reconcile the build into an actual Gitea webhook on
           # THIS repo (checked directly, not guessed at with a fixed sleep) before pushing content.
@@ -520,12 +756,12 @@ tasks:
           while [ "$_tries" -lt 18 ]; do
             # `|| true` on the pipeline: under `set -euo pipefail` a single transient curl/jq
             # failure would abort the step outright instead of being retried by this loop.
-            _hooks=$(curl -sk --max-time 10 "https://gitea.$DOMAIN/api/v1/repos/team-$_team/$_reponame/hooks" -H "Authorization: token $GITEA_PAT" 2>/dev/null | jq -r 'length' 2>/dev/null || true)
+            _hooks=$(curl -sk --max-time 10 "https://gitea.$DOMAIN/api/v1/repos/team-$_team/$_repo/hooks" -H "Authorization: token $GITEA_PAT" 2>/dev/null | jq -r 'length' 2>/dev/null || true)
             [ "${_hooks:-0}" -gt 0 ] && break
             _tries=$((_tries + 1))
             sleep 10
           done
-          [ "${_hooks:-0}" -gt 0 ] || { echo "error: no Gitea webhook appeared for team-$_team/$_reponame within 180s" >&2; return 1; }
+          [ "${_hooks:-0}" -gt 0 ] || { echo "error: no Gitea webhook appeared for team-$_team/$_repo within 180s" >&2; return 1; }
 
           # Registered in Gitea's webhook config != actually able to receive it. Confirmed live:
           # pushing content immediately after the check above raced the EventListener pod's own
@@ -535,143 +771,207 @@ tasks:
           # failed webhook delivery on its own, so that push's PipelineRun simply never happened
           # -- no error, just an indefinite wait later for a build that was never triggered. Wait
           # for the EventListener Deployment itself to be Available first, same pattern
-          # enable-apps already uses for gitea/harbor/tekton.
-          #
-          # The EventListener is named after the BUILD, "el-gitea-webhook-<reponame>" --
-          # confirmed live: team-green and team-blue both carry TWO of them
-          # (el-gitea-webhook-blue and el-gitea-webhook-green) once both builds exist. Under the
-          # old single-app model this was indistinguishable from "one per team", since the
-          # single build's name always equaled the team's own name -- checking
-          # "el-gitea-webhook-$_team" only ever worked by that coincidence, and silently checked
-          # the WRONG (but often-already-Available, from an old leftover build of the same name)
-          # deployment for any team not literally named "blue" or "green" -- a false pass that
-          # let this step race ahead of the real EventListener's readiness. Check
-          # "el-gitea-webhook-$_reponame" instead.
+          # enable-apps already uses for gitea/harbor/tekton. It is named after the BUILD:
+          # "el-gitea-webhook-<repo>".
           _tries=0
           while [ "$_tries" -lt 18 ]; do
-            _avail=$(kubectl --context "$KIND_CTX" --request-timeout=15s get deploy "el-gitea-webhook-$_reponame" -n "team-$_team" \
+            _avail=$(kubectl --context "$KIND_CTX" --request-timeout=15s get deploy "el-gitea-webhook-$_repo" -n "team-$_team" \
               -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)
             [ "${_avail:-0}" -ge 1 ] 2>/dev/null && break
             _tries=$((_tries + 1))
             sleep 5
           done
-          [ "${_avail:-0}" -ge 1 ] || { echo "error: el-gitea-webhook-$_reponame never became Available within 90s" >&2; return 1; }
+          [ "${_avail:-0}" -ge 1 ] || { echo "error: el-gitea-webhook-$_repo never became Available within 90s" >&2; return 1; }
 
-          DOCKERFILE=$(printf 'FROM harbor.%s/{{.SEED_HARBOR_SHARED_PROJECT}}/nginx-unprivileged:stable\nCOPY index.html /usr/share/nginx/html/index.html\nEXPOSE 8080\n' "$DOMAIN")
-          HTML=$(printf '<html><head><title>%s</title></head><body style="display:flex;align-items:center;justify-content:center;height:100vh;background:%s;color:white;font-family:sans-serif;"><h1>%s</h1></body></html>' "$_reponame" "$_color" "$_label")
-          gitea_put_file "team-$_team" "$_reponame" "Dockerfile" "$DOCKERFILE" "$GITEA_PAT" "add Dockerfile"
-          gitea_put_file "team-$_team" "$_reponame" "index.html" "$HTML" "$GITEA_PAT" "add index.html"
+          push_source
 
-          # Bounded wait for the triggered PipelineRun to finish (observed ~30-40s once it can
-          # schedule). Matched by THIS build's own name prefix -- "docker-trigger-build-<repo>-"
-          # -- not "whatever's latest in the namespace", which would be ambiguous now that two
-          # repos' builds land in the same team namespace.
-          #
-          # `grep ... || true`: confirmed live 2026-08-29 -- on the very first check, right after
-          # the push, Tekton's own PipelineRun object often doesn't exist yet at all, a completely
-          # normal state this loop exists to wait through. grep finds nothing and exits 1; under
-          # this function's `set -euo pipefail`, that killed the WHOLE function right there on
-          # try 1, silently -- the explicit "did not succeed within 180s" message below was never
-          # reached, because the loop never got a chance to run a second iteration. This is what
-          # caused every one of this session's fast (~50s), no-error-text failures: it was never
-          # about the build itself (which kept running fine in the background the whole time),
-          # only about this loop's very first, entirely expected empty grep killing the caller.
-          _tries=0
-          _status=""
-          while [ "$_tries" -lt 18 ]; do
-            _pr=$(kubectl --context "$KIND_CTX" --request-timeout=15s get pipelinerun -n "team-$_team" --sort-by=.metadata.creationTimestamp --no-headers 2>/dev/null \
-              | grep "^docker-trigger-build-$_reponame-" | tail -1 || true)
-            _status=$(printf '%s' "$_pr" | awk '{print $2}')
-            [ "$_status" = "True" ] && break
-            _tries=$((_tries + 1))
-            sleep 10
+          # What actually produces the image, in the three states this can be in.
+          if [ "$_pushed" = "true" ]; then
+            wait_for_triggered_build "$_team" "$_repo" "$_push_since"
+          elif harbor_has_tag "team-$_team" "$_repo" main; then
+            # Source unchanged AND an image already exists -- a rerun against an already-seeded
+            # cluster costs no build at all. This is the whole point of gitea_push_tree's
+            # deterministic commit SHA.
+            echo "harbor.$DOMAIN/team-$_team/$_repo:main already exists and the source is unchanged -- no rebuild needed"
+          else
+            echo "error: team-$_team/$_repo is already at the expected commit but harbor.$DOMAIN/team-$_team/$_repo:main does not exist," >&2
+            echo "       so a previous build must have failed. Look at 'kubectl get pipelinerun -n team-$_team'; any new commit" >&2
+            echo "       pushed to that repo re-triggers the build." >&2
+            return 1
+          fi
+
+          # Fresh token: the build above can take many minutes, far past the 60s token lifespan.
+          API_TOKEN=$(dev_team_token "$_team")
+          _image_repo="harbor.$DOMAIN/team-$_team/$_repo"
+
+          # The cross-team wiring, from SEED_BOOKINFO_CALLS: for every service THIS one calls,
+          # a <CALLEE>_HOSTNAME/<CALLEE>_SERVICE_PORT pair pointing at the callee's in-cluster
+          # Service DNS name -- NOT at its public route. Bookinfo's own source (productpage.py,
+          # LibertyRestEndpoint.java) builds these URLs as plain http:// and follows no redirects,
+          # and the public route answers HTTP with a 301 to HTTPS; going that way produces
+          # "Ratings service is currently unavailable" and nothing more informative.
+          _env_file=$(mktemp)
+          for _call in {{.SEED_BOOKINFO_CALLS}}; do
+            _caller=${_call%%:*}
+            _callee=${_call#*:}
+            [ "$_caller" = "$_team" ] || continue
+            _callee_upper=$(bookinfo_role_of "$_callee" | tr '[:lower:]' '[:upper:]')
+            printf '  - name: %s_HOSTNAME\n    value: %s.team-%s.svc.cluster.local\n  - name: %s_SERVICE_PORT\n    value: "%s"\n' \
+              "$_callee_upper" "{{.SEED_WORKLOAD_NAME}}" "$_callee" "$_callee_upper" "{{.SEED_SERVICE_PORT}}" >> "$_env_file"
           done
-          [ "$_status" = "True" ] || { echo "error: build for team-$_team/$_reponame did not succeed within 180s (last: $_pr)" >&2; return 1; }
-        }
 
-        setup_team_app() {
-          set -euo pipefail
-          _team=$1
-          _email="dev-$_team@$DOMAIN"
-          _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
+          # podLabels is on EVERY service, not just the ones that are called into: it costs
+          # nothing, and it means the netpol step never has to care which of the four happens to
+          # be a callee today. See SEED_NETPOL_LABEL_NAME for the two traps behind this label.
+          VALUES=$(printf 'image:\n  repository: %s\n  tag: main\nservicePorts:\n  - port: %s\n    targetPort: %s\n    protocol: TCP\n    name: http\npodLabels:\n  %s: %s\n' \
+            "$_image_repo" "{{.SEED_SERVICE_PORT}}" "{{.SEED_SERVICE_PORT}}" "{{.SEED_NETPOL_LABEL_NAME}}" "{{.SEED_NETPOL_LABEL_VALUE}}")
+          if [ -s "$_env_file" ]; then
+            VALUES=$(printf '%s\nenv:\n%s' "$VALUES" "$(cat "$_env_file")")
+          fi
+          rm -f "$_env_file"
 
-          GITEA_USER=$(gitea_oidc_login "$_email" "$_password")
-          GITEA_PAT=$(gitea_mint_pat "$GITEA_USER" "read:user,write:repository,write:organization,read:organization")
-          gitea_wait_for_org_permission "$GITEA_USER" "team-$_team" "$GITEA_PAT" "can_create_repository"
-
-          # agent-<team> also provisions itself in Gitea and lands in the team's org -- no repo
-          # creation of its own, dev owns that; this is just "find themselves in their
-          # respective team" (agent's OWN Gitea account + org membership sync, same mechanism as
-          # dev's, just no follow-up repo work).
-          _agent_email="agent-$_team@$DOMAIN"
-          _agent_password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_agent.txt)
-          _agent_gitea_user=$(gitea_oidc_login "$_agent_email" "$_agent_password")
-          # read:user AND read:organization -- the permissions endpoint below 403s without
-          # read:user too (confirmed live, same trap already hit and fixed for dev's PAT scope).
-          _agent_gitea_pat=$(gitea_mint_pat "$_agent_gitea_user" "read:user,read:organization")
-          gitea_wait_for_org_permission "$_agent_gitea_user" "team-$_team" "$_agent_gitea_pat" "can_read"
-
-          API_TOKEN=$(dev_team_token "$_team")
-
-          # The Akamai canary-deployment lab (techdocs.akamai.com/app-platform/docs/
-          # canary-deployment): two repos, literally named "blue" (stable) and "green" (canary)
-          # -- not derived from the team's own name, matching the docs' own semantics. A team
-          # that happens to be named "blue" or "green" itself will find these repo/build names
-          # coincide with resources an earlier single-app run of this script already created
-          # under that same name; that's harmless (apl_create_if_missing just reuses them, and
-          # the content push below overwrites whatever was there).
-          build_team_repo "$_team" blue "#1565c0" "Version: BLUE (stable)"
-          # Fresh token before the second repo's builds -- dev_team_token's note applies here
-          # too: the first build_team_repo call's waits can easily eat the 60s token lifespan.
-          API_TOKEN=$(dev_team_token "$_team")
-          build_team_repo "$_team" green "#2e7d32" "Version: GREEN (canary)"
-
-          # ONE workload named "canary" (chart k8s-deployments-canary) combining both images --
-          # versionOne is blue/stable, versionTwo is green/canary, matching the chart's own
-          # values.yaml. Only versionTwo gets the auto image updater, per the docs (the canary
-          # side auto-updates on every commit; the stable side is a deliberate, manual promotion).
-          API_TOKEN=$(dev_team_token "$_team")
-          BLUE_IMAGE_REPO="harbor.$DOMAIN/team-$_team/blue"
-          GREEN_IMAGE_REPO="harbor.$DOMAIN/team-$_team/green"
-          VALUES=$(printf 'versionOne:\n  image:\n    repository: %s\n    tag: main\nversionTwo:\n  image:\n    repository: %s\n    tag: main\n' "$BLUE_IMAGE_REPO" "$GREEN_IMAGE_REPO")
-          # imageParameter/tagParameter and the full harbor.<domain>/ prefix on imageRepository
-          # are both required for the ArgoCD Image Updater to actually fire -- confirmed live
-          # under the old single-app model (see git history), same trap, same fix, just pointed
-          # at versionTwo's nested path instead of the chart-root image.* the single-app model used.
+          # imageUpdateStrategy is what wires real GitOps auto-redeploy: the ArgoCD Image Updater
+          # watches the Harbor repo and rewrites image.repository/image.tag in the values repo when
+          # a new digest is pushed. imageParameter/tagParameter and the full harbor.<domain>/
+          # prefix on imageRepository are ALL required for it to fire at all -- confirmed live,
+          # twice, in two different demos.
           apl_create_if_missing \
-            "$API/v2/teams/$_team/workloads/canary" "$API/v2/teams/$_team/workloads" "$API_TOKEN" \
-            "$(jq -n --arg values "$VALUES" --arg url "{{.SEED_CATALOG_CHART_URL}}" --arg repo "$GREEN_IMAGE_REPO" \
-              '{kind:"AplTeamWorkload", metadata:{name:"canary"}, spec:{url:$url, chartProvider:"git", path:"{{.SEED_CANARY_CHART_PATH}}", revision:"main", values:$values, imageUpdateStrategy:{type:"digest", digest:{imageRepository:$repo, tag:"main", imageParameter:"versionTwo.image.repository", tagParameter:"versionTwo.image.tag"}}}}')" \
-            "workload canary ($_team)"
+            "$API/v2/teams/$_team/workloads/{{.SEED_WORKLOAD_NAME}}" "$API/v2/teams/$_team/workloads" "$API_TOKEN" \
+            "$(jq -n --arg name "{{.SEED_WORKLOAD_NAME}}" --arg values "$VALUES" --arg url "{{.SEED_CATALOG_CHART_URL}}" \
+                --arg path "{{.SEED_WORKLOAD_CHART_PATH}}" --arg repo "$_image_repo" \
+              '{kind:"AplTeamWorkload", metadata:{name:$name}, spec:{url:$url, chartProvider:"git", path:$path, revision:"main", values:$values, imageUpdateStrategy:{type:"digest", digest:{imageRepository:$repo, tag:"main", imageParameter:"image.repository", tagParameter:"image.tag"}}}}')" \
+            "workload {{.SEED_WORKLOAD_NAME}} ($_team)"
 
-          # ONE service named "canary", trafficControl enabled at the platform's own schema
-          # defaults (weightV1:90/weightV2:10 -- values-schema.yaml, confirmed live against
-          # tests/fixtures/env/teams/demo/services/hello-blue-green.yaml) -- "use the default
-          # weights" per the docs. routes.yaml routes this to backends "canary-v1"/"canary-v2",
-          # which is exactly what the k8s-deployments-canary chart's own service-v1/v2 templates
-          # create (Release.Name, i.e. the workload's own name "canary", with no override needed).
+          # useDefaultHost gives each team its own public URL at
+          # https://{{.SEED_WORKLOAD_NAME}}-<team>.<domain>/ (routes.yaml names the host
+          # "<serviceName>-<teamId>"). Handy for poking one microservice directly; the cross-team
+          # calls above deliberately do NOT go through it.
           apl_create_if_missing \
-            "$API/v2/teams/$_team/services/canary" "$API/v2/teams/$_team/services" "$API_TOKEN" \
-            '{"kind":"AplTeamService","metadata":{"name":"canary"},"spec":{"port":80,"ingress":{"type":"public","useDefaultHost":true},"trafficControl":{"enabled":true,"weightV1":90,"weightV2":10}}}' \
-            "service canary ($_team)"
+            "$API/v2/teams/$_team/services/{{.SEED_WORKLOAD_NAME}}" "$API/v2/teams/$_team/services" "$API_TOKEN" \
+            "$(jq -n --arg name "{{.SEED_WORKLOAD_NAME}}" --argjson port {{.SEED_SERVICE_PORT}} \
+              '{kind:"AplTeamService", metadata:{name:$name}, spec:{port:$port, ingress:{type:"public", useDefaultHost:true}}}')" \
+            "service {{.SEED_WORKLOAD_NAME}} ($_team)"
 
-          # Bounded wait for the public route to actually serve the app end to end. Hostname is
-          # "<serviceName>-<teamId>" per charts/team-ns/templates/routes.yaml -- "canary-$_team".
+          # Bounded wait for the public route to actually serve this microservice. /health, not
+          # /: all four Bookinfo services expose it, but only productpage serves anything at the
+          # document root.
           _tries=0
           _code=""
-          while [ "$_tries" -lt 18 ]; do
-            _code=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "https://canary-$_team.$DOMAIN/" 2>/dev/null || true)
+          while [ "$_tries" -lt 30 ]; do
+            _code=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "https://{{.SEED_WORKLOAD_NAME}}-$_team.$DOMAIN/health" 2>/dev/null || true)
             [ "$_code" = "200" ] && break
             _tries=$((_tries + 1))
+            echo "waiting for https://{{.SEED_WORKLOAD_NAME}}-$_team.$DOMAIN/health (try $_tries/30, last: $_code)..."
             sleep 10
           done
-          [ "$_code" = "200" ] || { echo "error: https://canary-$_team.$DOMAIN/ never returned 200 (last: $_code)" >&2; return 1; }
+          [ "$_code" = "200" ] || { echo "error: https://{{.SEED_WORKLOAD_NAME}}-$_team.$DOMAIN/health never returned 200 (last: $_code)" >&2; return 1; }
         }
 
-        for TEAM in {{.SEED_TEAMS}}; do
-          apl_run "seed-apps-$TEAM" "Setting up $TEAM's blue/green canary deployment (as dev-$TEAM)" setup_team_app "$TEAM" || exit $?
+        for SPEC in {{.SEED_BOOKINFO_SERVICES}}; do
+          ROLE=$(printf '%s' "$SPEC" | cut -d: -f1)
+          TEAM=$(printf '%s' "$SPEC" | cut -d: -f2)
+          REPO=$(printf '%s' "$SPEC" | cut -d: -f3)
+          SUBDIR=$(printf '%s' "$SPEC" | cut -d: -f4)
+          apl_run "seed-apps-$TEAM" "Setting up Bookinfo's '$ROLE' microservice in team $TEAM (as dev-$TEAM)" \
+            setup_team_service "$ROLE" "$TEAM" "$REPO" "$SUBDIR" || exit $?
         done
-        apl_ok "demo canary deployments live: $(for T in {{.SEED_TEAMS}}; do printf 'https://canary-%s.%s/ ' "$T" "$DOMAIN"; done)"
+        apl_ok "bookinfo microservices live: $(for S in {{.SEED_BOOKINFO_SERVICES}}; do printf 'https://{{.SEED_WORKLOAD_NAME}}-%s.%s/ ' "$(printf '%s' "$S" | cut -d: -f2)" "$DOMAIN"; done)"
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        API="https://console.$DOMAIN/api"
+
+        # Every team is created with networkPolicy.ingressPrivate: true (seed:teams), which allows
+        # ingress ONLY from istio-system/knative-serving/monitoring/tekton-pipelines -- not from
+        # another team's namespace. So productpage -> details/reviews and reviews -> ratings are
+        # blocked by default even though the Service DNS names resolve perfectly.
+        #
+        # The platform has a proper, scoped, self-service mechanism for exactly this: an
+        # AplTeamNetworkControl per callee (values-schema.yaml's `netpol` definition). Four things
+        # about it cost real time to find, all encoded below:
+        #
+        #  1. It needs its OWN endpoint -- POST /v2/teams/{team}/netpols. Nesting a `netpols`
+        #     array inside the team's AplTeamSettingSet body (POST /v2/teams) returns HTTP 200 and
+        #     LOOKS like it worked, but it is silently a no-op: apl-api's values assembly only ever
+        #     scans separate per-resource files at env/teams/<team>/netpols/*.yaml, the same
+        #     convention builds/ codeRepos/ workloads/ services/ each already follow. A netpol
+        #     nested in settings.yaml is invisible to that scan, forever.
+        #  2. The kind is AplTeamNetworkControl, not ...NetworkPolicy.
+        #  3. toLabelName may not contain "/" (apl-api rejects the pattern), so a normal qualified
+        #     Kubernetes label cannot be used -- hence the custom podLabels label the workloads
+        #     above carry. See SEED_NETPOL_LABEL_NAME for trap 4, the "true"/"false" coercion.
+        #  4. networkPolicy.ingressPrivate must STAY true. The chart template that renders
+        #     custom-network-policies.yaml only fires when it is -- flipping it to false is a
+        #     coarser "allow every namespace" fallback, not a shortcut to the same thing.
+        #
+        # As platform-admin: teams are created with selfService.teamMembers.editSecurityPolicies
+        # false, so dev-<team> genuinely may not write one of these. That is the platform working
+        # as configured, not something to work around.
+        create_netpol() {
+          set -euo pipefail
+          _caller=$1
+          _callee=$2
+          _token=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+          _name="allow-$_caller"
+          apl_create_if_missing \
+            "$API/v2/teams/$_callee/netpols/$_name" "$API/v2/teams/$_callee/netpols" "$_token" \
+            "$(jq -n --arg name "$_name" --arg ns "team-$_caller" \
+                --arg ln "{{.SEED_NETPOL_LABEL_NAME}}" --arg lv "{{.SEED_NETPOL_LABEL_VALUE}}" \
+              '{kind:"AplTeamNetworkControl", metadata:{name:$name}, spec:{ruleType:{type:"ingress", ingress:{toLabelName:$ln, toLabelValue:$lv, mode:"AllowOnly", allow:[{fromNamespace:$ns}]}}}}')" \
+            "netpol $_name ($_callee)"
+        }
+        for CALL in {{.SEED_BOOKINFO_CALLS}}; do
+          CALLER=${CALL%%:*}
+          CALLEE=${CALL#*:}
+          apl_run "seed-apps-netpol-$CALLEE-$CALLER" \
+            "Allowing team-$CALLER to reach team-$CALLEE's pods (AplTeamNetworkControl)" \
+            create_netpol "$CALLER" "$CALLEE" || exit $?
+        done
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+
+        # The check that actually proves the demo, rather than proving four independent pods are
+        # up: productpage's own rendered HTML has to carry content that can ONLY have come from
+        # the other three teams' namespaces.
+        #   "Shakespeare" / "paperback"  -> team-details answered           (productpage -> details)
+        #   "Reviewer1" / "Reviewer2"    -> team-reviews answered           (productpage -> reviews)
+        #   glyphicon-star               -> team-ratings answered           (reviews -> ratings)
+        # The stars are the important one: reviews v3 renders them only when the ratings call
+        # succeeded, and prints "Ratings service is currently unavailable" instead when it did
+        # not -- which is exactly what a missing netpol, or an internal call routed through the
+        # public HTTP->HTTPS redirect, looks like. An HTTP 200 alone proves none of this.
+        PRODPAGE_TEAM=$(for S in {{.SEED_BOOKINFO_SERVICES}}; do
+          case "$S" in productpage:*) printf '%s' "$S" | cut -d: -f2 ;; esac
+        done)
+        verify_bookinfo() {
+          _url="https://{{.SEED_WORKLOAD_NAME}}-$PRODPAGE_TEAM.$DOMAIN/productpage"
+          _tries=0
+          while [ "$_tries" -lt 30 ]; do
+            _body=$(curl -sk --max-time 20 "$_url" 2>/dev/null || true)
+            _missing=""
+            for _marker in Shakespeare paperback Reviewer1 Reviewer2 glyphicon-star; do
+              printf '%s' "$_body" | grep -q "$_marker" || _missing="$_missing $_marker"
+            done
+            if [ -z "$_missing" ]; then
+              echo "$_url renders details, reviews AND star ratings -- all four teams answered"
+              return 0
+            fi
+            _tries=$((_tries + 1))
+            echo "waiting for the full cross-team page at $_url (try $_tries/30, still missing:$_missing)..."
+            sleep 10
+          done
+          echo "error: $_url never rendered the full cross-team page (still missing:$_missing)" >&2
+          echo "       last response, first 600 bytes: $(printf '%s' "$_body" | head -c 600)" >&2
+          return 1
+        }
+        apl_run seed-apps-verify-bookinfo \
+          "Verifying the whole Bookinfo call chain end to end through productpage's rendered page" \
+          verify_bookinfo || exit $?
+        apl_ok "bookinfo demo verified end to end: https://{{.SEED_WORKLOAD_NAME}}-$PRODPAGE_TEAM.$DOMAIN/productpage"
 
   vikunja:
     desc: "Provision po/dev/agent in Vikunja via OIDC claim-driven team sync; po's project shared with the team"
@@ -753,12 +1053,21 @@ tasks:
           done
 
           # Project owned by po (created with po's own token), titled "<team>-example" (not just
-          # "<team>" -- the user asked for this explicitly), description links back to the
-          # team's blue/green Gitea repos -- matches the docs' own
-          # "create-code-repositories-and-images" naming, the same repos `apps` (the prior task)
-          # already registered/built from.
+          # "<team>" -- the user asked for this explicitly), description links back to the one
+          # Gitea repo this team owns: the Bookinfo microservice `apps` (the prior task) already
+          # registered and built for it.
           _title="$_team-example"
-          _description="Demo project for team $_team -- code: https://gitea.$DOMAIN/team-$_team/blue.git, https://gitea.$DOMAIN/team-$_team/green.git"
+          _repo=""
+          for _bi_spec in {{.SEED_BOOKINFO_SERVICES}}; do
+            if [ "$(printf '%s' "$_bi_spec" | cut -d: -f2)" = "$_team" ]; then
+              _repo=$(printf '%s' "$_bi_spec" | cut -d: -f3)
+            fi
+          done
+          if [ -n "$_repo" ]; then
+            _description="Demo project for team $_team -- Bookinfo microservice: https://gitea.$DOMAIN/team-$_team/$_repo.git"
+          else
+            _description="Demo project for team $_team"
+          fi
           # Rename-in-place if an OLDER run already created a project titled just "$_team" --
           # never creates a second, orphaned project under the new title alongside the old one.
           _project_id=$(vikunja_rename_project_if_needed "$_po_token" "$_team" "$_title" "$_description") \
@@ -789,7 +1098,7 @@ tasks:
         apl_ok "vikunja provisioned for: {{.SEED_TEAMS}}"
 
   demo:
-    desc: "Seed the demo: SEED_TEAMS teams, three users each, a live app per team, and Vikunja provisioning"
+    desc: "Seed the demo: the four Bookinfo teams, three users each, one live microservice per team wired to the others, and Vikunja provisioning"
     deps: [vikunja]
     cmds:
       - |

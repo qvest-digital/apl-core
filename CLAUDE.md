@@ -336,6 +336,25 @@ marker — which is exactly how a phantom Vikunja team appeared, containing ever
 platform. Note the flag is **global**: there is no per-team admin group, so scoping it means
 intersecting `team-admin` with the actual `team-<id>` membership.
 
+**Pinned tool versions in `charts/team-ns/templates/tekton-tasks/*.yaml` can be years stale, and
+upstream does not audit them.** Confirmed live 2026-08-29: `kaniko.yaml`'s `BUILDER_IMAGE` default
+was still `kaniko-project/executor:v1.5.1` (released 2021-02-23) — unchanged since the file was
+added upstream on 2023-05-09, through every subsequent upstream commit that touched it. It broke a
+real build: v1.5.1 can't build multi-stage Dockerfiles on this `kind` cluster
+(`unlinkat //product_uuid: device or resource busy` — kind bind-mounts that path from the host,
+kaniko's stage-cleanup can't unlink it; fixed by upgrading kaniko past whichever release added
+`--ignore-path`). **Fixed in this fork 2026-08-29**: `kaniko.yaml` bumped to `v1.23.2` (verified
+live against a real multi-stage build), and while in there the other three pinned images in the
+same directory were bumped too (`bash` 5.1.4→5.2 in `kaniko.yaml`/`buildpacks.yaml`, `grype`
+v0.112.0-nonroot→v0.118.0-nonroot, `git-init` v0.40.2→v0.45.0) — the latter two unverified by a
+real build at bump time (`git-init` is exercised by every build via `git-clone`, so a real cluster
+run will validate it; `grype` is not exercised by anything on this cluster since every seeded
+build sets `scanSource: false`, so treat it as unverified until something actually runs with
+scanning on). See `UPSTREAM-SYNC.md` §4b for the general pattern — upstream still hasn't fixed
+any of this, so a future merge won't reintroduce these specific versions but could easily
+reintroduce staleness elsewhere in the same directory; check every pinned image in that directory
+any time you're already in there for a sync, not just kaniko.
+
 **Never run `docker system prune -a`.** It will destroy unrelated containers, images and volumes
 belonging to other projects on this machine. If you need disk, `docker builder prune` is safe.
 

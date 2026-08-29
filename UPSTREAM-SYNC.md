@@ -94,6 +94,28 @@ git ls-files charts/vikunja charts/turnstone | grep values.yaml   # confirm .git
 Then run the test suite from a clean context (root `*.md` spellcheck trap applies here same as any
 build — see `CLAUDE.md` §"Traps that will cost you an hour each").
 
+## 4b. While you're in here: check for stale pinned tool versions too
+
+A merge only touches what upstream itself has changed — and upstream does not appear to audit
+pinned tool versions in `charts/team-ns/templates/tekton-tasks/*.yaml` at all. Confirmed live
+2026-08-29: `kaniko.yaml`'s `BUILDER_IMAGE` default has been pinned to `kaniko-project/executor:v1.5.1`
+(released 2021-02-23) since the file was first added upstream on 2023-05-09 (`b5b0ba763`) — over two
+years of subsequent upstream commits touching that same file (sync-wave annotations, etc.) never
+bumped the version. It surfaced as a real bug: v1.5.1 can't build multi-stage Dockerfiles on a `kind`
+cluster (`unlinkat //product_uuid: device or resource busy` — kind bind-mounts that path from the
+host; kaniko's stage-cleanup can't unlink it; fixed in later kaniko via `--ignore-path=/product_uuid`,
+added well after v1.5.1). A merge from upstream will carry this forward unchanged since upstream
+hasn't fixed it either.
+
+**Fixed in this fork 2026-08-29** (bumped to `v1.23.2`, verified against a real multi-stage
+build), along with the other three pinned images in the same directory (`bash`, `grype`,
+`git-init` — see the CLAUDE.md trap entry for exact versions and which of these are actually
+verified by a real run vs. just tag-bumped). A future upstream merge won't silently reintroduce
+v1.5.1 specifically, but the underlying pattern — upstream not auditing this directory at all —
+is unchanged, so take a look at every pinned image tag/digest under
+`charts/team-ns/templates/tekton-tasks/` while you're already touching this area for a sync,
+rather than assuming a merge keeps any of them current.
+
 ## 5. Record the new sync point
 
 Once the merge lands on `main`, move `reference/base` to the new merge commit (or create a new

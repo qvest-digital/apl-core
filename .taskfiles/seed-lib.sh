@@ -356,6 +356,18 @@ gitea_ensure_team_credentials() {
 
 # --- Harbor -----------------------------------------------------------------------------------
 
+# harbor_ensure_project / harbor_mirror are NOT used by the Bookinfo seed below: Bookinfo's four
+# Dockerfiles keep their upstream public `FROM` lines (python/ruby/node/gradle/open-liberty) and
+# kaniko pulled every one of them straight from the public registry, confirmed live 2026-08-29 --
+# all four `docker-trigger-build-*` PipelineRuns Succeeded. That is a deviation from
+# POD-EGRESS-INVESTIGATION.md's blanket "mirror every FROM into Harbor first" rule, kept because
+# the unmodified upstream source IS the demo content; rewriting `FROM` would make it a fork.
+#
+# These two are kept deliberately, unused, because they are exactly that documented workaround:
+# if a fresh cluster's builds ever fail pulling a base image, the first thing to try is
+# harbor_ensure_project + harbor_mirror for each base image, then a `sed` on the pushed
+# Dockerfile's FROM. Do not delete them just because nothing calls them today.
+
 # harbor_ensure_project <project> -- creates a public Harbor project if it doesn't already exist.
 harbor_ensure_project() {
   _project=$1
@@ -381,6 +393,17 @@ harbor_mirror() {
   timeout 300 docker run --rm --network host quay.io/skopeo/stable:latest \
     copy --dest-tls-verify=false --dest-creds "admin:$HARBOR_ADMIN_PASSWORD" \
     "docker://$_source" "docker://harbor.$DOMAIN/$_dest"
+}
+
+# harbor_has_tag <project> <repo> <tag> -- 0 if that exact tag exists in Harbor. Needs
+# $HARBOR_ADMIN_PASSWORD in the environment (same as the two above). Used to answer "is there
+# already a built image for this repo?" without re-running a build -- the seed only rebuilds when
+# the pushed source actually changed, so on a rerun this is what proves the previous run's build
+# really produced something.
+harbor_has_tag() {
+  _ht_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+    "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
+  [ "$_ht_code" = "200" ]
 }
 
 # --- apl-api: create-if-missing ---------------------------------------------------------------
@@ -428,6 +451,42 @@ apl_create_if_missing() {
   rm -f "$_out"
 }
 
+# apl_delete_if_present <get_url> <delete_url> <token> <label> -- the mirror image of
+# apl_create_if_missing, for retiring demo content this script itself created in an earlier
+# incarnation (the blue/green canary app the Bookinfo services replaced). GETs first so a
+# already-gone resource is a clean no-op rather than a 404 the caller has to special-case.
+#
+# This goes through apl-api like every other write here, NEVER `kubectl delete` on the rendered
+# ArgoCD Application/Deployment: the resource's source of truth is the git values repo, so a raw
+# kubectl delete is reverted by ArgoCD's selfHeal within seconds (CLAUDE.md rule 6).
+apl_delete_if_present() {
+  _del_get_url=$1
+  _del_url=$2
+  _del_token=$3
+  _del_label=$4
+  _del_get_http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "$_del_get_url" -H "Authorization: Bearer $_del_token")
+  case "$_del_get_http" in
+    [0-9][0-9][0-9]) ;;
+    *) echo "error: checking whether $_del_label exists got no valid HTTP status back (curl said: '$_del_get_http')" >&2; return 1 ;;
+  esac
+  if [ "$_del_get_http" != "200" ]; then
+    return 0
+  fi
+  _del_out=$(mktemp)
+  _del_http=$(curl -sk --max-time 30 -o "$_del_out" -w '%{http_code}' -X DELETE "$_del_url" -H "Authorization: Bearer $_del_token")
+  case "$_del_http" in
+    [0-9][0-9][0-9]) ;;
+    *) echo "error: deleting $_del_label got no valid HTTP status back (curl said: '$_del_http')" >&2; rm -f "$_del_out"; return 1 ;;
+  esac
+  if [ "$_del_http" -ge 300 ] && [ "$_del_http" != "404" ]; then
+    echo "error: deleting $_del_label returned HTTP $_del_http: $(cat "$_del_out")" >&2
+    rm -f "$_del_out"
+    return 1
+  fi
+  rm -f "$_del_out"
+  echo "removed $_del_label"
+}
+
 # --- Gitea: repo content ----------------------------------------------------------------------
 
 # gitea_create_org_repo <org> <repo> <pat> -- creates a private repo under a team's Gitea org,
@@ -449,35 +508,123 @@ gitea_create_org_repo() {
   rm -f "$_out"
 }
 
-# gitea_put_file <org> <repo> <path> <content> <pat> <message> -- creates or updates a file on
-# main. Looks up the current sha first (GET) to decide POST (create) vs PUT (update, needs the
-# prior sha) -- Gitea's contents API requires this to avoid a 409/422 add-conflict on a rerun.
-gitea_put_file() {
-  _org=$1
-  _repo=$2
-  _path=$3
-  _content=$4
-  _pat=$5
-  _message=$6
-  _b64=$(printf '%s' "$_content" | base64 -w0)
-  _sha=$(curl -sk --max-time 15 "https://gitea.$DOMAIN/api/v1/repos/$_org/$_repo/contents/$_path" \
-    -H "Authorization: token $_pat" | jq -r '.sha // empty')
-  _method=POST
-  _body=$(jq -n --arg content "$_b64" --arg msg "$_message" '{content: $content, message: $msg, branch: "main"}')
-  if [ -n "$_sha" ]; then
-    _method=PUT
-    _body=$(jq -n --arg content "$_b64" --arg msg "$_message" --arg sha "$_sha" \
-      '{content: $content, message: $msg, branch: "main", sha: $sha}')
+# gitea_delete_org_repo_if_present <org> <repo> <pat> -- removes a repository entirely. Used only
+# to retire the blue/green canary demo repos the earlier version of this seed created; a
+# not-there repo is a clean no-op.
+gitea_delete_org_repo_if_present() {
+  _dr_org=$1
+  _dr_repo=$2
+  _dr_pat=$3
+  _dr_http=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X DELETE \
+    "https://gitea.$DOMAIN/api/v1/repos/$_dr_org/$_dr_repo" -H "Authorization: token $_dr_pat")
+  case "$_dr_http" in
+    204) echo "removed Gitea repo $_dr_org/$_dr_repo" ;;
+    404) ;;
+    *) echo "warning: deleting Gitea repo $_dr_org/$_dr_repo returned HTTP $_dr_http" >&2 ;;
+  esac
+}
+
+# upstream_sparse_subdir <git-url> <ref> <subdir> -- prints a local path holding that ONE
+# subdirectory's contents, checked out from a public upstream repository.
+#
+# Why not the Gitea contents API (which the retired blue/green demo used, one REST call per
+# file): Bookinfo's productpage is ~11 files across three subdirectories and reviews is a ~17-file
+# Gradle project. One-file-per-call does not scale to that and is not atomic. A real clone + a
+# real push is both simpler and closer to what a human would actually do.
+#
+# Runs on the HOST, which has real, unrestricted internet access -- the same reason harbor_mirror
+# can use `docker run --network host` (POD-EGRESS-INVESTIGATION.md). Nothing in a pod ever fetches
+# from github.com here.
+#
+# `--depth 1 --filter=blob:none --sparse` keeps istio/istio (a very large repository) down to the
+# few files actually wanted, and the clone is CACHED under the state dir and reused: seeding four
+# services costs one clone, not four. Subsequent services just `sparse-checkout add` their own
+# subdirectory to the existing checkout.
+#
+# Always the SAME ref for reading and for cloning (the seed pins `master`, not a release tag). A
+# tag and the default branch disagree about these Dockerfiles' base images, and mixing the two
+# produces a build failure that looks nothing like a version mismatch.
+upstream_sparse_subdir() {
+  _uc_url=$1
+  _uc_ref=$2
+  _uc_subdir=$3
+  _uc_key=$(printf '%s@%s' "$_uc_url" "$_uc_ref" | tr -c 'A-Za-z0-9._-' '_')
+  _uc_dir="${APL_STATE_DIR:-.taskfiles/state}/seed_src_$_uc_key"
+  if [ ! -d "$_uc_dir/.git" ]; then
+    rm -rf "$_uc_dir"
+    mkdir -p "${APL_STATE_DIR:-.taskfiles/state}"
+    # Bounded (CLAUDE.md rule 1): git has no timeout of its own and a stalled fetch would hang here.
+    timeout 300 git clone --quiet --depth 1 --filter=blob:none --sparse \
+      --branch "$_uc_ref" "$_uc_url" "$_uc_dir" >&2 \
+      || { echo "error: cloning $_uc_url@$_uc_ref failed" >&2; rm -rf "$_uc_dir"; return 1; }
   fi
-  _out=$(mktemp)
-  _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X "$_method" "https://gitea.$DOMAIN/api/v1/repos/$_org/$_repo/contents/$_path" \
-    -H "Authorization: token $_pat" -H "Content-Type: application/json" -d "$_body")
-  if [ "$_http" -ge 300 ]; then
-    echo "error: writing $_org/$_repo:$_path returned HTTP $_http: $(cat "$_out")" >&2
-    rm -f "$_out"
-    return 1
+  timeout 120 git -C "$_uc_dir" sparse-checkout add "$_uc_subdir" >&2 \
+    || { echo "error: sparse-checkout add $_uc_subdir failed in $_uc_dir" >&2; return 1; }
+  [ -d "$_uc_dir/$_uc_subdir" ] \
+    || { echo "error: $_uc_subdir does not exist in $_uc_url@$_uc_ref" >&2; return 1; }
+  printf '%s' "$_uc_dir/$_uc_subdir"
+}
+
+# gitea_push_tree <org> <repo> <pat> <gitea-username> <srcdir> <message> -- force-pushes the whole
+# contents of <srcdir> as the single commit on <org>/<repo>'s `main`, over HTTPS, authenticating
+# as <gitea-username> with that user's own Gitea PAT (what gitea_mint_pat hands back).
+#
+# Exit status is three-valued, on purpose:
+#   0  pushed (content changed, so Gitea's webhook fired and a build was triggered)
+#   2  already identical -- nothing pushed, no webhook, no rebuild
+#   1  failure
+# Callers must handle 2 explicitly; see seed.yml's setup_team_service.
+#
+# `--force` is expected, not a conflict: gitea_create_org_repo auto-inits every new repo with a
+# README so it has a `main` branch at all, and this replaces that initial commit.
+#
+# GIT_SSL_NO_VERIFY: Gitea's certificate is signed by the platform's own root CA, which carries no
+# Authority Key Identifier (CLAUDE.md's CA note) -- the same reason every Tekton git-clone here
+# runs with sslVerify "false".
+#
+# IDEMPOTENCE, and why it matters more than usual: the commit is built with a FIXED author and
+# committer identity AND fixed dates, so identical content yields a byte-identical commit object
+# and therefore the same SHA on every run. That makes "is the remote already exactly this?" a
+# single SHA comparison -- and skipping the push when it matches is what stops a rerun of the seed
+# from firing every team's webhook and re-running every build for nothing.
+gitea_push_tree() {
+  _pt_org=$1
+  _pt_repo=$2
+  _pt_pat=$3
+  _pt_user=$4
+  _pt_src=$5
+  _pt_msg=$6
+
+  _pt_work=$(mktemp -d)
+  cp -a "$_pt_src/." "$_pt_work/" || { rm -rf "$_pt_work"; echo "error: could not copy $_pt_src" >&2; return 1; }
+  rm -rf "$_pt_work/.git"
+
+  _pt_sha=$(
+    cd "$_pt_work" || exit 1
+    git init -q -b main || exit 1
+    git add -A || exit 1
+    GIT_AUTHOR_NAME='apl seed' GIT_AUTHOR_EMAIL="seed@$DOMAIN" \
+      GIT_COMMITTER_NAME='apl seed' GIT_COMMITTER_EMAIL="seed@$DOMAIN" \
+      GIT_AUTHOR_DATE='@0 +0000' GIT_COMMITTER_DATE='@0 +0000' \
+      git commit -q -m "$_pt_msg" || exit 1
+    git rev-parse HEAD
+  ) || { rm -rf "$_pt_work"; echo "error: could not build a local commit for $_pt_org/$_pt_repo from $_pt_src" >&2; return 1; }
+
+  _pt_remote=$(curl -sk --max-time 15 "https://gitea.$DOMAIN/api/v1/repos/$_pt_org/$_pt_repo/branches/main" \
+    -H "Authorization: token $_pt_pat" 2>/dev/null | jq -r '.commit.id // empty' 2>/dev/null || true)
+  if [ "$_pt_remote" = "$_pt_sha" ]; then
+    echo "$_pt_org/$_pt_repo is already at $_pt_sha -- nothing to push, no webhook fired, no rebuild"
+    rm -rf "$_pt_work"
+    return 2
   fi
-  rm -f "$_out"
+
+  (
+    cd "$_pt_work" || exit 1
+    GIT_SSL_NO_VERIFY=1 timeout 120 git push --quiet --force \
+      "https://$_pt_user:$_pt_pat@gitea.$DOMAIN/$_pt_org/$_pt_repo.git" "HEAD:refs/heads/main"
+  ) || { rm -rf "$_pt_work"; echo "error: pushing $_pt_src to $_pt_org/$_pt_repo failed" >&2; return 1; }
+  rm -rf "$_pt_work"
+  echo "pushed $_pt_src to $_pt_org/$_pt_repo main ($_pt_sha)"
 }
 
 # --- Vikunja: OIDC claim-driven team sync -------------------------------------------------------
