@@ -67,7 +67,7 @@ tasks:
         apl_run build-operator "Building operator image {{.OPERATOR_IMAGE}}" build || exit $?
 
   build-api:
-    desc: "Clone apl-api, apply the vikunja+turnstone patches, sync the schema, build"
+    desc: "Clone apl-api, apply the vikunja+turnstone+bugfix patches, sync the schema, build"
     cmds:
       - |
         . "{{.LIB}}"
@@ -88,6 +88,14 @@ tasks:
           git -C {{.API_CLONE_DIR}} apply "$REPO_ROOT/turnstone-patches/apl-api.patch"
           grep -qE '^\s+- turnstone$' {{.API_CLONE_DIR}}/src/openapi/app.yaml \
             || { echo "error: AppList missing turnstone after patching -- no tile will render" >&2; exit 1; }
+          # Unrelated file (src/otomi-stack.ts, not app.yaml), so it doesn't need to go after the
+          # other two for conflict reasons -- kept last to match this task's own comment order.
+          # See bugfix-patches/README.md: fixes DELETE /v1/users/{id} 500ing for ~62.5% of users
+          # (a server-generated uuidv4 id starting with a digit fails an internal slug-name
+          # validator that should never have applied to a UUID).
+          git -C {{.API_CLONE_DIR}} apply "$REPO_ROOT/bugfix-patches/apl-api.patch"
+          grep -q 'NOTE(apl-core fork)' {{.API_CLONE_DIR}}/src/otomi-stack.ts \
+            || { echo "error: bugfix patch did not apply to otomi-stack.ts" >&2; exit 1; }
         }
         # apl_run_sub, not apl_run: this is work done to make the apl-api image buildable, not an
         # image going up, so it must not consume a slot in build-all's [k/N] counter. Still

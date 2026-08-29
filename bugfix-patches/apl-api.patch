@@ -1,0 +1,27 @@
+diff --git a/src/otomi-stack.ts b/src/otomi-stack.ts
+index 6f6362b..5ea72b8 100644
+--- a/src/otomi-stack.ts
++++ b/src/otomi-stack.ts
+@@ -1361,10 +1361,18 @@ export default class OtomiStack {
+     const sealedSecretPath = getNamespaceSealedSecretsValuesFilePath(APL_USERS_NAMESPACE, id)
+     await this.git.removeFile(sealedSecretPath)
+ 
+-    // Also remove legacy AplUser file if it exists
+-    const legacyFilePath = getResourceFilePath('AplUser', id)
+-    await this.git.removeFile(legacyFilePath)
+-    this.fileStore.delete(legacyFilePath)
++    // NOTE(apl-core fork): removed the "legacy AplUser file" cleanup that used to run here.
++    // It called getResourceFilePath('AplUser', id) with id = a server-generated uuidv4(), but
++    // that helper validates its `name` argument against ID_NAME_PATTERN
++    // (fileStore/file-map.ts), a Kubernetes-slug rule ("^[a-z]...") meant for human-chosen
++    // resource names -- not the UUID contract this endpoint's own OpenAPI spec declares for
++    // userId. Since a uuidv4's first hex character is a digit 10/16 of the time, ~62.5% of all
++    // users could never be deleted through this endpoint: the validator threw a plain Error,
++    // surfaced as an opaque HTTP 500, before doDeleteDeployment below ever ran. The cleanup
++    // itself was already dead code: today's createUser/saveUser only ever writes the
++    // SealedSecret removed above, at env/manifests/namespaces/apl-users/sealedsecrets/{id}.yaml
++    // -- never the legacy env/users/{name}.yaml path this was trying to also remove -- so no
++    // user created via the current path could ever have had a legacy file to clean up.
+ 
+     await this.doDeleteDeployment([sealedSecretPath])
+   }

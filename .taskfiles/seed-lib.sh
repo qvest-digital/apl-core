@@ -1,0 +1,947 @@
+# Shared Keycloak Admin REST helpers for .taskfiles/seed.yml -- separate from lib.sh because
+# these are seed-domain logic (specific curl calls against Keycloak), not the generic
+# output/logging helpers lib.sh provides. Sourced the same way: `. "{{.SEED_LIB}}"`.
+#
+# Every function here expects $KIND_CTX and $DOMAIN already set by the caller (Task's
+# {{.KIND_CONTEXT}}/{{.STATE_DIR}}-derived values can't be templated into a plain .sh file --
+# only the `. "..."` line in seed.yml itself goes through Task's templater) -- and returns
+# non-zero with a message on stderr on failure, same contract as everything in lib.sh.
+
+# kc_master_token -- prints an access token for Keycloak's own master-realm bootstrap admin
+# (the keycloak-x chart's initial admin, "keycloak-initial-admin" secret), via the built-in
+# admin-cli client. admin-cli is public and has Direct Access Grants on by default, unlike the
+# platform's own "otomi" client (see seed:auth) -- this is the only account that can call the
+# Admin REST API at all, platform-admin/team users cannot.
+kc_master_token() {
+  _user=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret keycloak-initial-admin -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  _pass=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret keycloak-initial-admin -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+  [ -n "$_user" ] && [ -n "$_pass" ] || { echo "error: keycloak-initial-admin secret came back empty" >&2; return 1; }
+  # --data-urlencode, not -d: plain -d does not URL-encode its value, so a generated password
+  # containing a reserved form character (&, =, +, %% -- exactly what happened live with one of
+  # the demo users' auto-generated passwords) silently truncates or corrupts the request body.
+  curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/realms/master/protocol/openid-connect/token" \
+    --data-urlencode grant_type=password --data-urlencode client_id=admin-cli \
+    --data-urlencode username="$_user" --data-urlencode password="$_pass" \
+    | jq -er '.access_token'
+}
+
+# kc_platform_admin_token <client-secret-name> -- prints a FRESH platform-admin access token via
+# the Resource Owner Password grant against the platform's own shared "otomi" OIDC client (same
+# grant seed:auth originally used, extracted here so every caller can get a live token instead of
+# reusing one cached to disk). Re-derives credentials and the client secret from their live
+# Kubernetes Secrets on every call (cheap, ~4 kubectl gets) rather than caching a token to a file
+# -- confirmed live: a long bounded wait elsewhere in the same task chain (e.g. enable-apps's
+# up-to-20-minute app-readiness wait) can comfortably outlive Keycloak's access-token lifetime, so
+# a token fetched before such a wait and reused after it 401s with "JWT verification failed:
+# \"exp\" claim timestamp check failed". Call this immediately before each use that follows any
+# nontrivial wait, never rely on a previously-fetched token surviving one.
+kc_platform_admin_token() {
+  _client_secret_name=$1
+  _admin_user=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  _admin_pass=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+  [ -n "$_admin_user" ] && [ -n "$_admin_pass" ] || { echo "error: platform-admin-initial-credentials came back empty" >&2; return 1; }
+
+  _client_ns=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret -A \
+    --field-selector "metadata.name=$_client_secret_name" -o jsonpath='{.items[0].metadata.namespace}')
+  [ -n "$_client_ns" ] || { echo "error: secret $_client_secret_name not found in any namespace" >&2; return 1; }
+  _client_id=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret "$_client_secret_name" \
+    -n "$_client_ns" -o jsonpath='{.data.client-id}' | base64 -d)
+  _client_secret=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret "$_client_secret_name" \
+    -n "$_client_ns" -o jsonpath='{.data.client-secret}' | base64 -d)
+  [ -n "$_client_id" ] && [ -n "$_client_secret" ] || { echo "error: client-id/client-secret came back empty from $_client_ns/$_client_secret_name" >&2; return 1; }
+
+  _resp=$(curl -sk --max-time 15 "https://keycloak.$DOMAIN/realms/otomi/protocol/openid-connect/token" \
+    --data-urlencode grant_type=password \
+    --data-urlencode client_id="$_client_id" \
+    --data-urlencode client_secret="$_client_secret" \
+    --data-urlencode username="$_admin_user" \
+    --data-urlencode password="$_admin_pass" \
+    --data-urlencode scope=openid)
+  printf '%s' "$_resp" | jq -er '.access_token'
+}
+
+# kc_user_id_by_email <token> <email> -- prints the Keycloak user id in the "otomi" realm, or
+# nothing (empty string, not an error) if no such user exists.
+#
+# `jq -r`, not `jq -er`: "no such user" is a normal outcome this function exists to report, and
+# -er turns it into exit 4. Callers assign this in a command substitution under
+# `set -euo pipefail` (seed:fix-first-login's fix(), kc_resolve_pending), so that nonzero status
+# aborted the caller outright -- making their own `[ -n "$USER_ID" ] || echo "error: ..."` guard
+# unreachable and the failure silent.
+kc_user_id_by_email() {
+  _token=$1
+  _email=$2
+  curl -sk --max-time 15 "https://keycloak.$DOMAIN/admin/realms/otomi/users?email=$_email&exact=true" \
+    -H "Authorization: Bearer $_token" 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || true
+}
+
+# kc_make_password_permanent <token> <user_id> <password> -- resets the credential to the given
+# password with temporary:false, then clears requiredActions outright. reset-password alone does
+# NOT clear a requiredAction already recorded on the user object -- without the second call, a
+# direct grant still fails with "Account is not fully set up" even though the password matches.
+kc_make_password_permanent() {
+  _token=$1
+  _id=$2
+  _password=$3
+  curl -sk --max-time 15 -f -X PUT "https://keycloak.$DOMAIN/admin/realms/otomi/users/$_id/reset-password" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" \
+    -d "{\"type\":\"password\",\"value\":$(printf '%s' "$_password" | jq -Rs .),\"temporary\":false}" \
+    || return 1
+  curl -sk --max-time 15 -f -X PUT "https://keycloak.$DOMAIN/admin/realms/otomi/users/$_id" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" \
+    -d '{"requiredActions":[]}'
+}
+
+# kc_resolve_pending <pending_tsv> <resolved_tsv> -- given a TSV file of "email<TAB>password"
+# lines for users just created via apl-api, waits ONCE for apl-tasks's Keycloak operator to
+# reconcile ALL of them together (bounded: 24 tries, 5s apart, ~120s cap total) -- not one
+# 120s-capped wait per user run back-to-back, which is needlessly serial when a single batch of
+# git commits gets debounced and reconciled by apl-tasks together anyway. Appends
+# "email<TAB>id<TAB>password" to <resolved_tsv> as each is found, and rewrites <pending_tsv> down
+# to just what's still unresolved on return -- a non-empty <pending_tsv> after the call means
+# those specific users never showed up in Keycloak within the bound; the caller decides whether
+# that's fatal.
+kc_resolve_pending() {
+  _pending=$1
+  _resolved=$2
+  _tries=0
+  while [ -s "$_pending" ] && [ "$_tries" -lt 24 ]; do
+    _token=$(kc_master_token) || return 1
+    _next=$(mktemp)
+    while IFS=$'\t' read -r _email _password; do
+      [ -n "$_email" ] || continue
+      _id=$(kc_user_id_by_email "$_token" "$_email") || true
+      if [ -n "$_id" ]; then
+        printf '%s\t%s\t%s\n' "$_email" "$_id" "$_password" >> "$_resolved"
+      else
+        printf '%s\t%s\n' "$_email" "$_password" >> "$_next"
+      fi
+    done < "$_pending"
+    mv "$_next" "$_pending"
+    _tries=$((_tries + 1))
+    if [ -s "$_pending" ]; then
+      echo "waiting for apl-tasks to reconcile $(wc -l < "$_pending" | tr -d ' ') user(s) in Keycloak (try $_tries/24)..."
+      sleep 5
+    fi
+  done
+}
+
+# --- Gitea: scripted OIDC login (no browser) -------------------------------------------------
+#
+# Gitea accounts are OIDC-JIT-provisioned: they're created only the first time that user
+# completes a real SSO login, never proactively. The whole Authorization Code flow is plain HTTP
+# redirects + one Keycloak login-form POST + cookies (this lab's Keycloak has no MFA/CAPTCHA), so
+# it's fully scriptable with curl -- confirmed live 2026-08-28 for two real users. The one real
+# trap: curl's `-L` preserves POST across a redirect (HTTP semantics), but Gitea's OAuth callback
+# only accepts GET -- following the POST's Location automatically gets a silent 405 that LOOKS
+# like it worked (empty 0-byte body, no error). Do the POST and the callback GET as two separate
+# curl calls, never `-L` through both in one.
+
+# gitea_user_by_email <email> -- prints "id username" (space-separated) for an existing Gitea
+# user with this email, or nothing if none exists yet. Uses the Gitea CLI inside the pod (admin
+# user list), not the API -- no token needed, and this has to work before any token can exist.
+gitea_user_by_email() {
+  _email=$1
+  kubectl --context "$KIND_CTX" --request-timeout=15s exec -n gitea deploy/gitea -c gitea -- gitea admin user list 2>/dev/null \
+    | awk -v email="$_email" '$3 == email {print $1, $2}'
+}
+
+# gitea_oidc_login <email> <password> -- completes a real Keycloak SSO login against Gitea's
+# "otomi-idp" OAuth2 source. ALWAYS actually logs in, even if the account already exists --
+# confirmed live: Gitea's OIDC source is configured with --group-claim-name/--group-team-map
+# (apl-tasks' gitea-oidc.ts), so org/team membership is (re-)synced from the JWT's `groups`
+# claim on EVERY login, not just applied once at account creation. Skipping the login for an
+# already-existing account (tried first) leaves that account permanently stuck with whatever
+# org membership existed at its very first login -- which can be none at all, if that first
+# login happened before the team existed in Gitea's group-team-map. Prints the resulting Gitea
+# username either way.
+gitea_oidc_login() {
+  _email=$1
+  _password=$2
+
+  _jar=$(mktemp)
+  _s1_headers=$(mktemp)
+  _s1_body=$(mktemp)
+  curl -sk --max-time 15 -c "$_jar" -D "$_s1_headers" -o "$_s1_body" -L --max-redirs 5 \
+    "https://gitea.$DOMAIN/user/oauth2/otomi-idp"
+  _action_url=$(grep -o 'action="[^"]*"' "$_s1_body" | head -1 | sed 's/action="//; s/"$//; s/&amp;/\&/g')
+  [ -n "$_action_url" ] || { echo "error: no Keycloak login form found at Gitea's otomi-idp entrypoint" >&2; return 1; }
+
+  _s2_headers=$(mktemp)
+  curl -sk --max-time 15 -b "$_jar" -c "$_jar" -D "$_s2_headers" -o /dev/null \
+    --data-urlencode "username=$_email" --data-urlencode "password=$_password" --data-urlencode "credentialId=" \
+    -X POST "$_action_url"
+  _callback_url=$(grep -i '^location:' "$_s2_headers" | sed 's/^[Ll]ocation: //; s/\r$//')
+  [ -n "$_callback_url" ] || { echo "error: Keycloak login did not redirect -- check the password" >&2; return 1; }
+
+  # Fresh GET, deliberately not -L from the POST above -- see the header comment.
+  _s3_headers=$(mktemp)
+  curl -sk --max-time 15 -b "$_jar" -c "$_jar" -D "$_s3_headers" -o /dev/null -L --max-redirs 10 -X GET "$_callback_url"
+  rm -f "$_jar" "$_s1_headers" "$_s1_body" "$_s2_headers" "$_s3_headers"
+
+  _existing=$(gitea_user_by_email "$_email")
+  [ -n "$_existing" ] || { echo "error: Gitea account for $_email was not provisioned after OIDC login" >&2; return 1; }
+  printf '%s' "$_existing" | awk '{print $2}'
+}
+
+# gitea_mint_pat <username> <scopes-csv> -- mints a fresh Personal Access Token for an existing
+# Gitea user via the CLI (no login needed once the account exists), and prints it. Token names
+# must be unique per user in Gitea and can't be reused once consumed, so this always mints a
+# freshly-named one rather than trying to reuse/detect an old one -- cheap, and these are
+# lab-only automation tokens.
+gitea_mint_pat() {
+  _username=$1
+  _scopes=$2
+  _name="seed-$(mktemp -u XXXXXX)"
+  kubectl --context "$KIND_CTX" --request-timeout=15s exec -n gitea deploy/gitea -c gitea -- \
+    gitea admin user generate-access-token -u "$_username" -t "$_name" --scopes "$_scopes" --raw
+}
+
+# gitea_wait_for_org_permission <username> <org> <pat> <permission-field> -- safety-net check,
+# NOT the actual sync mechanism: gitea_oidc_login's login (via Gitea's --group-team-map OIDC
+# config) is what grants org membership, synchronously, at login time -- confirmed live, it's
+# already in place by the time this runs. This just guards against any residual propagation
+# delay: bounded 6 tries, 3s apart, ~18s cap. If this is still false after 18s, something is
+# actually wrong (e.g. the team doesn't exist yet in Gitea's group-team-map) -- not a matter of
+# waiting longer. <permission-field> is a key from GET .../orgs/{org}/permissions -- typically
+# "can_create_repository" for a team-admin (dev, mapped to the org's Owners team) or "can_read"
+# for a plain member (po/agent, who should never get create rights, only membership).
+gitea_wait_for_org_permission() {
+  _username=$1
+  _org=$2
+  _pat=$3
+  _field=$4
+  _tries=0
+  while [ "$_tries" -lt 6 ]; do
+    # `|| true` on the whole pipeline: this runs under the caller's `set -euo pipefail`, where a
+    # single transient curl/jq failure would otherwise abort the step instead of being retried by
+    # the very loop that exists to retry it.
+    _can=$(curl -sk --max-time 10 "https://gitea.$DOMAIN/api/v1/users/$_username/orgs/$_org/permissions" \
+      -H "Authorization: token $_pat" 2>/dev/null | jq -r --arg f "$_field" '.[$f] // false' 2>/dev/null || true)
+    [ "$_can" = "true" ] && return 0
+    _tries=$((_tries + 1))
+    echo "waiting for $_username to show $_field in Gitea org $_org (try $_tries/6)..."
+    sleep 3
+  done
+  echo "error: $_username never got $_field in Gitea org $_org within 18s" >&2
+  return 1
+}
+
+# gitea_ensure_team_credentials <team> [<team>...] -- make sure every named team namespace really
+# has the `gitea-credentials` Secret that apl-gitea-operator is supposed to put there, nudging the
+# operator at most once if it doesn't.
+#
+# WHY THIS EXISTS -- an upstream bug in linode/apl-tasks, not something wrong in this repo.
+# Confirmed live 2026-08-29 with three brand-new teams (red/yellow/purple), exact timeline from
+# `kubectl get ... -o custom-columns=...CREATED` and the operator's own --timestamps log:
+#
+#   01:35:36  namespace team-red created (ArgoCD, team-ns chart)
+#   01:35:41  apl-gitea-operator: "Replacing secret for gitea-credentials in namespace team-red"
+#             -> HTTP 403 "...cannot update resource \"secrets\"... in the namespace \"team-red\""
+#   01:35:49  Role/RoleBinding apl-gitea-operator-service-account{,-binding} created in team-red
+#             (charts/team-ns/templates/rbac.yaml -- EIGHT SECONDS AFTER the operator needed them)
+#
+# So the operator raced its own RBAC grant. That alone would be survivable; what makes it fatal is
+# what the operator does next -- nothing, forever:
+#
+#   * apl-tasks' `setUserSecret` (dist/src/operators/gitea/lib/managers/gitea-users.js, read
+#     straight out of the running linode/apl-tasks:main image) has a retry path for exactly ONE
+#     error code -- 404, "secret doesn't exist yet, create it instead". Every other error, 403
+#     included, falls through to a bare `console.error(...)` and `return password`. It is not
+#     rethrown, and it is not pushed onto the `errors` array `setupGitea` checks -- so the very
+#     same run still logs "Success! Gitea setup/reconfiguration completed".
+#   * `setupGitea` is purely event-driven. It runs only from `secretsAndConfigmapsCallback`, on an
+#     Added/Modified watch event for `apl-gitea-operator-cm` / `apl-gitea-operator-secret` in the
+#     operator's own namespace. The only periodic timer in the whole operator is the 30s Gitea
+#     OIDC-config check, which does not touch team secrets. Adding a team fires the configmap
+#     watch once; if that one pass 403s, nothing ever fires it again.
+#
+# Measured: team-red sat with no secret for ~9 minutes (01:35:41 -> 01:44:27) with the operator
+# alive and logging its OIDC check every 30s the whole time. It does NOT self-heal.
+#
+# Downstream symptom, which is how this was found: the git-clone Task's `fetch-source` pod for the
+# team's first build sits at Init:0/2 forever with
+#   Warning FailedMount ... MountVolume.SetUp failed for volume "ws-xxxxx": secret
+#   "gitea-credentials" not found
+# and seed:apps' PipelineRun wait times out -- for new teams only. Teams created on an earlier pass
+# are unaffected, which is what makes this look like a SEED_TEAMS parameterization bug and isn't.
+#
+# THE NUDGE. On startup the operator's watches replay Added events for the existing cm/secret, so
+# `setupGitea` runs again -- and `createUsers` regenerates and rewrites `gitea-credentials` for
+# EVERY team org unconditionally, not just missing ones. So restarting the operator heals every
+# stuck team in one pass. Verified live: deleting the pod at 01:44:2x produced
+# gitea-credentials in team-red, team-yellow AND team-purple all stamped 01:44:27Z.
+#
+# Deleting the POD, never `rollout restart` and never a patch: this is asking a controller to
+# re-run its own reconcile loop, which CLAUDE.md rule 6 is not about. `rollout restart` would stamp
+# `kubectl.kubernetes.io/restartedAt` onto the Deployment's pod template -- a real spec diff that
+# ArgoCD's selfHeal would fight. A plain pod delete changes no spec at all; the Deployment's own
+# ReplicaSet recreates it, and ArgoCD has nothing to revert.
+#
+# Bounded and at most one nudge per call (CLAUDE.md rule 1), and idempotent: on an already-healthy
+# cluster phase 1 returns on its first poll and nothing is restarted.
+gitea_ensure_team_credentials() {
+  set -euo pipefail
+  _gtc_teams="$*"
+
+  # Prints the teams still missing the secret, space-separated (empty == all present).
+  _gtc_missing() {
+    _out=""
+    for _t in $_gtc_teams; do
+      kubectl --context "$KIND_CTX" --request-timeout=15s get secret gitea-credentials \
+        -n "team-$_t" -o name >/dev/null 2>&1 || _out="$_out$_t "
+    done
+    printf '%s' "$_out"
+  }
+
+  # Phase 1 -- just wait. On a healthy run the operator has already written these (green/blue got
+  # theirs within seconds of the namespace existing) and this returns on the first poll. 60s, not
+  # longer: when it works at all it works within ~5s of the namespace existing, so this is already
+  # 12x the observed latency, and every second past that is dead time on every new-team run.
+  _tries=0
+  while [ "$_tries" -lt 6 ]; do
+    _miss=$(_gtc_missing)
+    [ -z "$_miss" ] && { echo "gitea-credentials present in every team namespace: $_gtc_teams"; return 0; }
+    _tries=$((_tries + 1))
+    echo "waiting for apl-gitea-operator to write gitea-credentials for: $_miss(try $_tries/6)..."
+    sleep 10
+  done
+
+  # Phase 2 -- still missing after 60s. Before nudging, confirm the RBAC grant the operator needs
+  # has actually landed in each missing namespace. Restarting while the RoleBinding is still absent
+  # would just reproduce the same 403 and waste the one nudge this function allows itself.
+  _tries=0
+  while [ "$_tries" -lt 12 ]; do
+    _rbac_ok=true
+    for _t in $_miss; do
+      kubectl --context "$KIND_CTX" --request-timeout=15s get rolebinding \
+        apl-gitea-operator-service-account-binding -n "team-$_t" -o name >/dev/null 2>&1 || _rbac_ok=false
+    done
+    [ "$_rbac_ok" = "true" ] && break
+    _tries=$((_tries + 1))
+    echo "waiting for apl-gitea-operator-service-account-binding in: $_miss(try $_tries/12)..."
+    sleep 10
+  done
+  [ "$_rbac_ok" = "true" ] || {
+    echo "error: apl-gitea-operator-service-account-binding never appeared in team-ns for: $_miss" >&2
+    echo "       (that RoleBinding is charts/team-ns/templates/rbac.yaml -- if it is missing after" >&2
+    echo "        4 minutes the team's ArgoCD Application itself is not syncing; this is NOT the" >&2
+    echo "        403 race this function works around)" >&2
+    return 1
+  }
+
+  echo "nudging apl-gitea-operator: RBAC is in place but gitea-credentials is still missing for: $_miss"
+  echo "(upstream linode/apl-tasks swallows the 403 it hit before that RBAC landed and never retries"
+  echo " -- restarting its pod replays the configmap watch and rewrites the secret for every team)"
+  kubectl --context "$KIND_CTX" --request-timeout=30s delete pod -n apl-gitea-operator \
+    -l app.kubernetes.io/name=apl-gitea-operator
+
+  # Phase 3 -- poll again. The restart also re-waits for Gitea availability before its watches
+  # start, so allow the same 120s rather than expecting it within seconds.
+  _tries=0
+  while [ "$_tries" -lt 12 ]; do
+    _miss=$(_gtc_missing)
+    [ -z "$_miss" ] && { echo "gitea-credentials written after the nudge for every team: $_gtc_teams"; return 0; }
+    _tries=$((_tries + 1))
+    echo "waiting for gitea-credentials after the operator nudge for: $_miss(try $_tries/12)..."
+    sleep 10
+  done
+
+  echo "error: gitea-credentials still missing after a bounded operator restart for: $_miss" >&2
+  echo "       check 'kubectl logs -n apl-gitea-operator deploy/apl-gitea-operator | grep gitea-credentials'" >&2
+  return 1
+}
+
+# --- Harbor -----------------------------------------------------------------------------------
+
+# harbor_ensure_project <project> -- creates a public Harbor project if it doesn't already exist.
+harbor_ensure_project() {
+  _project=$1
+  _http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+    -X POST "https://harbor.$DOMAIN/api/v2.0/projects" -H "Content-Type: application/json" \
+    -d "{\"project_name\":\"$_project\",\"public\":true}")
+  case "$_http" in
+    201) echo "created Harbor project '$_project'" ;;
+    409) echo "Harbor project '$_project' already exists" ;;
+    *) echo "error: Harbor project creation for '$_project' returned HTTP $_http" >&2; return 1 ;;
+  esac
+}
+
+# harbor_mirror <source-image> <dest-repo:tag> -- mirrors a public image into Harbor from the
+# HOST's network (pods can't reach the public internet -- see POD-EGRESS-INVESTIGATION.md; the
+# host can). Idempotent: skopeo copy overwrites the same tag either way.
+harbor_mirror() {
+  _source=$1
+  _dest=$2
+  # Bounded (CLAUDE.md rule 1): this pulls from the public internet, and a stalled registry
+  # connection inside the container is exactly the kind of thing that hangs forever otherwise --
+  # skopeo has no default timeout of its own.
+  timeout 300 docker run --rm --network host quay.io/skopeo/stable:latest \
+    copy --dest-tls-verify=false --dest-creds "admin:$HARBOR_ADMIN_PASSWORD" \
+    "docker://$_source" "docker://harbor.$DOMAIN/$_dest"
+}
+
+# --- apl-api: create-if-missing ---------------------------------------------------------------
+
+# apl_create_if_missing <get_url> <post_url> <token> <body> <label> -- unlike /v2/teams (which
+# upserts cleanly on a repeat POST), coderepos/builds/workloads/services all 409 on a repeat POST
+# -- confirmed live 2026-08-28 for all four. GETs <get_url> first; only POSTs if that 404s.
+#
+# Confirmed live 2026-08-29: a transient connection failure (node under real load from concurrent
+# Tekton builds) makes curl's `%{http_code}` come back EMPTY rather than a real status -- `-s`
+# suppresses curl's own error text, so there is no diagnostic at all. The numeric comparison
+# `[ "$_post_http" -ge 300 ]` against that empty string is not just false, it is a shell error
+# ("integer expression expected") -- which an `if` condition swallows as "false" rather than
+# propagating, so the function fell through to `rm -f`/implicit success, having created NOTHING,
+# with zero output anywhere. This is what silently broke a workload/service creation deep inside
+# a 9-team rollout with nothing in the log to explain it. Every HTTP-code variable is now
+# validated as exactly 3 digits before being compared or trusted.
+apl_create_if_missing() {
+  _get_url=$1
+  _post_url=$2
+  _token=$3
+  _body=$4
+  _label=$5
+  _get_http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "$_get_url" -H "Authorization: Bearer $_token")
+  case "$_get_http" in
+    [0-9][0-9][0-9]) ;;
+    *) echo "error: checking whether $_label exists got no valid HTTP status back (curl said: '$_get_http') -- likely a transient connection failure" >&2; return 1 ;;
+  esac
+  if [ "$_get_http" = "200" ]; then
+    echo "$_label already exists -- skipping create"
+    return 0
+  fi
+  _out=$(mktemp)
+  _post_http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X POST "$_post_url" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" -d "$_body")
+  case "$_post_http" in
+    [0-9][0-9][0-9]) ;;
+    *) echo "error: creating $_label got no valid HTTP status back (curl said: '$_post_http') -- likely a transient connection failure" >&2; rm -f "$_out"; return 1 ;;
+  esac
+  if [ "$_post_http" -ge 300 ]; then
+    echo "error: creating $_label returned HTTP $_post_http: $(cat "$_out")" >&2
+    rm -f "$_out"
+    return 1
+  fi
+  rm -f "$_out"
+}
+
+# --- Gitea: repo content ----------------------------------------------------------------------
+
+# gitea_create_org_repo <org> <repo> <pat> -- creates a private repo under a team's Gitea org,
+# auto-initialized (gets a main branch immediately, needed before anything can be pushed to it).
+# Idempotent: an already-existing repo (409/422) is treated as success, not an error.
+gitea_create_org_repo() {
+  _org=$1
+  _repo=$2
+  _pat=$3
+  _out=$(mktemp)
+  _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X POST "https://gitea.$DOMAIN/api/v1/org/$_org/repos" \
+    -H "Authorization: token $_pat" -H "Content-Type: application/json" \
+    -d "{\"name\":\"$_repo\",\"private\":true,\"auto_init\":true}")
+  case "$_http" in
+    201) echo "created Gitea repo $_org/$_repo" ;;
+    409 | 422) echo "Gitea repo $_org/$_repo already exists" ;;
+    *) echo "error: creating Gitea repo $_org/$_repo returned HTTP $_http: $(cat "$_out")" >&2; rm -f "$_out"; return 1 ;;
+  esac
+  rm -f "$_out"
+}
+
+# gitea_put_file <org> <repo> <path> <content> <pat> <message> -- creates or updates a file on
+# main. Looks up the current sha first (GET) to decide POST (create) vs PUT (update, needs the
+# prior sha) -- Gitea's contents API requires this to avoid a 409/422 add-conflict on a rerun.
+gitea_put_file() {
+  _org=$1
+  _repo=$2
+  _path=$3
+  _content=$4
+  _pat=$5
+  _message=$6
+  _b64=$(printf '%s' "$_content" | base64 -w0)
+  _sha=$(curl -sk --max-time 15 "https://gitea.$DOMAIN/api/v1/repos/$_org/$_repo/contents/$_path" \
+    -H "Authorization: token $_pat" | jq -r '.sha // empty')
+  _method=POST
+  _body=$(jq -n --arg content "$_b64" --arg msg "$_message" '{content: $content, message: $msg, branch: "main"}')
+  if [ -n "$_sha" ]; then
+    _method=PUT
+    _body=$(jq -n --arg content "$_b64" --arg msg "$_message" --arg sha "$_sha" \
+      '{content: $content, message: $msg, branch: "main", sha: $sha}')
+  fi
+  _out=$(mktemp)
+  _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X "$_method" "https://gitea.$DOMAIN/api/v1/repos/$_org/$_repo/contents/$_path" \
+    -H "Authorization: token $_pat" -H "Content-Type: application/json" -d "$_body")
+  if [ "$_http" -ge 300 ]; then
+    echo "error: writing $_org/$_repo:$_path returned HTTP $_http: $(cat "$_out")" >&2
+    rm -f "$_out"
+    return 1
+  fi
+  rm -f "$_out"
+}
+
+# --- Vikunja: OIDC claim-driven team sync -------------------------------------------------------
+#
+# Vikunja team membership comes from a Keycloak group attribute (`vikunja_groups`), read via a
+# protocol mapper on the shared "otomi" client, aggregated from the user's groups -- NOT from us
+# calling Vikunja's own team/team-member API. Confirmed live 2026-08-28: this is exactly the
+# claim-driven mechanism `VIKUNJA.md` Appendix B recorded as "rejected" for the removed
+# continuously-reconciling operator (rejected there because it's pull-not-push and mutually
+# exclusive with API-managed membership -- neither concern applies to a one-shot seed script).
+# Once the mapper + group attribute are in place, EVERY login (see vikunja_oidc_login) both
+# creates the user's Vikunja account (if new) and syncs them into the team.
+
+# keycloak_ensure_vikunja_group_mapper -- idempotent. Adds a group-attribute-aggregating
+# oidc-usermodel-attribute-mapper named "vikunja-groups" to the "otomi" client (whose
+# Keycloak-internal id is literally the string "otomi", confirmed live -- not a generated UUID,
+# no lookup needed). Must use the dedicated protocol-mappers POST endpoint, not a PUT on the
+# whole client/client-scope -- confirmed (via VIKUNJA.md's prior work) that PUT silently ignores
+# nested protocolMappers changes on an already-existing scope like this one.
+keycloak_ensure_vikunja_group_mapper() {
+  _token=$(kc_master_token) || return 1
+  _existing=$(curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/admin/realms/otomi/clients/otomi/protocol-mappers/models" \
+    -H "Authorization: Bearer $_token" | jq -r '.[] | select(.name=="vikunja-groups") | .name')
+  if [ -n "$_existing" ]; then
+    echo "vikunja-groups protocol mapper already exists on the otomi client"
+    return 0
+  fi
+  curl -sk --max-time 15 -f -X POST "https://keycloak.$DOMAIN/admin/realms/otomi/clients/otomi/protocol-mappers/models" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" \
+    -d '{
+      "name": "vikunja-groups",
+      "protocol": "openid-connect",
+      "protocolMapper": "oidc-usermodel-attribute-mapper",
+      "config": {
+        "user.attribute": "vikunja_groups",
+        "claim.name": "vikunja_groups",
+        "jsonType.label": "JSON",
+        "multivalued": "true",
+        "aggregate.attrs": "true",
+        "userinfo.token.claim": "true",
+        "id.token.claim": "true",
+        "access.token.claim": "true"
+      }
+    }' > /dev/null
+  echo "added vikunja-groups protocol mapper to the otomi client"
+}
+
+# keycloak_stamp_team_vikunja_group <team> <display-name> -- idempotent. Merges a vikunja_groups
+# attribute onto the "team-<team>" Keycloak group (GET the group first to avoid clobbering its
+# other fields/attributes). external_id "kc-team-<team>" is what Vikunja's own claim-sync uses
+# as the team's stable identity across logins -- used later to look the team up by id, not name
+# (Vikunja appends "(otomi-idp)" to the display name itself, so name-matching is fragile).
+keycloak_stamp_team_vikunja_group() {
+  _team=$1
+  _display_name=$2
+  _token=$(kc_master_token) || return 1
+  _group_id=$(curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/admin/realms/otomi/groups?search=team-$_team" \
+    -H "Authorization: Bearer $_token" | jq -er --arg name "team-$_team" '.[] | select(.name==$name) | .id')
+  [ -n "$_group_id" ] || { echo "error: no Keycloak group named team-$_team" >&2; return 1; }
+
+  _group=$(curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/admin/realms/otomi/groups/$_group_id" \
+    -H "Authorization: Bearer $_token")
+  _current=$(printf '%s' "$_group" | jq -r '.attributes.vikunja_groups[0] // empty')
+  _expected=$(jq -nc --arg name "$_display_name" --arg oidc "kc-team-$_team" '{name: $name, oidcID: $oidc}')
+  if [ "$_current" = "$_expected" ]; then
+    echo "team-$_team's Keycloak group already stamped with the matching vikunja_groups attribute"
+    return 0
+  fi
+
+  _updated=$(printf '%s' "$_group" | jq --arg v "$_expected" '.attributes = ((.attributes // {}) + {vikunja_groups: [$v]})')
+  curl -sk --max-time 15 -f -X PUT "https://keycloak.$DOMAIN/admin/realms/otomi/groups/$_group_id" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" -d "$_updated" > /dev/null
+  echo "stamped team-$_team's Keycloak group with vikunja_groups=$_expected"
+}
+
+# --- Vikunja: rate-limit pacing ---------------------------------------------------------------
+#
+# Vikunja hardcodes a 10-requests-per-minute-PER-IP limit on its unauthenticated routes -- the
+# OIDC callback included -- as anti-account-enumeration protection. It is not configurable: no
+# ratelimit.enabled=false or any other setting touches it (confirmed by Vikunja's own
+# maintainers, community.vikunja.io/t/impossible-to-switch-off-the-rate-limits/3873).
+#
+# Worse, "per IP" collapses to a single shared bucket here: every one of these curl calls reaches
+# Vikunja through the Istio mesh as the SAME source IP (127.0.0.6, Envoy's fixed sidecar-loopback
+# address -- general Istio behaviour, not specific to this cluster), so all six demo users share
+# ONE budget no matter who is logging in or which team they belong to. Per-user or per-team
+# spacing therefore cannot work on its own; the budget has to be tracked for the whole run.
+#
+# Vikunja does answer with X-RateLimit-Limit / X-RateLimit-Remaining / X-RateLimit-Reset on every
+# response, the 200s as well as the 429s (confirmed live 2026-08-29). That is the server's own
+# accounting, so honouring it is exact -- no fixed sleeps that are either too short (and re-trip
+# the same still-open window) or needlessly slow. The state is kept in a file, not a variable,
+# because each `task:` cmds: entry is a separate shell and each apl_run body is a subshell.
+_vikunja_rl_file() { printf '%s/seed_vikunja_ratelimit' "${APL_STATE_DIR:-.taskfiles/state}"; }
+
+# _vikunja_rl_record <headers-file> -- persists the budget Vikunja just reported. Silently does
+# nothing if the headers aren't there (a future Vikunja could drop them; _vikunja_rl_wait then
+# simply has nothing to act on and the reactive 429 backoff still covers us).
+_vikunja_rl_record() {
+  _rl_rem=$(grep -i '^x-ratelimit-remaining:' "$1" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+  _rl_reset=$(grep -i '^x-ratelimit-reset:' "$1" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+  case "${_rl_rem:-}" in '' | *[!0-9]*) return 0 ;; esac
+  case "${_rl_reset:-}" in '' | *[!0-9]*) return 0 ;; esac
+  mkdir -p "${APL_STATE_DIR:-.taskfiles/state}"
+  printf '%s %s\n' "$_rl_rem" "$_rl_reset" > "$(_vikunja_rl_file)"
+}
+
+# _vikunja_rl_wait -- blocks until the current rate-limit window has room to spare, based on what
+# Vikunja itself last reported. Bounded by construction: the window is 60s, and the sleep is
+# clamped to 70s so a skewed clock can never turn this into an unbounded wait (CLAUDE.md rule 1).
+#
+# MUST be called BEFORE the OIDC dance starts, never between obtaining the authorization code and
+# redeeming it: this realm's accessCodeLifespan is 60s (confirmed live), so a rate-limit sleep
+# placed after the code was issued would expire it and turn a rate-limit problem into Keycloak
+# rejecting the exchange with invalid_grant "Code not valid".
+_vikunja_rl_wait() {
+  _rl_f=$(_vikunja_rl_file)
+  [ -f "$_rl_f" ] || return 0
+  _rl_rem=''
+  _rl_reset=''
+  read -r _rl_rem _rl_reset < "$_rl_f" || true
+  case "${_rl_rem:-}" in '' | *[!0-9]*) return 0 ;; esac
+  case "${_rl_reset:-}" in '' | *[!0-9]*) return 0 ;; esac
+  _rl_now=$(date +%s)
+  if [ "$_rl_reset" -le "$_rl_now" ]; then
+    rm -f "$_rl_f"
+    return 0
+  fi
+  # One full login is one request against this budget, but a retry is another -- keep enough
+  # headroom that the caller's own retry loop still has somewhere to go.
+  if [ "$_rl_rem" -gt "${VIKUNJA_RL_HEADROOM:-2}" ]; then
+    return 0
+  fi
+  _rl_sleep=$((_rl_reset - _rl_now + 2))
+  if [ "$_rl_sleep" -gt 70 ]; then _rl_sleep=70; fi
+  echo "vikunja rate-limit budget nearly spent ($_rl_rem of 10 left in this window) -- waiting ${_rl_sleep}s for it to reset before logging in" >&2
+  sleep "$_rl_sleep"
+  rm -f "$_rl_f"
+}
+
+# --- Vikunja: token cache ---------------------------------------------------------------------
+#
+# Every OIDC login costs one request against the shared budget above, and Vikunja's own JWT is
+# good for 10 minutes. Caching it means a rerun of an already-provisioned team spends nothing.
+_vikunja_token_cache_file() {
+  printf '%s/seed_vikunja_token_%s' "${APL_STATE_DIR:-.taskfiles/state}" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+# vikunja_cache_token <email> <token> -- stores a freshly obtained token for reuse.
+vikunja_cache_token() {
+  mkdir -p "${APL_STATE_DIR:-.taskfiles/state}"
+  _vc_file=$(_vikunja_token_cache_file "$1")
+  printf '%s' "$2" > "$_vc_file"
+  chmod 600 "$_vc_file"
+}
+
+# _vikunja_token_still_valid <token> -- 0 if the JWT's own exp is more than 120s away. Decodes the
+# payload locally rather than asking Vikunja, so the check itself costs no request. base64url, not
+# base64: the - and _ have to be translated back and the padding restored, or `base64 -d` fails.
+_vikunja_token_still_valid() {
+  _vt_payload=$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')
+  case $((${#_vt_payload} % 4)) in
+    2) _vt_payload="$_vt_payload==" ;;
+    3) _vt_payload="$_vt_payload=" ;;
+  esac
+  _vt_exp=$(printf '%s' "$_vt_payload" | base64 -d 2>/dev/null | jq -r '.exp // empty' 2>/dev/null || true)
+  case "${_vt_exp:-}" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$_vt_exp" -gt "$(($(date +%s) + 120))" ]
+}
+
+# vikunja_login <email> <password> -- vikunja_oidc_login, but reuses a cached still-valid JWT.
+#
+# Use this wherever the token itself is what's wanted. Use vikunja_oidc_login directly when the
+# LOGIN is what's wanted -- the claim-driven team sync only happens during a real login, so a
+# cached token proves nothing about current team membership (see seed.yml's setup_team_vikunja,
+# which checks membership explicitly and only then decides whether a real login is needed).
+vikunja_login() {
+  _vl_email=$1
+  _vl_password=$2
+  _vl_file=$(_vikunja_token_cache_file "$_vl_email")
+  if [ -f "$_vl_file" ]; then
+    _vl_token=$(cat "$_vl_file")
+    if [ -n "$_vl_token" ] && _vikunja_token_still_valid "$_vl_token"; then
+      echo "reusing the cached Vikunja token for $_vl_email (still valid -- no login, no rate-limit budget spent)" >&2
+      printf '%s' "$_vl_token"
+      return 0
+    fi
+  fi
+  _vl_token=$(vikunja_oidc_login "$_vl_email" "$_vl_password") || return 1
+  vikunja_cache_token "$_vl_email" "$_vl_token"
+  printf '%s' "$_vl_token"
+}
+
+# vikunja_team_members <token> <team_id> -- prints one member username per line (usernames are the
+# email addresses here, since that's what the OIDC provider hands Vikunja). Empty on any failure;
+# the caller decides what an empty list means. Note GET /teams/<id> answers 200 with an all-null
+# body for a team the caller can't see, so "no members" and "no such team" look alike -- always
+# resolve the id with vikunja_team_id_by_external_id first.
+vikunja_team_members() {
+  curl -sk --max-time 15 "https://vikunja.$DOMAIN/api/v1/teams/$2" -H "Authorization: Bearer $1" 2>/dev/null \
+    | jq -r '.members[]?.username // empty' 2>/dev/null || true
+}
+
+# vikunja_oidc_login <email> <password> -- completes a real Keycloak SSO login against Vikunja's
+# "otomi" OIDC provider and returns a bearer JWT directly (unlike Gitea, Vikunja's own callback
+# hands the token back in the response body -- no session-cookie/PAT dance needed). Confirmed
+# live 2026-08-28. ALWAYS actually logs in (no existing-account short-circuit): this is also what
+# re-syncs claim-driven team membership on every call, same reasoning as gitea_oidc_login.
+#
+# Three legs, not two like Gitea's: (1) GET Keycloak's /auth with redirect_uri set to VIKUNJA'S
+# FRONTEND route (https://vikunja.$DOMAIN/auth/openid/otomi -- a SPA route, not an API path;
+# "otomi" is the config-map key for the provider, not its display name "otomi-idp"), scrape the
+# login form action; (2) POST credentials, capture the redirect Location WITHOUT following it --
+# the code is in its query string; (3) POST that code to Vikunja's own callback API, which
+# returns {"token": "<jwt>"}.
+vikunja_oidc_login() {
+  _email=$1
+  _password=$2
+  # Wraps _once with up to 3 tries. Originally chalked up to transient load (isolated
+  # single-user/single-team runs never reproduced it; it only showed up processing multiple
+  # teams back to back) -- confirmed live 2026-08-29 it's actually deterministic: Vikunja's own
+  # per-IP rate limiter, tripped because every login (any user, any team) reaches it through the
+  # mesh as the same source IP. _vikunja_oidc_login_once itself now detects the 429 and sleeps
+  # before returning, so this loop's retries land after the window has had a chance to clear
+  # rather than re-hitting it instantly. Each retry gets a FRESH code (the whole 3-leg dance
+  # re-runs), so it's not just re-trying an already-invalid code.
+  _tries=0
+  while [ "$_tries" -lt 3 ]; do
+    _tries=$((_tries + 1))
+    _token=$(_vikunja_oidc_login_once "$_email" "$_password") && [ -n "$_token" ] && { printf '%s' "$_token"; return 0; }
+    if [ "$_tries" -lt 3 ]; then
+      # Never retry back to back. This realm has bruteForceProtected=true with
+      # quickLoginCheckMilliSeconds=1000 / minimumQuickLoginWaitSeconds=60 (confirmed live), so
+      # repeated sub-second login attempts for the SAME user are exactly what Keycloak is built
+      # to treat as a bot and answer with a 60s temporary lockout -- turning one recoverable
+      # failure into three guaranteed ones. _vikunja_oidc_login_once already sleeps out a full
+      # rate-limit window when Vikunja is the thing refusing; this covers everything else.
+      echo "vikunja login for $_email did not return a token (attempt $_tries/3) -- waiting 3s before retrying" >&2
+      sleep 3
+    fi
+  done
+  echo "error: vikunja login for $_email failed after 3 tries -- the reason for each attempt is logged above" >&2
+  return 1
+}
+
+_vikunja_oidc_login_once() {
+  _email=$1
+  _password=$2
+  _redirect=$(printf '%s' "https://vikunja.$DOMAIN/auth/openid/otomi" | jq -sRr @uri)
+  _scope=$(printf '%s' "openid email profile" | jq -sRr @uri)
+
+  # Before leg 1, deliberately -- never between leg 2 and leg 3. See _vikunja_rl_wait: the
+  # authorization code this dance is about to obtain is only valid for accessCodeLifespan (60s
+  # in this realm), so waiting out a rate-limit window mid-dance would expire it.
+  _vikunja_rl_wait
+
+  _jar=$(mktemp)
+  _s1_body=$(mktemp)
+  _s2_headers=$(mktemp)
+  _s2_body=$(mktemp)
+  _cb_headers=$(mktemp)
+  _cb_body=$(mktemp)
+
+  curl -sk --max-time 15 -c "$_jar" -o "$_s1_body" -L --max-redirs 5 \
+    "https://keycloak.$DOMAIN/realms/otomi/protocol/openid-connect/auth?client_id=otomi&redirect_uri=$_redirect&response_type=code&scope=$_scope&state=seed"
+  _action_url=$(grep -o 'action="[^"]*"' "$_s1_body" | head -1 | sed 's/action="//; s/"$//; s/&amp;/\&/g' || true)
+  if [ -z "$_action_url" ]; then
+    # Diagnose, don't just fail: every failure path here prints what actually came back. A bare
+    # "did not return a token" is what made this step's earlier failures unreadable.
+    echo "error [$_email]: no Keycloak login form at Vikunja's otomi entrypoint -- first 400 bytes of the response instead:" >&2
+    head -c 400 "$_s1_body" >&2
+    echo >&2
+    rm -f "$_jar" "$_s1_body" "$_s2_headers" "$_s2_body" "$_cb_headers" "$_cb_body"
+    return 1
+  fi
+
+  curl -sk --max-time 15 -b "$_jar" -c "$_jar" -D "$_s2_headers" -o "$_s2_body" \
+    --data-urlencode "username=$_email" --data-urlencode "password=$_password" --data-urlencode "credentialId=" \
+    -X POST "$_action_url"
+  _location=$(grep -i '^location:' "$_s2_headers" | tail -1 | sed 's/^[Ll]ocation: //; s/\r$//' || true)
+  if [ -z "$_location" ]; then
+    # A 200 here means Keycloak re-rendered the login page: wrong password, a pending required
+    # action, or a brute-force lockout (this realm has bruteForceProtected=true). Its own
+    # feedback text says which -- print it rather than guessing.
+    echo "error [$_email]: Keycloak did not redirect after the login POST ($(grep -i '^HTTP/' "$_s2_headers" | tail -1 | tr -d '\r'))." >&2
+    echo "  Keycloak's own message: $(grep -oiE '(kc-feedback-text|input-error[a-z-]*)"[^>]*>[^<]+' "$_s2_body" | sed 's/.*>//' | head -3 | tr '\n' ' ')" >&2
+    rm -f "$_jar" "$_s1_body" "$_s2_headers" "$_s2_body" "$_cb_headers" "$_cb_body"
+    return 1
+  fi
+  # Anchored on [?&]code= on purpose: an unanchored (?<=code=) also matches the session_code= of
+  # a Keycloak login-actions URL, which would send Keycloak's own session code to Vikunja as if
+  # it were an authorization code and come back as invalid_grant "Code not valid".
+  _code=$(printf '%s' "$_location" | grep -oP '(?<=[?&]code=)[^&]+' | head -1 || true)
+  if [ -z "$_code" ]; then
+    echo "error [$_email]: no code= parameter in Keycloak's redirect: $_location" >&2
+    rm -f "$_jar" "$_s1_body" "$_s2_headers" "$_s2_body" "$_cb_headers" "$_cb_body"
+    return 1
+  fi
+
+  # Headers and body to separate files with -w '%{http_code}' on stdout: the status is then the
+  # only thing on stdout, with no tail/sed splitting of a combined stream to get it wrong, and
+  # the X-RateLimit-* headers stay readable (see _vikunja_rl_record). NOT -f, because a 429 and a
+  # 400 both need their body inspected, not collapsed into a bare nonzero exit.
+  _cb_status=$(curl -sk --max-time 15 -D "$_cb_headers" -o "$_cb_body" -w '%{http_code}' \
+    -X POST "https://vikunja.$DOMAIN/api/v1/auth/openid/otomi/callback" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg code "$_code" --arg redirect "https://vikunja.$DOMAIN/auth/openid/otomi" '{code: $code, redirect_url: $redirect}')")
+  _vikunja_rl_record "$_cb_headers"
+  _cb_rl=$(grep -i '^x-ratelimit-remaining:' "$_cb_headers" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+
+  if [ "$_cb_status" = "429" ]; then
+    # Back off to the reset instant Vikunja itself reported, not a guessed fixed sleep. Clamped
+    # to 70s (the window is 60s) so a bad clock can't produce an unbounded wait.
+    _cb_reset=$(grep -i '^x-ratelimit-reset:' "$_cb_headers" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+    _cb_sleep=65
+    case "${_cb_reset:-}" in
+      '' | *[!0-9]*) : ;;
+      *) _cb_sleep=$((_cb_reset - $(date +%s) + 2)) ;;
+    esac
+    if [ "$_cb_sleep" -lt 2 ]; then _cb_sleep=2; fi
+    if [ "$_cb_sleep" -gt 70 ]; then _cb_sleep=70; fi
+    echo "error [$_email]: vikunja OIDC callback rate-limited (429) -- waiting ${_cb_sleep}s for the window to reset before this attempt is retried" >&2
+    rm -f "$_jar" "$_s1_body" "$_s2_headers" "$_s2_body" "$_cb_headers" "$_cb_body"
+    sleep "$_cb_sleep"
+    return 1
+  fi
+  if [ "$_cb_status" != "200" ]; then
+    echo "error [$_email]: vikunja OIDC callback returned HTTP $_cb_status (rate-limit budget left: ${_cb_rl:-unknown}): $(head -c 400 "$_cb_body")" >&2
+    rm -f "$_jar" "$_s1_body" "$_s2_headers" "$_s2_body" "$_cb_headers" "$_cb_body"
+    return 1
+  fi
+  _cb_token=$(jq -r '.token // empty' "$_cb_body" 2>/dev/null || true)
+  if [ -z "$_cb_token" ]; then
+    echo "error [$_email]: vikunja OIDC callback returned HTTP 200 but no .token: $(head -c 400 "$_cb_body")" >&2
+    rm -f "$_jar" "$_s1_body" "$_s2_headers" "$_s2_body" "$_cb_headers" "$_cb_body"
+    return 1
+  fi
+  rm -f "$_jar" "$_s1_body" "$_s2_headers" "$_s2_body" "$_cb_headers" "$_cb_body"
+  printf '%s' "$_cb_token"
+}
+
+# vikunja_team_id_by_external_id <token> <external_id> -- prints the Vikunja team id whose
+# external_id matches (set by keycloak_stamp_team_vikunja_group's oidcID), or nothing if the
+# claim-sync hasn't created it yet. Matching on external_id, not name/title -- Vikunja appends
+# "(otomi-idp)" to the display name itself, so name-matching is fragile.
+#
+# "Not found" is a NORMAL, zero-exit outcome here (empty output), not an error -- this used to be
+# `jq -er`, which exits 4 when its filter produces nothing. Callers run under `set -euo pipefail`
+# and assign this in a command substitution, so that nonzero status aborted the whole step
+# instantly and silently: their own `[ -n "$_id" ] || echo "error: ..."` line could never run.
+# Same trap, same fix, in vikunja_create_project_if_missing below.
+vikunja_team_id_by_external_id() {
+  _token=$1
+  _external_id=$2
+  curl -sk --max-time 15 "https://vikunja.$DOMAIN/api/v1/teams" -H "Authorization: Bearer $_token" 2>/dev/null \
+    | jq -r --arg eid "$_external_id" '[.[]? | select(.external_id==$eid) | .id] | first // empty' 2>/dev/null || true
+}
+
+# vikunja_create_project_if_missing <token> <title> <description> -- creates a project as
+# whichever user <token> belongs to (so ownership lands on that user), idempotent by title.
+#
+# `jq -r ... | first // empty`, never `jq -er`: see vikunja_team_id_by_external_id's note. With
+# `-er`, the not-yet-created case -- the ONLY case in which this function has any work to do --
+# exited 4 and, under the caller's `set -euo pipefail`, aborted the whole step before the create
+# below could ever run. Confirmed live: a team could end up with its Vikunja team and all its
+# members synced but no project at all, and nothing in the log said why.
+vikunja_create_project_if_missing() {
+  _token=$1
+  _title=$2
+  _description=$3
+  _existing=$(curl -sk --max-time 15 "https://vikunja.$DOMAIN/api/v1/projects" -H "Authorization: Bearer $_token" 2>/dev/null \
+    | jq -r --arg t "$_title" '[.[]? | select(.title==$t) | .id] | first // empty' 2>/dev/null || true)
+  if [ -n "$_existing" ]; then
+    echo "vikunja project '$_title' already exists (id $_existing)" >&2
+    printf '%s' "$_existing"
+    return 0
+  fi
+  _cp_out=$(mktemp)
+  _cp_http=$(curl -sk --max-time 15 -o "$_cp_out" -w '%{http_code}' -X PUT "https://vikunja.$DOMAIN/api/v1/projects" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg title "$_title" --arg desc "$_description" '{title: $title, description: $desc}')")
+  if [ "$_cp_http" -ge 300 ]; then
+    echo "error: creating vikunja project '$_title' returned HTTP $_cp_http: $(head -c 400 "$_cp_out")" >&2
+    rm -f "$_cp_out"
+    return 1
+  fi
+  _cp_id=$(jq -r '.id // empty' "$_cp_out" 2>/dev/null || true)
+  rm -f "$_cp_out"
+  if [ -z "$_cp_id" ]; then
+    echo "error: creating vikunja project '$_title' returned HTTP $_cp_http but no .id" >&2
+    return 1
+  fi
+  echo "created vikunja project '$_title' (id $_cp_id)" >&2
+  printf '%s' "$_cp_id"
+}
+
+# vikunja_rename_project_if_needed <token> <old_title> <new_title> <description> -- migrates a
+# project from an old title to a new one, in place, exactly once. Confirmed live 2026-08-29:
+# `POST /api/v1/projects/{id}` accepts a partial body (title+description only) and updates just
+# those fields. Checks for <new_title> FIRST (idempotent no-op once migrated), then falls back to
+# finding <old_title> and renaming it -- never creates a second project under the new title if
+# the old one is still there, which a bare vikunja_create_project_if_missing("$new_title", ...)
+# would do (title-matching, so an old-titled project is invisible to it and gets left behind as
+# an orphaned duplicate). Prints the project id either way; caller still needs to share it with
+# the team (sharing is unaffected by a rename).
+vikunja_rename_project_if_needed() {
+  _token=$1
+  _old_title=$2
+  _new_title=$3
+  _description=$4
+  _projects=$(curl -sk --max-time 15 "https://vikunja.$DOMAIN/api/v1/projects" -H "Authorization: Bearer $_token" 2>/dev/null || true)
+  _new_id=$(printf '%s' "$_projects" | jq -r --arg t "$_new_title" '[.[]? | select(.title==$t) | .id] | first // empty' 2>/dev/null || true)
+  if [ -n "$_new_id" ]; then
+    printf '%s' "$_new_id"
+    return 0
+  fi
+  _old_id=$(printf '%s' "$_projects" | jq -r --arg t "$_old_title" '[.[]? | select(.title==$t) | .id] | first // empty' 2>/dev/null || true)
+  if [ -z "$_old_id" ]; then
+    # Neither title exists yet -- nothing to migrate, let the normal create-if-missing path handle it.
+    return 1
+  fi
+  _rn_out=$(mktemp)
+  _rn_http=$(curl -sk --max-time 15 -o "$_rn_out" -w '%{http_code}' -X POST "https://vikunja.$DOMAIN/api/v1/projects/$_old_id" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg title "$_new_title" --arg desc "$_description" '{title: $title, description: $desc}')")
+  if [ "$_rn_http" -ge 300 ]; then
+    echo "error: renaming vikunja project '$_old_title' (id $_old_id) to '$_new_title' returned HTTP $_rn_http: $(head -c 400 "$_rn_out")" >&2
+    rm -f "$_rn_out"
+    return 1
+  fi
+  rm -f "$_rn_out"
+  echo "renamed vikunja project '$_old_title' -> '$_new_title' (id $_old_id)" >&2
+  printf '%s' "$_old_id"
+}
+
+# vikunja_share_with_team_if_missing <token> <project_id> <team_id> <permission> -- idempotent.
+# Confirmed live: sharing a project with a claim-created (OIDC-managed) team works fine via this
+# API -- VIKUNJA.md's "OIDC-created teams are not editable through its API" is about editing the
+# TEAM object itself (membership/properties), not about other objects referencing its id.
+# Read-back trap (matches VIKUNJA.md's own documented finding for the same endpoint shape): the
+# GET here embeds the shared team's own object, whose id field is plain "id", NOT "team_id" --
+# checking "team_id" on the read-back never matches, so every call would re-share needlessly
+# (harmless against this API, but not actually idempotent) without this fix.
+vikunja_share_with_team_if_missing() {
+  _token=$1
+  _project_id=$2
+  _team_id=$3
+  _permission=$4
+  _already=$(curl -sk --max-time 15 "https://vikunja.$DOMAIN/api/v1/projects/$_project_id/teams" \
+    -H "Authorization: Bearer $_token" 2>/dev/null \
+    | jq -r --argjson tid "$_team_id" '[.[]? | select(.id==$tid) | .id] | first // empty' 2>/dev/null || true)
+  if [ -n "$_already" ]; then
+    echo "project $_project_id already shared with team $_team_id"
+    return 0
+  fi
+  _st_out=$(mktemp)
+  _st_http=$(curl -sk --max-time 15 -o "$_st_out" -w '%{http_code}' -X PUT "https://vikunja.$DOMAIN/api/v1/projects/$_project_id/teams" \
+    -H "Authorization: Bearer $_token" -H "Content-Type: application/json" \
+    -d "$(jq -n --argjson tid "$_team_id" --argjson perm "$_permission" '{team_id: $tid, permission: $perm}')")
+  if [ "$_st_http" -ge 300 ]; then
+    echo "error: sharing project $_project_id with team $_team_id returned HTTP $_st_http: $(head -c 400 "$_st_out")" >&2
+    rm -f "$_st_out"
+    return 1
+  fi
+  rm -f "$_st_out"
+  echo "shared project $_project_id with team $_team_id (permission $_permission)"
+}

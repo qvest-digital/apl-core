@@ -1,0 +1,797 @@
+# Seed the platform with demo teams/users/workloads by calling apl-api directly -- an explicit
+# opt-in step run AFTER `task setup` has completed, never part of it. See the approved plan at
+# the time this was written for the full research behind these choices (apl-api is a thin
+# git-backed CRUD API; Console -> apl-api -> git values repo -> operator/apl-tasks/ArgoCD
+# reconcile the real side effects; apl-api itself only checks that a request carries a valid
+# Keycloak-issued OIDC JWT, it does not care whether that JWT came through oauth2-proxy).
+#
+# Scope so far: `seed:auth` (bearer token, with the forced first-login password change handled),
+# `seed:teams` (SEED_TEAMS demo teams -- any number, any names), `seed:users` (three users per
+# team), and `seed:apps` -- a code
+# repo, a Tekton build with a webhook, a workload, and a public service, per team, done AS that
+# team's dev-<team> user (not platform-admin), following the Akamai docs' own
+# create-code-repositories-and-images / create-workloads-with-argocd / expose-services labs.
+# Getting dev-<team> a Gitea credential needs a real Keycloak SSO login (Gitea accounts are
+# OIDC-JIT-provisioned, never created proactively) -- fully scripted with curl, no browser, see
+# seed-lib.sh's gitea_oidc_login. The base image each team's Dockerfile builds FROM is mirrored
+# into a SHARED Harbor project once (not duplicated per team) because pods can't reach the
+# public internet -- see POD-EGRESS-INVESTIGATION.md. The sslVerify/skip-tls-verify fixes that
+# same doc says a webhook-triggered Tekton build needs are already baked into every build this
+# platform creates (charts/team-ns/templates/builds/docker.yaml), so no patch is needed here.
+#
+# Demo shape: however many teams SEED_TEAMS lists (default two, "green" and "blue"; override with
+# `go-task seed:demo SEED_TEAMS="alpha beta gamma"` for any count/names), each with the same three
+# users --
+#   po-<team>    : plain team member (isTeamAdmin: false)
+#   dev-<team>   : team admin on the Console for that team ONLY (isTeamAdmin: true,
+#                  isPlatformAdmin: false -- NOT a platform admin)
+#   agent-<team> : plain team member, identical rights to po-<team>
+# Emails are <role>-<team>@<domainSuffix>, matching the platform-admin@<domainSuffix> pattern
+# SETUP.md/install:credentials already uses. firstName/lastName are the role/team capitalized
+# (e.g. "Dev"/"Green") so the Console's user list reads unambiguously.
+version: '3'
+silent: true
+
+vars:
+  # Same realm/paths every other app in values/*.gotmpl derives from
+  # (helmfile.d/snippets/derived.gotmpl's $oidcBaseUrl) -- never hardcode a literal domain here,
+  # CLAUDE.md rule 5.
+  KEYCLOAK_REALM_PATH: /realms/otomi
+  # Materialized by an ExternalSecret from values/oauth2-proxy/oauth2-proxy-raw.gotmpl
+  # ("oauth2-proxy-client-access", keys client-id/client-secret) -- this is the platform's one
+  # shared OIDC client (default id "otomi", values-schema.yaml's apps.keycloak.idp.clientID),
+  # the same client oauth2-proxy itself uses for the browser flow. Its namespace is discovered
+  # at runtime below rather than assumed, since it isn't pinned down anywhere in source.
+  OAUTH2_PROXY_CLIENT_SECRET_NAME: oauth2-proxy-client-access
+  SEED_LIB: '{{.ROOT_DIR}}/.taskfiles/seed-lib.sh'
+  # app:namespace:deployment -- apps seed:apps needs (Gitea for repos/OIDC, Harbor for images,
+  # Tekton for builds) that a minimal `task setup` (only platform minimums) leaves disabled.
+  # Enabled the same way the Console's Apps dashboard does it -- PUT /v1/apps/admin -- not by
+  # editing values.yaml (that only applies at initial install, see CLAUDE.md rule 6).
+  SEED_REQUIRED_APPS: "gitea:gitea:gitea harbor:harbor:harbor-core tekton:tekton-pipelines:tekton-pipelines-controller vikunja:vikunja:vikunja"
+  # Read & Write (Vikunja's 0=Read/1=Read&Write/2=Admin) -- the team's default level on its own
+  # demo project. Change to 2 if the team should administer the project itself, not just use it.
+  SEED_VIKUNJA_TEAM_PERMISSION: 1
+  # Space-separated team names -- the whole demo scales to however many are listed here, from one
+  # team to as many as you want. Override on the command line, e.g.
+  # `go-task seed:demo SEED_TEAMS="alpha beta gamma delta epsilon"`. Every team gets the same
+  # po/dev/agent layout (see SEED_ROLES) -- no per-team customization beyond the name itself.
+  SEED_TEAMS: "green blue"
+  # role:isTeamAdmin:FirstName -- one entry per role, applied to every team in SEED_TEAMS.
+  SEED_ROLES: "po:false:PO dev:true:Dev agent:false:Agent"
+  # The example Dockerfile's FROM, per the Akamai docs' code-repo lab -- mirrored into Harbor
+  # once (see SEED_HARBOR_SHARED_PROJECT), never pulled directly (pods have no public egress).
+  SEED_BASE_IMAGE: "nginxinc/nginx-unprivileged:stable"
+  SEED_HARBOR_SHARED_PROJECT: shared
+  # Per-team demo app: the Akamai canary-deployment lab
+  # (https://techdocs.akamai.com/app-platform/docs/canary-deployment) -- two Gitea repos, "blue"
+  # (stable) and "green" (canary), each with their own build, combined into ONE workload named
+  # "canary" (chart k8s-deployments-canary -- note plural "deployments", confirmed against
+  # linode/apl-charts source, NOT the singular k8s-deployment chart the old single-app model
+  # used) and ONE service named "canary" with trafficControl enabled. Chart values are
+  # versionOne.image.{repository,tag} (blue) / versionTwo.image.{repository,tag} (green); the
+  # auto image updater watches only versionTwo (the docs' own "canary" side auto-updates on
+  # commit, the stable side does not). Confirmed live against tests/fixtures/env/teams/demo/
+  # services/hello-blue-green.yaml and values-schema.yaml: AplTeamService's trafficControl
+  # defaults are weightV1:90/weightV2:10 -- matches the docs' "use the default weights" -- so
+  # this seed script sets them explicitly to those same defaults rather than omitting the field.
+  SEED_CANARY_CHART_PATH: k8s-deployments-canary
+  SEED_CATALOG_CHART_URL: "https://github.com/linode/apl-charts.git"
+
+tasks:
+  fix-first-login:
+    desc: "Make the platform-admin's initial password permanent (Keycloak forces UPDATE_PASSWORD on first login)"
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        [ -f {{.STATE_DIR}}/pool_start.txt ] || { apl_fail "no {{.STATE_DIR}}/pool_start.txt -- is the platform installed? run 'task setup' first"; exit 1; }
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN="$(cat {{.STATE_DIR}}/pool_start.txt).nip.io"
+
+        fix() {
+          set -euo pipefail
+          PLATFORM_USER=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+            -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+          PLATFORM_PASS=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+            -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+          [ -n "$PLATFORM_USER" ] && [ -n "$PLATFORM_PASS" ] || { echo "error: platform-admin-initial-credentials came back empty" >&2; exit 1; }
+
+          TOKEN=$(kc_master_token)
+          USER_ID=$(kc_user_id_by_email "$TOKEN" "$PLATFORM_USER")
+          [ -n "$USER_ID" ] || { echo "error: no Keycloak user found for $PLATFORM_USER" >&2; exit 1; }
+
+          NEEDS_FIX=$(curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/admin/realms/otomi/users/$USER_ID" \
+            -H "Authorization: Bearer $TOKEN" | jq -r '(.requiredActions // []) | index("UPDATE_PASSWORD") != null')
+          if [ "$NEEDS_FIX" != "true" ]; then
+            echo "platform-admin has no pending UPDATE_PASSWORD required action -- nothing to do"
+            exit 0
+          fi
+
+          # Reuse the SAME password already in the secret -- the user asked for the initial
+          # password to become permanent, not for a new one to be generated.
+          kc_make_password_permanent "$TOKEN" "$USER_ID" "$PLATFORM_PASS"
+        }
+        apl_run seed-fix-first-login "Making platform-admin's initial password permanent" fix || exit $?
+
+  auth:
+    desc: "Fetch a platform-admin Keycloak access token via the Resource Owner Password grant (proves login works; NOT cached for later use -- see teams/users, which re-fetch fresh)"
+    deps: [fix-first-login]
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        [ -f {{.STATE_DIR}}/pool_start.txt ] || { apl_fail "no {{.STATE_DIR}}/pool_start.txt -- is the platform installed? run 'task setup' first"; exit 1; }
+        DOMAIN="$(cat {{.STATE_DIR}}/pool_start.txt).nip.io"
+        echo "$DOMAIN" > {{.STATE_DIR}}/seed_domain.txt
+        KIND_CTX="{{.KIND_CONTEXT}}"
+
+        # A token fetched here would go stale by the time a long dependent step (enable-apps's
+        # up-to-20-minute app-readiness wait) finishes -- confirmed live: reusing one across that
+        # wait 401s with "JWT verification failed: \"exp\" claim timestamp check failed". This
+        # step exists only to prove the ROPC login itself works (the forced first-login password
+        # change is the one real obstacle, handled by fix-first-login above) -- teams/users each
+        # call kc_platform_admin_token fresh, right before they need it, instead of reading a
+        # cached file.
+        auth() {
+          set -euo pipefail
+          TOKEN=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+          [ -n "$TOKEN" ]
+        }
+        apl_run seed-auth "Fetching a platform-admin access token from Keycloak" auth || exit $?
+        apl_ok "platform-admin login confirmed"
+
+  enable-apps:
+    desc: "Enable gitea/harbor/tekton if a minimal install left them off (same PUT the Console's Apps dashboard uses)"
+    deps: [auth]
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        TOKEN=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+        API="https://console.$DOMAIN/api"
+
+        toggle_missing() {
+          set -euo pipefail
+          _current=$(curl -sk --max-time 15 -f "$API/v1/apps" -H "Authorization: Bearer $TOKEN")
+          _missing=""
+          for SPEC in {{.SEED_REQUIRED_APPS}}; do
+            _app=${SPEC%%:*}
+            _enabled=$(printf '%s' "$_current" | jq -r --arg id "$_app" '.[] | select(.id==$id) | .enabled')
+            [ "$_enabled" = "true" ] || _missing="$_missing\"$_app\","
+          done
+          if [ -z "$_missing" ]; then
+            echo "gitea/harbor/tekton already enabled -- nothing to toggle"
+            return 0
+          fi
+          _ids="[${_missing%,}]"
+          echo "enabling: $_ids"
+          curl -sk --max-time 15 -f -X PUT "$API/v1/apps/admin" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            -d "{\"ids\":$_ids,\"enabled\":true}" > /dev/null
+        }
+        apl_run seed-enable-apps "Enabling any of gitea/harbor/tekton left off by a minimal install" toggle_missing || exit $?
+      - |
+        . "{{.LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        # Enabling an app is a git commit -- the actual install (real Helm charts, much heavier
+        # than a team resource) takes real minutes, not seconds. Bounded wait: 40 tries, 30s
+        # apart, ~20 min cap -- generous on purpose, this is a one-time cost per fresh cluster.
+        # Every kubectl call is --request-timeout-bounded -- kubectl has no default timeout and
+        # will hang indefinitely against an unresponsive API server otherwise (CLAUDE.md rule 1).
+        wait_ready() {
+          set -euo pipefail
+          _tries=0
+          while [ "$_tries" -lt 40 ]; do
+            _all_ready=true
+            for SPEC in {{.SEED_REQUIRED_APPS}}; do
+              _ns=$(printf '%s' "$SPEC" | cut -d: -f2)
+              _deploy=$(printf '%s' "$SPEC" | cut -d: -f3)
+              _avail=$(kubectl --context "$KIND_CTX" --request-timeout=15s get deploy "$_deploy" -n "$_ns" \
+                -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)
+              [ "${_avail:-0}" -ge 1 ] 2>/dev/null || _all_ready=false
+            done
+            [ "$_all_ready" = "true" ] && break
+            _tries=$((_tries + 1))
+            echo "waiting for gitea/harbor/tekton deployments to become available (try $_tries/40)..."
+            sleep 30
+          done
+          [ "$_all_ready" = "true" ] || { echo "error: gitea/harbor/tekton not all Available after ~20 min" >&2; return 1; }
+        }
+        apl_run seed-enable-apps-wait "Waiting for gitea/harbor/tekton to actually come up (real Helm installs, several minutes)" wait_ready || exit $?
+
+  teams:
+    desc: "Create the demo teams (SEED_TEAMS) via POST /v2/teams and verify each"
+    # selfService.teamMembers.createServices defaults to false (team.yaml) and is a HARD gate,
+    # separate from and bypassing the normal teamAdmin/teamMember CASL create-rights check --
+    # confirmed live: apl-api's authz middleware routes "create:Service" through
+    # hasSelfService(teamId, 'createServices') whenever the caller is a team member at all,
+    # never through the CASL role check, even for a team-admin. Omit this and seed:apps's
+    # service creation 403s with "User not allowed to perform \"create\" on \"Service\" resource"
+    # no matter how privileged dev-<team> is.
+    deps: [enable-apps]
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        # Fresh, not cached: this runs right after enable-apps's up-to-20-minute readiness wait,
+        # which can easily outlive a token fetched before it started (see kc_platform_admin_token).
+        TOKEN=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+        API="https://console.$DOMAIN/api"
+
+        create_team() {
+          set -euo pipefail
+          _team=$1
+          _out={{.STATE_DIR}}/seed_team_create_$_team.json
+          _body=$(cat <<JSON
+        {
+          "kind": "AplTeamSettingSet",
+          "metadata": {"name": "$_team", "labels": {"apl.io/teamId": "$_team"}},
+          "spec": {
+            "managedMonitoring": {"grafana": false, "alertmanager": false},
+            "networkPolicy": {"ingressPrivate": true, "egressPublic": true},
+            "selfService": {
+              "teamMembers": {
+                "createServices": true,
+                "editSecurityPolicies": false,
+                "useCloudShell": false,
+                "downloadKubeconfig": false,
+                "downloadDockerLogin": false
+              }
+            }
+          }
+        }
+        JSON
+        )
+          _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' \
+            -X POST "$API/v2/teams" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$_body")
+          if [ "$_http" -ge 300 ]; then
+            echo "error: POST /v2/teams ($_team) returned HTTP $_http" >&2
+            cat "$_out" >&2
+            exit 1
+          fi
+        }
+        for TEAM in {{.SEED_TEAMS}}; do
+          apl_run "seed-team-create-$TEAM" "Creating demo team '$TEAM' via POST /v2/teams" create_team "$TEAM" || exit $?
+        done
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        TOKEN=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+        API="https://console.$DOMAIN/api"
+
+        # Verify, don't assert (CLAUDE.md rule 4) -- a 2xx from the POST only means apl-api
+        # accepted and committed it, not that it's the team we think it is. Round-trip with a GET.
+        verify_team() {
+          set -euo pipefail
+          _team=$1
+          _resp=$(curl -sk --max-time 15 "$API/v2/teams/$_team" -H "Authorization: Bearer $TOKEN")
+          _name=$(printf '%s' "$_resp" | jq -er '.metadata.name')
+          [ "$_name" = "$_team" ]
+        }
+        for TEAM in {{.SEED_TEAMS}}; do
+          apl_run "seed-team-verify-$TEAM" "Verifying '$TEAM' via GET /v2/teams/$TEAM" verify_team "$TEAM" || exit $?
+        done
+        apl_ok "teams created and confirmed: {{.SEED_TEAMS}}"
+        apl_info "each team's namespace (team-<name>) appears once the operator reconciles the commit --"
+        apl_info "not checked here; 'kubectl get ns' once you're ready to confirm."
+
+  users:
+    desc: "Create the demo users (po/dev/agent per team), then make all their passwords permanent in one pass"
+    deps: [teams]
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        TOKEN=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+        API="https://console.$DOMAIN/api"
+        PENDING={{.STATE_DIR}}/seed_pending_passwords.txt
+        : > "$PENDING"
+
+        # Per-user marker block in passwords.txt, keyed by email -- NOT one big block for all six.
+        # apl-api 409s "User email already exists" on a repeat POST (unlike /v2/teams, which
+        # upserts cleanly), and it never re-exposes initialPassword for a user that already
+        # exists. A single wipe-and-rewrite-everything block would silently drop an
+        # already-seeded user's credentials the moment any ONE user in a partial rerun already
+        # existed. Keying per-user means a skipped (already-existing) user's passwords.txt entry
+        # from a previous run is simply left alone.
+        record_credentials() {
+          set -euo pipefail
+          _email=$1 _team=$2 _role=$3 _is_admin=$4 _password=$5
+          _mark_begin="# --- demo-user: $_email (generated by 'task seed:users') ---"
+          _mark_end="# --- end demo-user: $_email ---"
+          [ -f passwords.txt ] && sed -i "/^${_mark_begin//\//\\/}\$/,/^${_mark_end//\//\\/}\$/d" passwords.txt
+          {
+            echo "$_mark_begin"
+            printf 'team:     %s\nrole:     %s%s\nusername: %s\npassword: %s\n' \
+              "$_team" "$_role" "$([ "$_is_admin" = "true" ] && echo " (team-admin)" || echo "")" \
+              "$_email" "$_password"
+            echo "$_mark_end"
+          } >> passwords.txt
+          chmod 600 passwords.txt
+          # Machine-readable copy for later automation (seed:apps needs dev-<team>'s password to
+          # act as that user) -- passwords.txt is for humans, re-parsing it programmatically would
+          # be fragile. Only written for roles that actually have a password to record here.
+          printf '%s' "$_password" > {{.STATE_DIR}}/seed_pw_${_team}_${_role}.txt
+          chmod 600 {{.STATE_DIR}}/seed_pw_${_team}_${_role}.txt
+        }
+
+        create_user() {
+          set -euo pipefail
+          _team=$1 _role=$2 _is_admin=$3 _firstname=$4
+          _lastname=$(printf '%s' "$_team" | sed 's/./\U&/')
+          _email="$_role-$_team@$DOMAIN"
+          _out={{.STATE_DIR}}/seed_user_${_team}_${_role}.json
+          _body=$(cat <<JSON
+        {
+          "email": "$_email",
+          "firstName": "$_firstname",
+          "lastName": "$_lastname",
+          "isPlatformAdmin": false,
+          "isTeamAdmin": $_is_admin,
+          "teams": ["$_team"]
+        }
+        JSON
+        )
+          _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' \
+            -X POST "$API/v1/users" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$_body")
+          if [ "$_http" = "409" ] && grep -q 'already exists' "$_out"; then
+            echo "user $_email already exists -- leaving its passwords.txt entry as-is (apl-api does not re-issue a password for an existing user, and it was already made permanent by an earlier run)"
+            exit 0
+          fi
+          if [ "$_http" -ge 300 ]; then
+            echo "error: POST /v1/users ($_email) returned HTTP $_http" >&2
+            cat "$_out" >&2
+            exit 1
+          fi
+          _returned_email=$(jq -er '.email' "$_out")
+          [ "$_returned_email" = "$_email" ] || { echo "error: response email '$_returned_email' != '$_email'" >&2; exit 1; }
+          _password=$(jq -er '.initialPassword' "$_out")
+
+          record_credentials "$_email" "$_team" "$_role" "$_is_admin" "$_password"
+          # Queued for the single shared wait-then-fix pass below -- NOT fixed here, one user at
+          # a time: apl-tasks reconciles a batch of git commits together on one debounce, so
+          # waiting per-user serially (up to 120s EACH) is needless when one shared wait covers
+          # every user created this run.
+          printf '%s\t%s\n' "$_email" "$_password" >> "$PENDING"
+        }
+
+        for TEAM in {{.SEED_TEAMS}}; do
+          for ROLE_SPEC in {{.SEED_ROLES}}; do
+            ROLE=${ROLE_SPEC%%:*}
+            REST=${ROLE_SPEC#*:}
+            IS_ADMIN=${REST%%:*}
+            FIRSTNAME=${REST#*:}
+            apl_run "seed-user-$TEAM-$ROLE" "Creating $ROLE-$TEAM (isTeamAdmin=$IS_ADMIN)" \
+              create_user "$TEAM" "$ROLE" "$IS_ADMIN" "$FIRSTNAME" || exit $?
+          done
+        done
+        apl_ok "demo users created; credentials recorded in passwords.txt per-user"
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        PENDING={{.STATE_DIR}}/seed_pending_passwords.txt
+        RESOLVED={{.STATE_DIR}}/seed_resolved.txt
+        : > "$RESOLVED"
+
+        if [ ! -s "$PENDING" ]; then
+          apl_skip "no freshly created users this run -- nothing to wait for or fix"
+        else
+          fix_all() {
+            set -euo pipefail
+            kc_resolve_pending "$PENDING" "$RESOLVED"
+            if [ -s "$PENDING" ]; then
+              echo "error: still not reconciled in Keycloak after ~120s: $(cut -f1 "$PENDING" | tr '\n' ' ')" >&2
+              exit 1
+            fi
+            while IFS=$'\t' read -r _email _id _password; do
+              [ -n "$_email" ] || continue
+              _token=$(kc_master_token)
+              kc_make_password_permanent "$_token" "$_id" "$_password"
+            done < "$RESOLVED"
+          }
+          _n=$(wc -l < "$PENDING" | tr -d ' ')
+          apl_run seed-users-fix-first-login \
+            "Waiting once for apl-tasks to reconcile $_n new user(s) in Keycloak, then making their passwords permanent" \
+            fix_all || exit $?
+        fi
+
+  apps:
+    desc: "Per team, as dev-<team>: blue/green Gitea repos + auto-build + a canary workload/service"
+    deps: [users]
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        HARBOR_ADMIN_PASSWORD=$(kubectl --context {{.KIND_CONTEXT}} --request-timeout=15s get secret harbor-admin-password \
+          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
+        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
+
+        mirror_base() {
+          set -euo pipefail
+          harbor_ensure_project "{{.SEED_HARBOR_SHARED_PROJECT}}"
+          harbor_mirror "{{.SEED_BASE_IMAGE}}" "{{.SEED_HARBOR_SHARED_PROJECT}}/nginx-unprivileged:stable"
+        }
+        apl_run seed-apps-mirror-base "Mirroring {{.SEED_BASE_IMAGE}} into the shared Harbor project" mirror_base || exit $?
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+
+        # Every team's first build mounts the `gitea-credentials` Secret apl-gitea-operator writes
+        # into the team namespace -- without it the git-clone Task's fetch-source pod hangs at
+        # Init:0/2 on a FailedMount and the PipelineRun wait below just times out, with the real
+        # cause (a swallowed 403 in the operator, minutes earlier) nowhere near the failure.
+        # A brand-new team hits that 403 routinely; an existing one never does. Full account, and
+        # why this is upstream's bug rather than something wired wrong here, in seed-lib.sh's
+        # gitea_ensure_team_credentials.
+        #
+        # Done ONCE for all of SEED_TEAMS, not per team inside setup_team_app: the operator
+        # rewrites the secret for every team org on a single reconcile pass, so one check (and at
+        # most one nudge) covers the whole run no matter how many teams it has.
+        apl_run seed-apps-gitea-credentials \
+          "Ensuring apl-gitea-operator wrote gitea-credentials into every team namespace" \
+          gitea_ensure_team_credentials {{.SEED_TEAMS}} || exit $?
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        API="https://console.$DOMAIN/api"
+
+        # dev-<team>'s own Keycloak bearer token -- same ROPC pattern seed:auth uses for
+        # platform-admin, just with dev-<team>'s own credentials. Everything below runs AS that
+        # user, never platform-admin: the blue setup must be done by the blue dev, the green
+        # setup by the green dev.
+        #
+        # Call this immediately before each group of API calls, never once for the whole
+        # function: this realm's accessTokenLifespan is SIXTY SECONDS (confirmed live against
+        # /admin/realms/otomi), and setup_team_app deliberately waits far longer than that
+        # between its two groups of calls -- up to 180s for the Gitea webhook, 90s for the
+        # EventListener and another 180s for the PipelineRun. A token fetched before those waits
+        # is long dead by the time the workload and service are created. Same class of bug as the
+        # platform-admin token that used to be cached across enable-apps's readiness wait; see
+        # kc_platform_admin_token's note in seed-lib.sh.
+        dev_team_token() {
+          _team=$1
+          _email="dev-$_team@$DOMAIN"
+          _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
+          _client_ns=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret -A \
+            --field-selector "metadata.name={{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}" \
+            -o jsonpath='{.items[0].metadata.namespace}')
+          _client_id=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret {{.OAUTH2_PROXY_CLIENT_SECRET_NAME}} \
+            -n "$_client_ns" -o jsonpath='{.data.client-id}' | base64 -d)
+          _client_secret=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret {{.OAUTH2_PROXY_CLIENT_SECRET_NAME}} \
+            -n "$_client_ns" -o jsonpath='{.data.client-secret}' | base64 -d)
+          _tok_resp=$(curl -sk --max-time 15 "https://keycloak.$DOMAIN{{.KEYCLOAK_REALM_PATH}}/protocol/openid-connect/token" \
+            --data-urlencode grant_type=password --data-urlencode client_id="$_client_id" --data-urlencode client_secret="$_client_secret" \
+            --data-urlencode username="$_email" --data-urlencode password="$_password" --data-urlencode scope=openid)
+          _tok=$(printf '%s' "$_tok_resp" | jq -r '.access_token // empty' 2>/dev/null || true)
+          # Diagnose rather than die silently: with `jq -er` straight off the pipe, a failed
+          # login aborted the caller through `set -e` with no message at all, and Keycloak's own
+          # error ("invalid_grant", "Account is not fully set up", ...) was thrown away.
+          [ -n "$_tok" ] || { echo "error: no access token for $_email -- Keycloak said: $(printf '%s' "$_tok_resp" | head -c 300)" >&2; return 1; }
+          printf '%s' "$_tok"
+        }
+
+        # build_team_repo <team> <reponame> <html-color> <html-label> -- one repo's worth of the
+        # canary lab's "create-code-repositories-and-images" prerequisite: create the Gitea repo,
+        # register it (coderepo+build) via apl-api, wait for ITS OWN webhook, push a Dockerfile +
+        # index.html, wait for ITS OWN PipelineRun (matched by name prefix, not "whatever's latest
+        # in the namespace" -- two repos now share one team namespace, so that would race).
+        # Reused twice per team (blue, green) since the shape is otherwise identical.
+        build_team_repo() {
+          set -euo pipefail
+          _team=$1 _reponame=$2 _color=$3 _label=$4
+          gitea_create_org_repo "team-$_team" "$_reponame" "$GITEA_PAT"
+
+          apl_create_if_missing \
+            "$API/v2/teams/$_team/coderepos/$_reponame" "$API/v2/teams/$_team/coderepos" "$API_TOKEN" \
+            "{\"kind\":\"AplTeamCodeRepo\",\"metadata\":{\"name\":\"$_reponame\"},\"spec\":{\"gitService\":\"gitea\",\"repositoryUrl\":\"https://gitea.$DOMAIN/team-$_team/$_reponame.git\",\"private\":true}}" \
+            "coderepo $_reponame ($_team)"
+
+          apl_create_if_missing \
+            "$API/v2/teams/$_team/builds/$_reponame" "$API/v2/teams/$_team/builds" "$API_TOKEN" \
+            "{\"kind\":\"AplTeamBuild\",\"metadata\":{\"name\":\"$_reponame\"},\"spec\":{\"imageName\":\"$_reponame\",\"tag\":\"main\",\"mode\":{\"type\":\"docker\",\"docker\":{\"repoUrl\":\"https://gitea.$DOMAIN/team-$_team/$_reponame.git\",\"path\":\"./Dockerfile\",\"revision\":\"main\"}},\"trigger\":true,\"scanSource\":false}}" \
+            "build $_reponame ($_team)"
+
+          # Bounded wait for the operator to reconcile the build into an actual Gitea webhook on
+          # THIS repo (checked directly, not guessed at with a fixed sleep) before pushing content.
+          _tries=0
+          _hooks=0
+          while [ "$_tries" -lt 18 ]; do
+            # `|| true` on the pipeline: under `set -euo pipefail` a single transient curl/jq
+            # failure would abort the step outright instead of being retried by this loop.
+            _hooks=$(curl -sk --max-time 10 "https://gitea.$DOMAIN/api/v1/repos/team-$_team/$_reponame/hooks" -H "Authorization: token $GITEA_PAT" 2>/dev/null | jq -r 'length' 2>/dev/null || true)
+            [ "${_hooks:-0}" -gt 0 ] && break
+            _tries=$((_tries + 1))
+            sleep 10
+          done
+          [ "${_hooks:-0}" -gt 0 ] || { echo "error: no Gitea webhook appeared for team-$_team/$_reponame within 180s" >&2; return 1; }
+
+          # Registered in Gitea's webhook config != actually able to receive it. Confirmed live:
+          # pushing content immediately after the check above raced the EventListener pod's own
+          # startup (its istio-proxy sidecar wasn't ready yet) -- Gitea's push landed, was
+          # delivered, and got back a hard "503 no healthy upstream" from Envoy (visible in
+          # gitea's own hook_task table, not surfaced anywhere else). Gitea does NOT retry a
+          # failed webhook delivery on its own, so that push's PipelineRun simply never happened
+          # -- no error, just an indefinite wait later for a build that was never triggered. Wait
+          # for the EventListener Deployment itself to be Available first, same pattern
+          # enable-apps already uses for gitea/harbor/tekton.
+          #
+          # The EventListener is named after the BUILD, "el-gitea-webhook-<reponame>" --
+          # confirmed live: team-green and team-blue both carry TWO of them
+          # (el-gitea-webhook-blue and el-gitea-webhook-green) once both builds exist. Under the
+          # old single-app model this was indistinguishable from "one per team", since the
+          # single build's name always equaled the team's own name -- checking
+          # "el-gitea-webhook-$_team" only ever worked by that coincidence, and silently checked
+          # the WRONG (but often-already-Available, from an old leftover build of the same name)
+          # deployment for any team not literally named "blue" or "green" -- a false pass that
+          # let this step race ahead of the real EventListener's readiness. Check
+          # "el-gitea-webhook-$_reponame" instead.
+          _tries=0
+          while [ "$_tries" -lt 18 ]; do
+            _avail=$(kubectl --context "$KIND_CTX" --request-timeout=15s get deploy "el-gitea-webhook-$_reponame" -n "team-$_team" \
+              -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)
+            [ "${_avail:-0}" -ge 1 ] 2>/dev/null && break
+            _tries=$((_tries + 1))
+            sleep 5
+          done
+          [ "${_avail:-0}" -ge 1 ] || { echo "error: el-gitea-webhook-$_reponame never became Available within 90s" >&2; return 1; }
+
+          DOCKERFILE=$(printf 'FROM harbor.%s/{{.SEED_HARBOR_SHARED_PROJECT}}/nginx-unprivileged:stable\nCOPY index.html /usr/share/nginx/html/index.html\nEXPOSE 8080\n' "$DOMAIN")
+          HTML=$(printf '<html><head><title>%s</title></head><body style="display:flex;align-items:center;justify-content:center;height:100vh;background:%s;color:white;font-family:sans-serif;"><h1>%s</h1></body></html>' "$_reponame" "$_color" "$_label")
+          gitea_put_file "team-$_team" "$_reponame" "Dockerfile" "$DOCKERFILE" "$GITEA_PAT" "add Dockerfile"
+          gitea_put_file "team-$_team" "$_reponame" "index.html" "$HTML" "$GITEA_PAT" "add index.html"
+
+          # Bounded wait for the triggered PipelineRun to finish (observed ~30-40s once it can
+          # schedule). Matched by THIS build's own name prefix -- "docker-trigger-build-<repo>-"
+          # -- not "whatever's latest in the namespace", which would be ambiguous now that two
+          # repos' builds land in the same team namespace.
+          #
+          # `grep ... || true`: confirmed live 2026-08-29 -- on the very first check, right after
+          # the push, Tekton's own PipelineRun object often doesn't exist yet at all, a completely
+          # normal state this loop exists to wait through. grep finds nothing and exits 1; under
+          # this function's `set -euo pipefail`, that killed the WHOLE function right there on
+          # try 1, silently -- the explicit "did not succeed within 180s" message below was never
+          # reached, because the loop never got a chance to run a second iteration. This is what
+          # caused every one of this session's fast (~50s), no-error-text failures: it was never
+          # about the build itself (which kept running fine in the background the whole time),
+          # only about this loop's very first, entirely expected empty grep killing the caller.
+          _tries=0
+          _status=""
+          while [ "$_tries" -lt 18 ]; do
+            _pr=$(kubectl --context "$KIND_CTX" --request-timeout=15s get pipelinerun -n "team-$_team" --sort-by=.metadata.creationTimestamp --no-headers 2>/dev/null \
+              | grep "^docker-trigger-build-$_reponame-" | tail -1 || true)
+            _status=$(printf '%s' "$_pr" | awk '{print $2}')
+            [ "$_status" = "True" ] && break
+            _tries=$((_tries + 1))
+            sleep 10
+          done
+          [ "$_status" = "True" ] || { echo "error: build for team-$_team/$_reponame did not succeed within 180s (last: $_pr)" >&2; return 1; }
+        }
+
+        setup_team_app() {
+          set -euo pipefail
+          _team=$1
+          _email="dev-$_team@$DOMAIN"
+          _password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_dev.txt)
+
+          GITEA_USER=$(gitea_oidc_login "$_email" "$_password")
+          GITEA_PAT=$(gitea_mint_pat "$GITEA_USER" "read:user,write:repository,write:organization,read:organization")
+          gitea_wait_for_org_permission "$GITEA_USER" "team-$_team" "$GITEA_PAT" "can_create_repository"
+
+          # agent-<team> also provisions itself in Gitea and lands in the team's org -- no repo
+          # creation of its own, dev owns that; this is just "find themselves in their
+          # respective team" (agent's OWN Gitea account + org membership sync, same mechanism as
+          # dev's, just no follow-up repo work).
+          _agent_email="agent-$_team@$DOMAIN"
+          _agent_password=$(cat {{.STATE_DIR}}/seed_pw_${_team}_agent.txt)
+          _agent_gitea_user=$(gitea_oidc_login "$_agent_email" "$_agent_password")
+          # read:user AND read:organization -- the permissions endpoint below 403s without
+          # read:user too (confirmed live, same trap already hit and fixed for dev's PAT scope).
+          _agent_gitea_pat=$(gitea_mint_pat "$_agent_gitea_user" "read:user,read:organization")
+          gitea_wait_for_org_permission "$_agent_gitea_user" "team-$_team" "$_agent_gitea_pat" "can_read"
+
+          API_TOKEN=$(dev_team_token "$_team")
+
+          # The Akamai canary-deployment lab (techdocs.akamai.com/app-platform/docs/
+          # canary-deployment): two repos, literally named "blue" (stable) and "green" (canary)
+          # -- not derived from the team's own name, matching the docs' own semantics. A team
+          # that happens to be named "blue" or "green" itself will find these repo/build names
+          # coincide with resources an earlier single-app run of this script already created
+          # under that same name; that's harmless (apl_create_if_missing just reuses them, and
+          # the content push below overwrites whatever was there).
+          build_team_repo "$_team" blue "#1565c0" "Version: BLUE (stable)"
+          # Fresh token before the second repo's builds -- dev_team_token's note applies here
+          # too: the first build_team_repo call's waits can easily eat the 60s token lifespan.
+          API_TOKEN=$(dev_team_token "$_team")
+          build_team_repo "$_team" green "#2e7d32" "Version: GREEN (canary)"
+
+          # ONE workload named "canary" (chart k8s-deployments-canary) combining both images --
+          # versionOne is blue/stable, versionTwo is green/canary, matching the chart's own
+          # values.yaml. Only versionTwo gets the auto image updater, per the docs (the canary
+          # side auto-updates on every commit; the stable side is a deliberate, manual promotion).
+          API_TOKEN=$(dev_team_token "$_team")
+          BLUE_IMAGE_REPO="harbor.$DOMAIN/team-$_team/blue"
+          GREEN_IMAGE_REPO="harbor.$DOMAIN/team-$_team/green"
+          VALUES=$(printf 'versionOne:\n  image:\n    repository: %s\n    tag: main\nversionTwo:\n  image:\n    repository: %s\n    tag: main\n' "$BLUE_IMAGE_REPO" "$GREEN_IMAGE_REPO")
+          # imageParameter/tagParameter and the full harbor.<domain>/ prefix on imageRepository
+          # are both required for the ArgoCD Image Updater to actually fire -- confirmed live
+          # under the old single-app model (see git history), same trap, same fix, just pointed
+          # at versionTwo's nested path instead of the chart-root image.* the single-app model used.
+          apl_create_if_missing \
+            "$API/v2/teams/$_team/workloads/canary" "$API/v2/teams/$_team/workloads" "$API_TOKEN" \
+            "$(jq -n --arg values "$VALUES" --arg url "{{.SEED_CATALOG_CHART_URL}}" --arg repo "$GREEN_IMAGE_REPO" \
+              '{kind:"AplTeamWorkload", metadata:{name:"canary"}, spec:{url:$url, chartProvider:"git", path:"{{.SEED_CANARY_CHART_PATH}}", revision:"main", values:$values, imageUpdateStrategy:{type:"digest", digest:{imageRepository:$repo, tag:"main", imageParameter:"versionTwo.image.repository", tagParameter:"versionTwo.image.tag"}}}}')" \
+            "workload canary ($_team)"
+
+          # ONE service named "canary", trafficControl enabled at the platform's own schema
+          # defaults (weightV1:90/weightV2:10 -- values-schema.yaml, confirmed live against
+          # tests/fixtures/env/teams/demo/services/hello-blue-green.yaml) -- "use the default
+          # weights" per the docs. routes.yaml routes this to backends "canary-v1"/"canary-v2",
+          # which is exactly what the k8s-deployments-canary chart's own service-v1/v2 templates
+          # create (Release.Name, i.e. the workload's own name "canary", with no override needed).
+          apl_create_if_missing \
+            "$API/v2/teams/$_team/services/canary" "$API/v2/teams/$_team/services" "$API_TOKEN" \
+            '{"kind":"AplTeamService","metadata":{"name":"canary"},"spec":{"port":80,"ingress":{"type":"public","useDefaultHost":true},"trafficControl":{"enabled":true,"weightV1":90,"weightV2":10}}}' \
+            "service canary ($_team)"
+
+          # Bounded wait for the public route to actually serve the app end to end. Hostname is
+          # "<serviceName>-<teamId>" per charts/team-ns/templates/routes.yaml -- "canary-$_team".
+          _tries=0
+          _code=""
+          while [ "$_tries" -lt 18 ]; do
+            _code=$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "https://canary-$_team.$DOMAIN/" 2>/dev/null || true)
+            [ "$_code" = "200" ] && break
+            _tries=$((_tries + 1))
+            sleep 10
+          done
+          [ "$_code" = "200" ] || { echo "error: https://canary-$_team.$DOMAIN/ never returned 200 (last: $_code)" >&2; return 1; }
+        }
+
+        for TEAM in {{.SEED_TEAMS}}; do
+          apl_run "seed-apps-$TEAM" "Setting up $TEAM's blue/green canary deployment (as dev-$TEAM)" setup_team_app "$TEAM" || exit $?
+        done
+        apl_ok "demo canary deployments live: $(for T in {{.SEED_TEAMS}}; do printf 'https://canary-%s.%s/ ' "$T" "$DOMAIN"; done)"
+
+  vikunja:
+    desc: "Provision po/dev/agent in Vikunja via OIDC claim-driven team sync; po's project shared with the team"
+    deps: [apps]
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+
+        # Confirmed live 2026-08-28: Vikunja team membership comes from a Keycloak group
+        # attribute read via a protocol mapper on the "otomi" client, aggregated onto every
+        # member of that group -- NOT from us calling Vikunja's team/team-member API at all.
+        # This is the claim-driven mechanism VIKUNJA.md Appendix B recorded as "rejected" for the
+        # now-removed CONTINUOUS operator (rejected there for being pull-not-push and mutually
+        # exclusive with API-managed membership -- neither concern applies to a one-shot script).
+        apl_run seed-vikunja-mapper "Ensuring the vikunja-groups Keycloak protocol mapper exists" keycloak_ensure_vikunja_group_mapper || exit $?
+
+        for TEAM in {{.SEED_TEAMS}}; do
+          stamp_team() { keycloak_stamp_team_vikunja_group "$1" "Team $(printf '%s' "$1" | sed 's/./\U&/')"; }
+          apl_run "seed-vikunja-stamp-$TEAM" "Stamping team-$TEAM's Keycloak group for Vikunja sync" stamp_team "$TEAM" || exit $?
+        done
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+
+        setup_team_vikunja() {
+          set -euo pipefail
+          _team=$1
+
+          # po/dev/agent each need ONE real OIDC login: that is what both creates their Vikunja
+          # account (OIDC-JIT-provisioned, same as Gitea) and syncs them into the claim-driven
+          # team, all three as ordinary members (po belongs in the team too, alongside dev and
+          # agent -- which is what makes the sync trivial: one Keycloak group, everyone already
+          # in it from user creation, no special-casing per role).
+          #
+          # But only when they are not already members. Vikunja's OIDC callback carries a
+          # hardcoded, non-configurable 10-requests-per-minute-per-IP limit, and through the
+          # Istio mesh all six demo users share ONE bucket (see seed-lib.sh's
+          # "Vikunja: rate-limit pacing" block). So the budget is treated as the scarce resource
+          # it is: check membership over the AUTHENTICATED API (not rate-limited) and log a user
+          # in only if that check says a sync is actually needed. A rerun of an
+          # already-provisioned team therefore spends nothing at all, instead of burning six
+          # logins to re-prove what is already true.
+          #
+          # The fixed sleeps that used to sit between logins here (8s within a team, 20s between
+          # teams) are gone: they were guesswork against a budget nobody was actually counting,
+          # and they could not see retries or adjacent teams. _vikunja_oidc_login_once now paces
+          # itself against Vikunja's own X-RateLimit-* headers, which is exact.
+          _po_email="po-$_team@$DOMAIN"
+          _po_token=$(vikunja_login "$_po_email" "$(cat {{.STATE_DIR}}/seed_pw_${_team}_po.txt)")
+
+          _team_id=$(vikunja_team_id_by_external_id "$_po_token" "kc-team-$_team")
+          if [ -z "$_team_id" ]; then
+            # A cached token can predate the Keycloak group stamp, and the team is only
+            # created/updated during a real login -- so force one and look again.
+            _po_token=$(vikunja_oidc_login "$_po_email" "$(cat {{.STATE_DIR}}/seed_pw_${_team}_po.txt)")
+            vikunja_cache_token "$_po_email" "$_po_token"
+            _team_id=$(vikunja_team_id_by_external_id "$_po_token" "kc-team-$_team")
+          fi
+          [ -n "$_team_id" ] || { echo "error: no Vikunja team with external_id kc-team-$_team even after a fresh po login -- is the vikunja-groups mapper/group attribute in place?" >&2; return 1; }
+
+          _members=$(vikunja_team_members "$_po_token" "$_team_id")
+          for _role in po dev agent; do
+            _role_email="$_role-$_team@$DOMAIN"
+            if printf '%s\n' "$_members" | grep -Fqx "$_role_email"; then
+              echo "$_role_email is already in Vikunja team $_team_id -- no login needed"
+              continue
+            fi
+            _role_token=$(vikunja_oidc_login "$_role_email" "$(cat {{.STATE_DIR}}/seed_pw_${_team}_${_role}.txt)")
+            vikunja_cache_token "$_role_email" "$_role_token"
+            if [ "$_role" = "po" ]; then _po_token=$_role_token; fi
+            _members=$(vikunja_team_members "$_po_token" "$_team_id")
+            printf '%s\n' "$_members" | grep -Fqx "$_role_email" \
+              || { echo "error: $_role_email logged into Vikunja but did not land in team $_team_id -- claim sync did not fire" >&2; return 1; }
+          done
+
+          # Project owned by po (created with po's own token), titled "<team>-example" (not just
+          # "<team>" -- the user asked for this explicitly), description links back to the
+          # team's blue/green Gitea repos -- matches the docs' own
+          # "create-code-repositories-and-images" naming, the same repos `apps` (the prior task)
+          # already registered/built from.
+          _title="$_team-example"
+          _description="Demo project for team $_team -- code: https://gitea.$DOMAIN/team-$_team/blue.git, https://gitea.$DOMAIN/team-$_team/green.git"
+          # Rename-in-place if an OLDER run already created a project titled just "$_team" --
+          # never creates a second, orphaned project under the new title alongside the old one.
+          _project_id=$(vikunja_rename_project_if_needed "$_po_token" "$_team" "$_title" "$_description") \
+            || _project_id=$(vikunja_create_project_if_missing "$_po_token" "$_title" "$_description")
+          vikunja_share_with_team_if_missing "$_po_token" "$_project_id" "$_team_id" "{{.SEED_VIKUNJA_TEAM_PERMISSION}}"
+        }
+
+        # No inter-team sleep any more: the rate-limit budget is shared across teams, so spacing
+        # teams apart by a fixed amount was never a bound on anything. _vikunja_oidc_login_once
+        # paces every login against Vikunja's own reported budget instead, which covers logins
+        # from adjacent teams and from retries alike.
+        for TEAM in {{.SEED_TEAMS}}; do
+          # Up to 3 tries total, backing off 10s between them. Everything in setup_team_vikunja
+          # is idempotent and now membership-aware, so a retry re-does only what is still
+          # missing rather than replaying every login.
+          _vikunja_tries=0
+          _vikunja_ok=false
+          while [ "$_vikunja_tries" -lt 3 ]; do
+            _vikunja_tries=$((_vikunja_tries + 1))
+            if apl_run "seed-vikunja-$TEAM-try$_vikunja_tries" "Provisioning $TEAM in Vikunja (po/dev/agent logins, project, team share), try $_vikunja_tries/3" setup_team_vikunja "$TEAM"; then
+              _vikunja_ok=true
+              break
+            fi
+            [ "$_vikunja_tries" -lt 3 ] && sleep 10
+          done
+          [ "$_vikunja_ok" = "true" ] || { apl_fail "Vikunja provisioning for $TEAM failed after 3 tries -- see the logs above"; exit 1; }
+        done
+        apl_ok "vikunja provisioned for: {{.SEED_TEAMS}}"
+
+  demo:
+    desc: "Seed the demo: SEED_TEAMS teams, three users each, a live app per team, and Vikunja provisioning"
+    deps: [vikunja]
+    cmds:
+      - |
+        . "{{.LIB}}"
+        apl_ok "demo seed complete -- teams, users, apps and Vikunja are up, credentials are in passwords.txt"

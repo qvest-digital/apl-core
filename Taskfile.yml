@@ -146,6 +146,8 @@ includes:
   images: .taskfiles/images.yml
   install: .taskfiles/install.yml
   verify: .taskfiles/verify.yml
+  # Explicit opt-in only -- never part of `setup`. See .taskfiles/seed.yml's header comment.
+  seed: .taskfiles/seed.yml
 
 tasks:
   default:
