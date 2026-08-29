@@ -451,42 +451,6 @@ apl_create_if_missing() {
   rm -f "$_out"
 }
 
-# apl_delete_if_present <get_url> <delete_url> <token> <label> -- the mirror image of
-# apl_create_if_missing, for retiring demo content this script itself created in an earlier
-# incarnation (the blue/green canary app the Bookinfo services replaced). GETs first so a
-# already-gone resource is a clean no-op rather than a 404 the caller has to special-case.
-#
-# This goes through apl-api like every other write here, NEVER `kubectl delete` on the rendered
-# ArgoCD Application/Deployment: the resource's source of truth is the git values repo, so a raw
-# kubectl delete is reverted by ArgoCD's selfHeal within seconds (CLAUDE.md rule 6).
-apl_delete_if_present() {
-  _del_get_url=$1
-  _del_url=$2
-  _del_token=$3
-  _del_label=$4
-  _del_get_http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' "$_del_get_url" -H "Authorization: Bearer $_del_token")
-  case "$_del_get_http" in
-    [0-9][0-9][0-9]) ;;
-    *) echo "error: checking whether $_del_label exists got no valid HTTP status back (curl said: '$_del_get_http')" >&2; return 1 ;;
-  esac
-  if [ "$_del_get_http" != "200" ]; then
-    return 0
-  fi
-  _del_out=$(mktemp)
-  _del_http=$(curl -sk --max-time 30 -o "$_del_out" -w '%{http_code}' -X DELETE "$_del_url" -H "Authorization: Bearer $_del_token")
-  case "$_del_http" in
-    [0-9][0-9][0-9]) ;;
-    *) echo "error: deleting $_del_label got no valid HTTP status back (curl said: '$_del_http')" >&2; rm -f "$_del_out"; return 1 ;;
-  esac
-  if [ "$_del_http" -ge 300 ] && [ "$_del_http" != "404" ]; then
-    echo "error: deleting $_del_label returned HTTP $_del_http: $(cat "$_del_out")" >&2
-    rm -f "$_del_out"
-    return 1
-  fi
-  rm -f "$_del_out"
-  echo "removed $_del_label"
-}
-
 # --- Gitea: repo content ----------------------------------------------------------------------
 
 # gitea_create_org_repo <org> <repo> <pat> -- creates a private repo under a team's Gitea org,
@@ -506,22 +470,6 @@ gitea_create_org_repo() {
     *) echo "error: creating Gitea repo $_org/$_repo returned HTTP $_http: $(cat "$_out")" >&2; rm -f "$_out"; return 1 ;;
   esac
   rm -f "$_out"
-}
-
-# gitea_delete_org_repo_if_present <org> <repo> <pat> -- removes a repository entirely. Used only
-# to retire the blue/green canary demo repos the earlier version of this seed created; a
-# not-there repo is a clean no-op.
-gitea_delete_org_repo_if_present() {
-  _dr_org=$1
-  _dr_repo=$2
-  _dr_pat=$3
-  _dr_http=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X DELETE \
-    "https://gitea.$DOMAIN/api/v1/repos/$_dr_org/$_dr_repo" -H "Authorization: token $_dr_pat")
-  case "$_dr_http" in
-    204) echo "removed Gitea repo $_dr_org/$_dr_repo" ;;
-    404) ;;
-    *) echo "warning: deleting Gitea repo $_dr_org/$_dr_repo returned HTTP $_dr_http" >&2 ;;
-  esac
 }
 
 # upstream_sparse_subdir <git-url> <ref> <subdir> -- prints a local path holding that ONE

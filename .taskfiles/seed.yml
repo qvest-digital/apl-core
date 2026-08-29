@@ -38,8 +38,8 @@
 # branch `master` -- sparse-cloned on the HOST (which has internet access; pods do not) and
 # force-pushed into that team's Gitea repo as dev-<team>, over HTTPS, with that user's own PAT.
 # See seed-lib.sh's upstream_sparse_subdir / gitea_push_tree. Everything below is done AS
-# dev-<team>, never as platform-admin, except the two things a team admin genuinely may not do
-# (retiring old content, and writing network policies -- see the netpols step).
+# dev-<team>, never as platform-admin, except the one thing a team admin genuinely may not do
+# (writing network policies -- see the netpols step).
 #
 # Getting dev-<team> a Gitea credential needs a real Keycloak SSO login (Gitea accounts are
 # OIDC-JIT-provisioned, never created proactively) -- fully scripted with curl, no browser, see
@@ -162,9 +162,6 @@ vars:
   #     `expected string, got &value.valueUnstructured{Value:true}`. Any other token is fine.
   SEED_NETPOL_LABEL_NAME: bookinfo
   SEED_NETPOL_LABEL_VALUE: bkflag
-  # Names of the retired blue/green canary demo's resources, removed from every seeded team the
-  # first time the Bookinfo seed runs against a cluster that still has them.
-  SEED_RETIRED_NAMES: "canary blue green"
 
 tasks:
   fix-first-login:
@@ -503,40 +500,13 @@ tasks:
   apps:
     desc: "Istio Bookinfo, one microservice per team: Gitea repo + Tekton build + workload + public service, cross-team wired"
     deps: [users]
+    # This task's own polling loops print real progress every few seconds (webhook waits, build
+    # waits, the final cross-team page check) -- but Taskfile.yml's global `output: group` buffers
+    # a task's ENTIRE stdout until its script block exits, so without this flag none of it is
+    # visible until the whole (multi-minute) task finishes, indistinguishable from a hang. See
+    # CLAUDE.md's note on `interactive: true`.
+    interactive: true
     cmds:
-      - |
-        . "{{.LIB}}"
-        . "{{.SEED_LIB}}"
-        KIND_CTX="{{.KIND_CONTEXT}}"
-        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
-        API="https://console.$DOMAIN/api"
-
-        # Retire the blue/green canary demo an earlier version of this seed created. Bookinfo is
-        # the DEFAULT demo content now, not an alternative sitting beside it, so the old resources
-        # go rather than accumulating: two dead ArgoCD Applications and four dead Gitea repos per
-        # team is not a demo anyone wants to be shown.
-        #
-        # As platform-admin, not dev-<team>: this is retiring content, not team self-service, and
-        # it has to work even for a team whose dev user cannot be logged in for some reason. The
-        # Gitea repositories themselves are removed further down, inside setup_team_service, where
-        # that team's own PAT already exists.
-        #
-        # Note the order -- service, then workload, then build, then coderepo: the later ones are
-        # what the earlier ones reference.
-        retire_old_demo() {
-          set -euo pipefail
-          _team=$1
-          _token=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
-          for _n in {{.SEED_RETIRED_NAMES}}; do
-            for _kind in services workloads builds coderepos; do
-              apl_delete_if_present "$API/v2/teams/$_team/$_kind/$_n" "$API/v2/teams/$_team/$_kind/$_n" \
-                "$_token" "$_kind/$_n ($_team)"
-            done
-          done
-        }
-        for TEAM in {{.SEED_TEAMS}}; do
-          apl_run "seed-apps-retire-$TEAM" "Retiring any leftover blue/green canary content in $TEAM" retire_old_demo "$TEAM" || exit $?
-        done
       - |
         . "{{.LIB}}"
         . "{{.SEED_LIB}}"
@@ -690,13 +660,6 @@ tasks:
           # read:user too (confirmed live, same trap already hit and fixed for dev's PAT scope).
           _agent_gitea_pat=$(gitea_mint_pat "$_agent_gitea_user" "read:user,read:organization")
           gitea_wait_for_org_permission "$_agent_gitea_user" "team-$_team" "$_agent_gitea_pat" "can_read"
-
-          # The Gitea half of retiring the blue/green canary demo (the apl-api half ran as
-          # platform-admin in the previous step). Done here because it needs a PAT belonging to
-          # somebody who owns the org, which is exactly the one we just minted.
-          for _old in blue green; do
-            gitea_delete_org_repo_if_present "team-$_team" "$_old" "$GITEA_PAT"
-          done
 
           # The real upstream tree, sparse-cloned on the host. Cached across all four services --
           # one clone of istio/istio for the whole run.
@@ -976,6 +939,10 @@ tasks:
   vikunja:
     desc: "Provision po/dev/agent in Vikunja via OIDC claim-driven team sync; po's project shared with the team"
     deps: [apps]
+    # Same reasoning as apps' interactive: true -- this task's rate-limit-pacing waits (can be
+    # 60s+ per team) print live progress that global `output: group` would otherwise buffer until
+    # the whole task exits.
+    interactive: true
     cmds:
       - |
         . "{{.LIB}}"
@@ -1103,4 +1070,13 @@ tasks:
     cmds:
       - |
         . "{{.LIB}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        # Recomputed here, not passed through from apps: this is a separate task/shell invocation.
+        # Deliberately the LAST thing this whole seed:demo chain prints -- see productpage's own
+        # verify_bookinfo in the apps task for why this URL, not a generic team-ns route, is what
+        # actually proves the demo (it is the one page every other team's content flows into).
+        PRODPAGE_TEAM=$(for S in {{.SEED_BOOKINFO_SERVICES}}; do
+          case "$S" in productpage:*) printf '%s' "$S" | cut -d: -f2 ;; esac
+        done)
         apl_ok "demo seed complete -- teams, users, apps and Vikunja are up, credentials are in passwords.txt"
+        apl_ok "see the demo: https://app-$PRODPAGE_TEAM.$DOMAIN/productpage"
