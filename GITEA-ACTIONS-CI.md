@@ -397,6 +397,21 @@ the cache only after verification, so a truncated file is never reachable under 
 When parallelizing anything else here, audit it for shared write paths first -- the download was
 the only one, but it was not obvious from the call site.
 
+**17. The runner pod must opt out of the Istio sidecar, or every dependency install fails.**
+CI steps are clients of the public internet -- `pip install`, `bundle install`, `npm install`,
+`gradle build`. With a sidecar in the pod that egress is intercepted and the connection is reset:
+observed live 2026-08-29, every `pip install` retried five times against
+`ConnectionResetError(104, 'Connection reset by peer')` on `/simple/blinker/` and the job died with
+`No matching distribution found for blinker==1.9.0`. Nothing in the message points at Istio, and it
+is easy to misread as a proxy/DNS/NetworkPolicy problem -- there is no egress NetworkPolicy in a
+team namespace at all, so that lead is a dead end. The fix is one annotation on the **Job's pod
+template**, `sidecar.istio.io/inject: "false"`, which is exactly what the platform's own build pods
+carry (`charts/team-ns/templates/builds/docker.yaml`) and for the same reason: a build is a client
+of the outside world, not a mesh workload. The runner still reaches in-cluster Gitea normally. When
+comparing a failing pod against a working one, check the annotations before anything else --
+`kubectl get pod <p> -o json | jq .metadata.annotations` answered this in one command after a long
+detour through mesh config and network policies.
+
 ## What the seed leaves behind
 
 All four repos end with CI **green on `main`** and `main` protected — no open PRs, deliberately, so

@@ -184,9 +184,25 @@ proven live — both created real, attributed content (an issue, a task) through
 using platform-user credentials, not the bootstrap admin. **The one finding that matters most:
 neither app's API accepts a raw Keycloak/OIDC token as a bearer credential** — this is a real
 upstream limitation (tracked for Gitea, `go-gitea/gitea#23382`), not something to fix here or route
-around with a cleverer curl invocation. Getting a usable credential for a real platform user means
-completing an actual SSO login, then taking the credential *that app itself* hands back — a Gitea
-Personal Access Token, or a Vikunja Bot Account token. Full detail, including exact API calls,
+around with a cleverer curl invocation.
+
+Two separate things follow from that, and conflating them wastes a session:
+
+- **Logging in as a platform user is OIDC-only.** Gitea's accounts are provisioned by Keycloak, so
+  they carry no local Gitea password — HTTP basic auth with the platform password is rejected
+  (verified live 2026-08-29: `401` against `/api/v1/user`). The valid path is a real SSO login;
+  `gitea_oidc_login` in `.taskfiles/seed-lib.sh` performs exactly that with curl and a cookie jar,
+  and it must run on **every** login, not just at account creation, because Gitea re-syncs org/team
+  membership from the JWT's `groups` claim each time.
+- **Getting an API credential does NOT require logging in at all.** For automation, mint a Personal
+  Access Token with the admin CLI, which needs no session and no SSO:
+  `gitea admin user generate-access-token -u <login> -t <name> --scopes <csv> --raw` — that is what
+  `gitea_mint_pat` does, and every Gitea API call in the seed authenticates with a PAT obtained this
+  way. (`MCP.md`'s PAT recipe is the *human* route, through the web UI after an SSO login.)
+
+Do not read the OIDC-bearer limitation as "the API is closed unless you complete an SSO dance" — a
+mistake made live on 2026-08-29, which led to reading compressed Actions logs out of the Gitea pod's
+filesystem instead of asking the API for them. Full detail, including exact API calls,
 CLI flags, and every trap that cost real time (a crash-looping sidecar, a session model that
 silently dropped auth between requests, a UI search box that can't find the very account you just
 created) is in `MCP.md` — read it before touching either server again, and before wiring any MCP

@@ -70,6 +70,16 @@ spec:
         activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
         template:
           metadata:
+            annotations:
+              # No Istio sidecar. CI steps talk to the public internet (pip/gem/npm/gradle), and
+              # with a sidecar in the pod that egress is intercepted and reset -- observed live
+              # 2026-08-29: every `pip install` retried five times against
+              # ConnectionResetError(104) and the job failed with "No matching distribution found".
+              # This is the same annotation the platform's own Tekton build pods carry (see
+              # charts/team-ns/templates/builds/docker.yaml), for the same reason: a build is not a
+              # mesh workload, it is a client of the outside world. The runner still reaches
+              # in-cluster Gitea normally, just without the proxy in front of it.
+              sidecar.istio.io/inject: "false"
             labels:
               app: ci-runner
           spec:

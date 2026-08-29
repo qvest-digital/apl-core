@@ -86,6 +86,25 @@ you need. That PAT is a normal `Authorization: Bearer <token>` credential gitea-
 unmodified. Nothing gitea-mcp-specific here; it's exactly how a human would get API access to
 their own Gitea account.
 
+> **That is the *human* route, and it is not the one automation should take.** From a script or an
+> agent, a PAT needs no browser, no SSO redirect and no session at all — the admin CLI mints one
+> directly:
+>
+> ```sh
+> kubectl exec -n gitea deploy/gitea -c gitea -- \
+>   gitea admin user generate-access-token -u <gitea-login> -t <unique-name> --scopes <csv> --raw
+> ```
+>
+> `gitea_mint_pat` in `.taskfiles/seed-lib.sh` is exactly this, and every Gitea API call the demo
+> seed makes is authenticated with a PAT obtained that way. Note the `-u` argument is Gitea's
+> *login name*, which for these OIDC-provisioned users is the email with `@` and `.` replaced by
+> `-` (e.g. `dev-prodpage-172-18-255-200-nip-io`), not the email itself —
+> `gitea admin user list` prints the real names.
+>
+> SSO login is still required for a different purpose: `gitea_oidc_login` must run to provision the
+> account and to re-sync its org/team membership from the JWT `groups` claim, which Gitea redoes on
+> every login. Provisioning and credentials are two separate problems; only the first needs SSO.
+
 **Vikunja — Bot Accounts, not personal API tokens.** Vikunja has a first-class "bot user" concept
 (Settings → Bots, `/user/settings/bots`) distinct from a personal API token:
 
