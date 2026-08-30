@@ -438,6 +438,21 @@ harbor_make_project_public() {
   esac
 }
 
+# harbor_delete_tag <project> <repo> <tag> -- delete one tag's artifact. Needs
+# $HARBOR_ADMIN_PASSWORD, like the others.
+#
+# Used only by SEED_FORCE_RUNNER_BUILD. The runner build is trigger:false and seed:runners skips it
+# when the tag exists, so deleting the tag is what makes a changed .gitea/runner/Dockerfile
+# actually rebuild on a cluster that already has the image.
+harbor_delete_tag() {
+  _hdt_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+    -X DELETE "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
+  case "$_hdt_code" in
+    200|404) echo "harbor tag $1/$2:$3 removed (HTTP $_hdt_code)" ;;
+    *) echo "error: deleting harbor tag $1/$2:$3 returned HTTP $_hdt_code" >&2; return 1 ;;
+  esac
+}
+
 # --- apl-api: create-if-missing ---------------------------------------------------------------
 
 # apl_create_if_missing <get_url> <post_url> <token> <body> <label> -- unlike /v2/teams (which

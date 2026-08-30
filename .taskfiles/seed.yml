@@ -142,6 +142,10 @@ vars:
   SEED_RUNNER_SHA256: "0cccfbb0333b2126b66b331b94e36bf74f034037add09c4a9ff3fb042968cba6"
   # Second AplTeamBuild per repo, building .gitea/runner/Dockerfile into this image name.
   SEED_RUNNER_IMAGE_NAME: ci-runner
+
+  # Off by default. See the skip in seed:runners: the runner build is trigger:false, so a changed
+  # .gitea/runner/Dockerfile is invisible to a cluster that already has the image.
+  SEED_FORCE_RUNNER_BUILD: '{{.SEED_FORCE_RUNNER_BUILD | default "false"}}'
   # The status check branch protection requires. "<workflow name> / <job id> (<event>)" -- all four
   # workflows are `name: ci` with a single job `ci`, deliberately, so this one string fits them all.
   SEED_CI_STATUS_CONTEXT: "ci / ci (pull_request)"
@@ -1293,8 +1297,19 @@ tasks:
               '{kind:"AplTeamBuild", metadata:{name:$name}, spec:{imageName:$image, tag:"main", trigger:false, scanSource:false, mode:{type:"docker", docker:{repoUrl:$url, path:"./.gitea/runner/Dockerfile", revision:"main"}}}}')" \
             "runner build $_build ($_team)"
 
+          # The runner build is trigger:false, so nothing rebuilds it on a push -- and this skip
+          # means a CHANGED .gitea/runner/Dockerfile can never reach a cluster that already has the
+          # image. Fine for the demo's steady state, and a real trap while iterating on that
+          # Dockerfile: the seed reports success having built nothing. Confirmed live 2026-08-30,
+          # when a PATH fix in the runner image was silently ignored for a whole seed run.
+          #
+          # SEED_FORCE_RUNNER_BUILD=true deletes the tag first, which is what makes the build run.
+          # A fresh cluster never needs it: there is no tag, so the current Dockerfile always wins.
+          if [ "{{.SEED_FORCE_RUNNER_BUILD}}" = "true" ]; then
+            harbor_delete_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main || true
+          fi
           if harbor_has_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main; then
-            apl_skip "runner image already in Harbor for team-$_team"
+            apl_skip "runner image already in Harbor for team-$_team (SEED_FORCE_RUNNER_BUILD=true rebuilds it)"
           else
             wait_for_runner_build "$_team" "$_build"
           fi
