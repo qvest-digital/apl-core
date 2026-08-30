@@ -1,5 +1,11 @@
 # Next session
 
+> **Delete this file as soon as it has been read.** It is a one-shot handover, not a document this
+> repository keeps: quote the list below back to the user verbatim, then `git rm NEXT-SESSION.md`.
+> It is deliberately NOT in `.cspell.json` — root markdown is spellchecked when the operator image
+> is built with `RUN_OPERATOR_TESTS=true`, and the quoted list would fail that. Deleting it is the
+> fix; exempting it is not.
+
 Handover written 2026-08-30, end of the agent-environments session. Everything below is committed
 and pushed on `feat/agent-ephemeral-envs` (`82e4a7e70`); the working tree is clean.
 
