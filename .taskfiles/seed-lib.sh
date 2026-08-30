@@ -413,6 +413,70 @@ gitea_ensure_team_credentials() {
 
 # --- Harbor -----------------------------------------------------------------------------------
 
+# harbor_oidc_login <email> <password> -- completes Harbor's own Keycloak SSO round trip, the same
+# shape as gitea_oidc_login. Returns 0 on success; prints nothing on the happy path.
+#
+# Harbor needs this ONCE per identity before its API will treat that identity as anything at all.
+# A raw Keycloak bearer for a user Harbor has never seen is handled as ANONYMOUS: reads return only
+# public projects and writes fail with 401 (not 403 -- the 401/403 distinction is how you tell
+# "unknown identity" from "known identity, wrong role"). After one login the user row exists and
+# the same bearer is a full identity. Verified live 2026-08-30 on a fresh cluster.
+harbor_oidc_login() {
+  _hol_email=$1
+  _hol_password=$2
+
+  _hol_jar=$(mktemp)
+  _hol_body=$(mktemp)
+  curl -sk --max-time 20 -c "$_hol_jar" -o "$_hol_body" -L --max-redirs 10 "https://harbor.$DOMAIN/c/oidc/login"
+  _hol_action=$(grep -o 'action="[^"]*"' "$_hol_body" | head -1 | sed 's/action="//; s/"$//; s/&amp;/\&/g')
+  rm -f "$_hol_body"
+  [ -n "$_hol_action" ] || { echo "error: no Keycloak login form at Harbor's /c/oidc/login" >&2; rm -f "$_hol_jar"; return 1; }
+
+  _hol_headers=$(mktemp)
+  curl -sk --max-time 20 -b "$_hol_jar" -c "$_hol_jar" -D "$_hol_headers" -o /dev/null \
+    --data-urlencode "username=$_hol_email" --data-urlencode "password=$_hol_password" --data-urlencode "credentialId=" \
+    -X POST "$_hol_action"
+  _hol_cb=$(grep -i '^location:' "$_hol_headers" | sed 's/^[Ll]ocation: //; s/\r$//')
+  rm -f "$_hol_headers"
+  case "$_hol_cb" in
+    *required-action*)
+      echo "error: $_hol_email has a pending Keycloak required action -- run 'go-task seed:fix-first-login'" >&2
+      rm -f "$_hol_jar"; return 1 ;;
+    "")
+      echo "error: Keycloak did not redirect for $_hol_email -- check the password" >&2
+      rm -f "$_hol_jar"; return 1 ;;
+  esac
+
+  curl -sk --max-time 20 -b "$_hol_jar" -c "$_hol_jar" -o /dev/null -L --max-redirs 10 -X GET "$_hol_cb"
+  grep -qi 'sid' "$_hol_jar" || { echo "error: no Harbor session cookie after the OIDC callback" >&2; rm -f "$_hol_jar"; return 1; }
+  rm -f "$_hol_jar"
+}
+
+# harbor_ensure_platform_admin -- log platform-admin into Harbor once, so harbor_token's bearer is a
+# real identity. Call it ONCE in a task preamble, before any parallel work; it is deliberately NOT
+# called from harbor_token, because apl_run_parallel would then run one login per team subshell,
+# concurrently, for no benefit.
+#
+# platform-admin specifically, because it is the only identity that can do what the seed needs:
+# Harbor's oidc_admin_group is set to `platform-admin`, so that group's members act as Harbor
+# sysadmins. A TEAM ADMIN cannot -- apl-harbor-operator binds `team-<team>` as **developer** and
+# gives projectAdmin to `all-teams-admin`, which has no members, so a team admin gets 403 flipping
+# its own project's visibility even though the Console shows it as team admin. Verified live
+# 2026-08-30 for dev-ratings, and by hand in the Harbor web UI. Changing that would be an
+# apl-harbor-operator change in apl-tasks, not a seed change.
+_HARBOR_PLATFORM_ADMIN_READY=""
+harbor_ensure_platform_admin() {
+  [ -n "${_HARBOR_PLATFORM_ADMIN_READY:-}" ] && return 0
+  _hepa_user=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  _hepa_pass=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+  [ -n "$_hepa_user" ] && [ -n "$_hepa_pass" ] || { echo "error: platform-admin-initial-credentials came back empty" >&2; return 1; }
+  harbor_oidc_login "$_hepa_user" "$_hepa_pass" || return 1
+  _HARBOR_PLATFORM_ADMIN_READY=1
+  echo "platform-admin signed in to Harbor (its API bearer is now a real identity, with sysadmin via oidc_admin_group)"
+}
+
 # harbor_token -- a platform-admin OIDC access token, accepted by Harbor's API as a bearer
 # credential. Harbor runs in auth_mode oidc_auth against the same Keycloak realm as everything
 # else here, so the platform's own admin identity IS a Harbor admin identity -- no second

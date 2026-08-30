@@ -571,6 +571,11 @@ tasks:
         # same realm, so the platform admin already IS a Harbor admin. This names the OIDC client
         # whose secret mints that token; harbor_token defaults to the same value if it is unset.
         export OAUTH2_PROXY_CLIENT_SECRET_NAME="{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}"
+        # Once, here, before any parallel work: Harbor treats a bearer for a user it has never seen
+        # as ANONYMOUS, so without this every harbor_* call reads only public projects and writes
+        # 401. See harbor_ensure_platform_admin for why it must be platform-admin and not a team
+        # admin (team groups are bound as developer; projectAdmin goes to an empty group).
+        harbor_ensure_platform_admin || exit $?
 
         # A NORMAL team, deliberately. `team-admin` looks like the obvious owner for platform-wide
         # assets and is unusable: its Gitea org has no human members, so platform-admin is not even
@@ -793,6 +798,11 @@ tasks:
         # same realm, so the platform admin already IS a Harbor admin. This names the OIDC client
         # whose secret mints that token; harbor_token defaults to the same value if it is unset.
         export OAUTH2_PROXY_CLIENT_SECRET_NAME="{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}"
+        # Once, here, before any parallel work: Harbor treats a bearer for a user it has never seen
+        # as ANONYMOUS, so without this every harbor_* call reads only public projects and writes
+        # 401. See harbor_ensure_platform_admin for why it must be platform-admin and not a team
+        # admin (team groups are bound as developer; projectAdmin goes to an empty group).
+        harbor_ensure_platform_admin || exit $?
 
         # dev-<team>'s own Keycloak bearer token -- same ROPC pattern seed:auth uses for
         # platform-admin, just with dev-<team>'s own credentials. Everything below runs AS that
@@ -1254,6 +1264,11 @@ tasks:
         # tag", meaning the "already in Harbor, skipping" branch could never fire and a rerun
         # rebuilt all four runner images even when they were current.
         export OAUTH2_PROXY_CLIENT_SECRET_NAME="{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}"
+        # Once, here, before any parallel work: Harbor treats a bearer for a user it has never seen
+        # as ANONYMOUS, so without this every harbor_* call reads only public projects and writes
+        # 401. See harbor_ensure_platform_admin for why it must be platform-admin and not a team
+        # admin (team groups are bound as developer; projectAdmin goes to an empty group).
+        harbor_ensure_platform_admin || exit $?
 
         # Same 60-second-token discipline as seed:apps -- this task waits minutes for image builds,
         # so a token fetched up front would be long dead by the time it is used.
