@@ -396,3 +396,104 @@ result += "  \"text\": \"Absolutely fun and entertaining...\"";
 Java concatenates strings happily, so this compiles, lints and passes CI, and emits
 `"reviewer": "Bob"  "text": ...` — invalid JSON that breaks only when productpage parses the
 response. Correcting it and pushing to the same branch updated the existing PR in place.
+
+## 17. The agent can read the whole environment's logs — proven, with a demo
+
+An agent on an ephemeral node can query the logs of **every service in its environment, including
+the ones belonging to other teams**, with no special grant. This is the single most useful
+capability found so far, and it needs no per-service instrumentation.
+
+### How the logs get there
+
+`promtail` is vestigial on this platform — `values-schema.yaml:2368` and
+`helmfile.d/snippets/defaults.yaml:901` declare it with `enabled: false`, but there is **no chart
+for it and no Console tile**, so it cannot be switched on and does not need to be. Enabling Loki
+brings up an **OpenTelemetry Collector daemonset** (`platform-logs`, namespace `otel`) which reads
+`/var/log/pods/*` and routes by namespace:
+
+```
+file_log → k8s_attributes → routing connector
+  resource.attributes["namespace"] == "team-reviews"  →  X-Scope-OrgID: reviews
+```
+
+So a team's logs land in that team's own Loki tenant, automatically. Everything not matching a team
+namespace goes to tenant `admins`.
+
+Two endpoints, and picking the wrong one wastes an hour:
+
+| endpoint | auth |
+|---|---|
+| `loki-headless.monitoring:3101` | basic auth **only** — a reverse proxy derives the tenant from the username. **Use this.** |
+| `loki-gateway.monitoring:80` | basic auth **plus** an explicit `X-Scope-OrgID` header, else `401 no org id` |
+
+The user→tenant table lives in the `reverse-proxy-auth-config` Secret in `monitoring`, one row per
+team — as **plaintext** passwords, not hashes.
+
+### Giving the agent access
+
+Same shape as the git credential, and for the same reason: `LOKI_PASSWORD` ends in `_PASSWORD`, so
+Turnstone's `scrubbed_env()` strips it and `logcli` would fail with an auth error that looks nothing
+like the cause. Mount the credential as a file and ship a wrapper on `PATH`:
+
+```sh
+logs                                                    # everything in the namespace
+logs '{namespace="team-reviews",deployment="env-demo-reviews"}'
+logs '{namespace="team-reviews"} |= "reviews/0"' 50
+```
+
+`logcli` (a single Go binary, `LOKI_ADDR`/`LOKI_USERNAME`/`LOKI_PASSWORD`/`LOKI_ORG_ID`) is the
+better long-term answer and belongs in the node image; the wrapper needs only `curl` and `jq`,
+which the stock image already has.
+
+**Two traps in building that wrapper.** `start_at: "end"` on the collector's `file_log` receiver
+means it only reads lines written *after* it started — a freshly enabled Loki looks permanently
+broken until something generates traffic, and every tenant returns `{"status":"success"}` with no
+data, including tenants that do not exist. And in the script itself, do **not** write
+`Q="${1:-{namespace=\"team-reviews\"}}"`: a default value containing `}` terminates the parameter
+expansion at its first brace and appends the remainder to the query, producing a malformed LogQL
+selector and a `jq` parse error that points nowhere near the cause. Assign the default separately.
+
+### The demo
+
+Prompt, given to the node's own UI:
+
+> You have a `logs` command that queries this environment's logs with LogQL. Run `logs` with no
+> arguments first to see what's there. Then curl the productpage a few times, and use `logs` to
+> trace one of those requests through the environment. The istio-proxy access lines carry a request
+> id — use it to show which services the request hit and in what order, with status codes and
+> latencies. Tell me which backends you can see, and whether any of them are services this team does
+> not own.
+
+What came back: a rendered request-flow diagram and this table, reconstructed purely from
+`istio-proxy` access logs correlated on one request id.
+
+| step | service | endpoint | status | latency |
+|---|---|---|---|---|
+| 1 | productpage | `GET /productpage?u=normal` | 200 | 183ms |
+| 2 | details | `GET /details/0` | 200 | 16ms |
+| 3 | reviews | `GET /reviews/0` | 200 | 148ms |
+| 4 | ratings | `GET /ratings/0` | 200 | 41ms |
+
+**On `claude-haiku-4-5`, in 6 tool calls, using 12.7% of a 200k context.** Distributed tracing
+across four services, with no tracing stack, no instrumentation, and a cheap model — because every
+pod's Envoy sidecar already logs the request id, and the sidecar logs are captured for free.
+
+### Two findings from the result
+
+**The ephemeral environment erases the ownership signal.** The agent concluded that all four
+services "are owned by this team", because they are all in `team-reviews` with an `env-demo-`
+prefix. Read as a statement about the namespace that is correct; read as a statement about the
+organisation it is wrong — `productpage`, `details` and `ratings` belong to three other teams and
+are only co-located here because an environment is one namespace (§10).
+
+This is the intended trade and it cuts both ways: co-location is exactly what gives the agent
+cross-service debugging with no grant, and it is also why the agent cannot tell which backends it
+may *change*. An agent asked to fix a bug in this environment would have no signal that three of
+these four services are not its to edit. If the pipeline ever lets an agent open PRs against
+whatever it debugs, that signal has to be supplied explicitly — the namespace will not carry it.
+
+**Read-only, and on a shared credential.** Unlike the Gitea PAT this is not a per-environment
+token: Loki OSS has no token concept, the tenant is chosen by basic-auth username, and the password
+is a long-lived per-team value stored in plaintext. A leak means rotating a shared team credential
+rather than revoking one environment's. Accepted for now because the access is read-only and
+tenant-scoped; recorded here rather than solved.
