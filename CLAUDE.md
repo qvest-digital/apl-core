@@ -359,10 +359,10 @@ restart needed. Full account, including the specific failure mode this generaliz
 
 ## Traps that will cost you an hour each
 
-**Build from a clean context, not the working directory.** `npm run test:ci` spellchecks every
-root-level `*.md`. `docker build .` copies your whole working tree, so stray local notes fail the
-build with an error that has nothing to do with the code — and `.git/info/exclude` does not apply to
-Docker. Always:
+**Build from a clean context, not the working directory.** `docker build .` copies your whole
+working tree, and `.git/info/exclude` does not apply to Docker — so the image is built from whatever
+happens to be lying around rather than from what a fresh clone would produce. Exporting tracked
+files makes the build reproducible and keeps local scratch out of it. Always:
 
 ```bash
 CTX=$(mktemp -d)
@@ -580,5 +580,8 @@ unanswered — particularly anything that narrows scope or changes tracked files
 - `main` is the fully merged state. Reference PRs against `reference/base` exist for reading only
   and must never be merged; they are drafts and titled `[reference]`.
 - Commit messages are conventional commits, with a body explaining *why*, not just what.
-- Root `*.md` files are spellchecked. New jargon goes in `.cspell.json`, inserted in alphabetical
-  order — do not let a formatter rewrite that file, it will reflow unrelated arrays.
+- **There is no spellchecker.** `cspell`, the `spellcheck` npm script and `.cspell.json` were removed
+  from this fork deliberately: policing prose in a software project cost more attention than it ever
+  returned, and every hit it produced here was a real word it did not know. Do not reintroduce it,
+  and do not add jargon lists anywhere. If an upstream merge brings it back, drop it again — see
+  `UPSTREAM-SYNC.md` §3.

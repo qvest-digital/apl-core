@@ -70,7 +70,7 @@ protecting when you resolve):
 | `chart/apl/templates/deployment.yaml`, `post-job.yaml` | `651782eaf` | image repo/pull-policy settable |
 | `charts/team-ns/templates/builds/docker.yaml` | kaniko/CA-trust comment commits | comment-only in the fork: the `sslVerify: false` / `--skip-tls-verify` block now cites `CLAUDE.md`'s CA-trust section rather than the deleted `POD-EGRESS-INVESTIGATION.md`. Trivial to resolve — keep upstream's logic, keep the fork's comment |
 | `values/gitea/gitea.gotmpl`, `values/argocd-image-updater/*.gotmpl` | same | comment-only, same reason as above |
-| `.cspell.json` | several docs commits | fork-only jargon (Vikunja, Turnstone, etc.) — trivial, always keep both sides' words |
+| `.cspell.json`, `package.json` | the spellcheck-removal commit | **this fork deleted `cspell` entirely** — the `spellcheck` script, the `lint` entry, the devDependency and `.cspell.json` itself. An upstream merge will try to restore all four; drop them again rather than merging, and check `package-lock.json` came back clean |
 
 Two of these are the ones actually likely to fight upstream line-for-line, because they are places
 upstream also edits often:
@@ -93,7 +93,7 @@ timeout 60 bin/gen-chart-schema.sh                 # values.schema.json is gitig
 git ls-files charts/vikunja charts/turnstone | grep values.yaml   # confirm .git/info/exclude didn't eat one
 ```
 
-Then run the test suite from a clean context (root `*.md` spellcheck trap applies here same as any
+Then run the test suite from a clean context (the clean-context build rule applies here same as any
 build — see `CLAUDE.md` §"Traps that will cost you an hour each").
 
 ## 4b. While you're in here: check for stale pinned tool versions too

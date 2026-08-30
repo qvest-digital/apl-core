@@ -118,14 +118,16 @@ git log --oneline $(git merge-base upstream/main main)..main
 
 ### 6. Fork-only docs and tooling · `a7d8395f2` + `03aa5d1d5`
 
-- **Files:** `SETUP.md`, `CLAUDE.md`, `UPGRADE.md`, `bin/gen-chart-schema.sh`, `.cspell.json`,
-  `.gitignore`, and the fork section of `README.md`
-- **Always keep ours.** Only `README.md`, `.cspell.json` and `.gitignore` can conflict, because
-  upstream owns those files too. Resolve all three by **union**: keep upstream's content and
-  re-apply our additions on top. For `.cspell.json` that means merging the two `ignoreWords` arrays
-  and keeping them in alphabetical order — see the rule in `CLAUDE.md`; do not let a formatter
-  reflow the file. Our only `.gitignore` addition is `passwords.txt` (SETUP.md step 9); losing it
-  means a lab credential dump becomes committable.
+- **Files:** `SETUP.md`, `CLAUDE.md`, `UPGRADE.md`, `bin/gen-chart-schema.sh`, `.gitignore`, and the
+  fork section of `README.md`
+- **Always keep ours.** Only `README.md` and `.gitignore` can conflict, because upstream owns those
+  files too. Resolve both by **union**: keep upstream's content and re-apply our additions on top.
+  Our only `.gitignore` addition is `passwords.txt` (SETUP.md step 9); losing it means a lab
+  credential dump becomes committable.
+- **`.cspell.json` is gone, deliberately.** This fork removed the spellchecker outright — the
+  `spellcheck` script, its entry in `lint`, the `cspell` devDependency and the config file. Upstream
+  still has all four, so a merge will reintroduce them; delete them again rather than resolving.
+  See `UPSTREAM-SYNC.md` §3 and the repository conventions in `CLAUDE.md`.
 
 ---
 

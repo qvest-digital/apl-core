@@ -508,10 +508,10 @@ docker build --build-arg VERSION=6.2.1-fork \
              -t apl-core-local:v6.2.1-fork "$CTX"
 ```
 
-`npm run test:ci` spellchecks every root-level `*.md`, and `docker build .` copies your whole working
-tree — so stray local notes fail the build on an unknown word, with an error that looks nothing like
-its cause. `.git/info/exclude` hides files from git, not from Docker. Exporting tracked files
-sidesteps it and builds exactly what a fresh clone would.
+`docker build .` copies your whole working tree, and `.git/info/exclude` hides files from git but
+not from Docker — so the image ends up built from whatever happens to be lying around locally.
+Exporting tracked files builds exactly what a fresh clone would, which is the only version anyone
+else can reproduce.
 
 **`APPS_REVISION` is not optional here, and omitting it fails in a way that looks like success.** The
 platform does not carry its Argo CD chart definitions inside the image — it pulls them from
@@ -1773,7 +1773,7 @@ Each of these cost real time.
 | Trap | Consequence |
 |---|---|
 | `docker build ... \| tail` | reports *tail's* exit code — a failed build looks successful and produces no image |
-| Building from the working directory | local `*.md` files fail the build's spellcheck |
+| Building from the working directory | the image is built from local scratch files, not from what a fresh clone would produce |
 | Skipping `bin/gen-chart-schema.sh` | Helm validates nothing, silently |
 | Copying a MetalLB range from notes | MetalLB advertises an unreachable IP |
 | `domainSuffix` not matching the pool | every platform hostname resolves to the wrong place |
