@@ -196,6 +196,13 @@ neither app's API accepts a raw Keycloak/OIDC token as a bearer credential** —
 upstream limitation (tracked for Gitea, `go-gitea/gitea#23382`), not something to fix here or route
 around with a cleverer curl invocation.
 
+⛔ **That finding is about a raw token, NOT about the platform identity.** `platform-admin` and every
+team user *can* reach these APIs — by completing the app's OIDC flow and keeping the session or JWT
+it returns, which is exactly what `gitea_oidc_login` and `vikunja_oidc_login` do. Misreading this
+paragraph as "OIDC identities cannot use the API" and reaching for a per-app bootstrap password
+instead is a repeated, expensive mistake here; the binding rule is in "Traps that will cost you an
+hour each" above, and every integration doc now repeats it.
+
 Two separate things follow from that, and conflating them wastes a session:
 
 - **Logging in as a platform user is OIDC-only.** Gitea's accounts are provisioned by Keycloak, so
@@ -470,6 +477,47 @@ a running cluster, check the source revision *first*:
 kubectl get application <app> -n argocd -o jsonpath='{.spec.source.targetRevision}'
 git diff <that-revision> -- charts/<name>      # non-empty = the cluster cannot see your change
 ```
+
+**This whole platform is OIDC-integrated — the platform admin can reach every app's API, and the
+way in is the app's OIDC login flow.** Every app authenticates against the same Keycloak realm, so
+`platform-admin` already *is* an admin in Gitea, Harbor, Vikunja and Turnstone — the same identity
+the Console's apps page signs you in with. Do not go hunting for a per-app bootstrap password in a
+Kubernetes Secret because an app "has its own admin". That is a second credential path the platform
+does not need, and reaching for it is a recurring mistake here.
+
+**The flow, not a bearer token.** Fetching a Keycloak access token and sending it as
+`Authorization: Bearer` is *not* the OIDC flow, and it is the wrong test for whether an app is
+reachable: Gitea, Vikunja and Turnstone all answer `401` to a raw token, exactly as they do to a
+bogus one. What works is the authorization-code round trip the browser performs — hit the app's
+OIDC entrypoint with a cookie jar, POST the credentials to the Keycloak form it returns, follow the
+callback back, and keep the app session cookie or JWT that lands in the jar. Three worked
+implementations already exist, so write a fourth by copying one, never by inventing a flow:
+
+| app | helper | what you get |
+|---|---|---|
+| Gitea | `gitea_oidc_login` (`.taskfiles/seed-lib.sh`) | session; pair with `gitea_mint_pat` for an API token |
+| Vikunja | `vikunja_oidc_login` / `vikunja_login` | a Vikunja JWT |
+| Turnstone | none yet — `GET /v1/api/auth/oidc/authorize`, same shape | `turnstone_auth_console` cookie |
+| Harbor | `harbor_token` | Harbor also accepts a **raw** Keycloak bearer, unusually — verified live |
+
+Verified live 2026-08-30: the Turnstone flow above logs `platform-admin` in with `admin.settings`
+and `admin.models` (`/v1/api/auth/whoami`), and `PUT /v1/api/admin/settings/model.default_alias`
+succeeds with that session. Harbor's bearer reaches admin-only `/api/v2.0/users` and
+`/configurations` and writes with `PUT /projects/{id}`.
+
+**Two things that genuinely are not this.** Docker/OCI *registry* auth (skopeo, `docker login`)
+needs a per-user CLI secret rather than any of the above; the one recipe that needs it (mirroring a
+base image into Harbor with skopeo) is preserved as a comment in `.taskfiles/seed-lib.sh` and reads
+the password straight out of the `harbor-admin-password` Secret. And Keycloak's own master-realm administration
+(`kc_master_token`) is the IdP bootstrapping itself: a realm user cannot administer the realm.
+
+**Testing this wrong is easy, so test it right.** Never measure authentication against an endpoint
+that answers anonymously — `GET /api/v2.0/projects`, or any public project's `/repositories`,
+returns `200` for *anyone*, a deliberately bogus credential included. Use an admin-only endpoint
+(`/users`, `/configurations`, `/whoami`) and always run a bogus credential as a control. Both
+mistakes were made live on 2026-08-30: a `200` from an anonymous endpoint read as "the password
+works", and a `401` from a raw bearer read as "platform-admin cannot use this API". Both
+conclusions were wrong, and the second one is the one that keeps coming back.
 
 **Never run `docker system prune -a`.** It will destroy unrelated containers, images and volumes
 belonging to other projects on this machine. If you need disk, `docker builder prune` is safe.

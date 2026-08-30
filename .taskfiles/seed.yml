@@ -566,12 +566,11 @@ tasks:
         # harbor_has_tag's curl authenticated as "admin:" , got 401, and returned false EVERY time.
         # The "runner image already in Harbor" skip below therefore never fired, and the build wait
         # was satisfied instead by whatever old PipelineRun of the same name was lying around.
-        HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
-          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
-        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
-        HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
-          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
-        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
+        # Harbor's API is reached with a platform-admin OIDC token (harbor_token in seed-lib.sh),
+        # not the Harbor bootstrap admin password -- Harbor is in auth_mode oidc_auth against this
+        # same realm, so the platform admin already IS a Harbor admin. This names the OIDC client
+        # whose secret mints that token; harbor_token defaults to the same value if it is unset.
+        export OAUTH2_PROXY_CLIENT_SECRET_NAME="{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}"
 
         # A NORMAL team, deliberately. `team-admin` looks like the obvious owner for platform-wide
         # assets and is unusable: its Gitea org has no human members, so platform-admin is not even
@@ -644,7 +643,7 @@ tasks:
           while [ "$_tries" -lt 40 ]; do
             _ns=$(kubectl --context "$KIND_CTX" --request-timeout=15s get ns "team-$TEAM" -o jsonpath='{.status.phase}' 2>/dev/null || true)
             _org=$(curl -sk --max-time 10 "https://gitea.$DOMAIN/api/v1/orgs/team-$TEAM" 2>/dev/null | jq -r '.username // empty' 2>/dev/null || true)
-            _hb=$(curl -sk --max-time 10 -u "admin:$HARBOR_ADMIN_PASSWORD" "https://harbor.$DOMAIN/api/v2.0/projects?name=team-$TEAM" 2>/dev/null | jq -r '.[0].name // empty' 2>/dev/null || true)
+            _hb=$(curl -sk --max-time 10 -H "Authorization: Bearer $(harbor_token)" "https://harbor.$DOMAIN/api/v2.0/projects?name=team-$TEAM" 2>/dev/null | jq -r '.[0].name // empty' 2>/dev/null || true)
             if [ "$_ns" = "Active" ] && [ -n "$_org" ] && [ -n "$_hb" ]; then return 0; fi
             _tries=$((_tries + 1)); sleep 15
           done
@@ -789,9 +788,11 @@ tasks:
         export SEED_RUNNER_VERSION="{{.SEED_RUNNER_VERSION}}"
         # Needed by harbor_has_tag below -- "is there already an image for this repo?" is what
         # decides whether an unchanged source tree still needs a build.
-        HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
-          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
-        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
+        # Harbor's API is reached with a platform-admin OIDC token (harbor_token in seed-lib.sh),
+        # not the Harbor bootstrap admin password -- Harbor is in auth_mode oidc_auth against this
+        # same realm, so the platform admin already IS a Harbor admin. This names the OIDC client
+        # whose secret mints that token; harbor_token defaults to the same value if it is unset.
+        export OAUTH2_PROXY_CLIENT_SECRET_NAME="{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}"
 
         # dev-<team>'s own Keycloak bearer token -- same ROPC pattern seed:auth uses for
         # platform-admin, just with dev-<team>'s own credentials. Everything below runs AS that
@@ -1030,6 +1031,24 @@ tasks:
             return 1
           fi
 
+          # Public = world-readable, still team-writable. Harbor's public flag grants anonymous
+          # PULL only: a request asking for push against a public project is issued a token whose
+          # access is ["pull"] and nothing more (verified live 2026-08-30 against this lab's own
+          # token service), so write access stays exactly where it was -- with the project's
+          # members, whose membership is OIDC-driven like the rest of the platform.
+          #
+          # Needed because the platform operator creates every team project PRIVATE and
+          # harbor-pullsecret is team-scoped, so team-reviews cannot pull team-prodpage/productpage.
+          # That is what blocks a whole Bookinfo environment from running in ONE namespace, which is
+          # what an ephemeral per-PR environment needs. AGENT-ENVIRONMENTS.md section 10 recorded
+          # this as applied live and NOT yet seeded; this is that gap closed. In this lab "public"
+          # means company-internal, the same reading already used for the Gitea repos.
+          #
+          # Placed after the build, not before: nothing here needs it earlier (the team's own
+          # kaniko push authenticates as the team), and by this point the project is certain to
+          # exist because the image was just pushed into it.
+          harbor_make_project_public "team-$_team" || return 1
+
           # Fresh token: the build above can take many minutes, far past the 60s token lifespan.
           API_TOKEN=$(dev_team_token "$_team")
           _image_repo="harbor.$DOMAIN/team-$_team/$_repo"
@@ -1230,6 +1249,11 @@ tasks:
         export SEED_RUNNER_URL="{{.SEED_RUNNER_URL}}"
         export SEED_RUNNER_SHA256="{{.SEED_RUNNER_SHA256}}"
         export SEED_RUNNER_VERSION="{{.SEED_RUNNER_VERSION}}"
+        # harbor_has_tag and harbor_delete_tag below both need this. This task previously carried no
+        # Harbor credential at all -- so every harbor_has_tag here was refused and answered "no
+        # tag", meaning the "already in Harbor, skipping" branch could never fire and a rerun
+        # rebuilt all four runner images even when they were current.
+        export OAUTH2_PROXY_CLIENT_SECRET_NAME="{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}"
 
         # Same 60-second-token discipline as seed:apps -- this task waits minutes for image builds,
         # so a token fetched up front would be long dead by the time it is used.

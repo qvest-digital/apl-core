@@ -206,10 +206,16 @@ library  team-details  team-prodpage  team-ratings  team-reviews   -> all public
 With that, a single namespace can run the whole environment, and `team-reviews` hosts all four
 `env-demo-*` services.
 
-**This is not yet in the seed.** It was applied live. `.taskfiles/seed-lib.sh` already carries an
-unused `harbor_ensure_project` helper that creates projects with `"public":true` — folding it into
-`seed:apps` is the outstanding work, and until then a rebuilt lab returns to private projects and
-this blocker comes back.
+**Now seeded** (2026-08-30). `setup_team_service` in `seed:apps` calls `harbor_make_project_public`
+for each team once its image has been pushed, so a rebuilt lab no longer returns to private
+projects. `harbor_ensure_project` stays unused: the platform operator creates each team's project
+itself, as private, so a create call 409s and the visibility never changes — flipping an existing
+project is the operation this actually needs.
+
+Public is read-only for everyone outside the team: Harbor's public flag grants anonymous **pull**
+only. Verified live against this lab's token service — a request for `pull,push` on a public project
+comes back with `access: [{actions: ["pull"]}]`, so push still requires a project member and
+membership stays OIDC-driven.
 
 ## 11. Catalogs are the mechanism for "the entire environment" — not yet built
 
@@ -621,7 +627,6 @@ still live-only; a rebuild keeps the first group and loses the second.
 
 | change | why it matters |
 |---|---|
-| the four *demo* teams' Harbor projects made public | needed for a single-namespace ephemeral environment, where one team's namespace runs four teams' images; unrelated to the platform layer, which is covered above |
 | `replicaCount: 1` on every workload | the `k8s-deployment` chart defaults to **2**, silently doubling every pod on a host that is already swapping |
 | enabling Loki (and with it the OTel collector) | the agent's log access in §17 depends on it; it is an ordinary Console app toggle, not seeded |
 | the ephemeral environment itself | every `env-demo-*` workload, the Turnstone node, its mounted git and Loki credentials, and the branch build that put the environment on a PR — all created by hand, none of it triggered by anything yet |

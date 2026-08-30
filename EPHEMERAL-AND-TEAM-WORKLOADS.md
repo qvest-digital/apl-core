@@ -196,6 +196,25 @@ auth with the platform password (`401` — these accounts hold no local Gitea pa
 still required for a different purpose: it provisions the account and re-syncs its org/team
 membership from the JWT `groups` claim, on **every** login.
 
+> ### RULE — do not break this one
+>
+> **The platform identity is the credential, and the OIDC *flow* is how you present it.** Every app
+> here federates to the same Keycloak realm, so `platform-admin` already **is** an admin in Gitea,
+> Harbor, Vikunja and Turnstone — the identity the Console's apps page signs you in with. Reach an
+> app's API by completing its authorization-code round trip with a cookie jar and keeping the
+> session/JWT that lands there: `gitea_oidc_login`, `vikunja_oidc_login`, or Turnstone's
+> `GET /v1/api/auth/oidc/authorize` (all `.taskfiles/seed-lib.sh` shape). Copy one; never invent a
+> flow.
+>
+> **Do not** reach for a per-app bootstrap admin password out of a Kubernetes Secret because the app
+> "has its own admin". **Do not** conclude an API is closed because a raw Keycloak bearer returned
+> `401` — a raw bearer is not the OIDC flow. (Harbor is the lone app that also accepts one.)
+> **Do not** test auth against an endpoint that answers anonymously; use an admin-only endpoint and
+> run a bogus credential as a control. Both of those bad tests produced confidently wrong
+> conclusions on 2026-08-30. Full rule in `CLAUDE.md`.
+
+
+
 ## 10. Diagnosis order, when an event-created pod misbehaves
 
 Cheapest-first, each step ruling out a whole class:

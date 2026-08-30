@@ -186,6 +186,43 @@ gitea_oidc_login() {
   printf '%s' "$_existing" | awk '{print $2}'
 }
 
+# turnstone_oidc_login <email> <password> -- completes the same Keycloak SSO round trip
+# gitea_oidc_login does, against Turnstone's console, and prints the path to a cookie jar holding
+# the resulting `turnstone_auth_console` session. Caller uses `curl -b "$jar"` and rm's it after.
+#
+# This is the ONLY way in for a platform identity: Turnstone answers 401 to a raw Keycloak bearer
+# exactly as it does to a bogus one (verified live 2026-08-30 on /v1/api/admin/settings and
+# /v1/api/models), because it issues its own JWT after the flow rather than trusting Keycloak's.
+# What the session then carries is real admin: /v1/api/auth/whoami reports admin.settings,
+# admin.models, admin.nodes and the rest for platform-admin, and PUT
+# /v1/api/admin/settings/model.default_alias succeeds with it. See CLAUDE.md's OIDC rule.
+turnstone_oidc_login() {
+  _tol_email=$1
+  _tol_password=$2
+
+  _tol_jar=$(mktemp)
+  _tol_body=$(mktemp)
+  curl -sk --max-time 20 -c "$_tol_jar" -o "$_tol_body" -L --max-redirs 10 \
+    "https://turnstone.$DOMAIN/v1/api/auth/oidc/authorize"
+  _tol_action=$(grep -o 'action="[^"]*"' "$_tol_body" | head -1 | sed 's/action="//; s/"$//; s/&amp;/\&/g')
+  rm -f "$_tol_body"
+  [ -n "$_tol_action" ] || { echo "error: no Keycloak login form at Turnstone's oidc/authorize entrypoint" >&2; rm -f "$_tol_jar"; return 1; }
+
+  _tol_headers=$(mktemp)
+  curl -sk --max-time 20 -b "$_tol_jar" -c "$_tol_jar" -D "$_tol_headers" -o /dev/null \
+    --data-urlencode "username=$_tol_email" --data-urlencode "password=$_tol_password" --data-urlencode "credentialId=" \
+    -X POST "$_tol_action"
+  _tol_cb=$(grep -i '^location:' "$_tol_headers" | sed 's/^[Ll]ocation: //; s/\r$//')
+  rm -f "$_tol_headers"
+  [ -n "$_tol_cb" ] || { echo "error: Keycloak did not redirect for $_tol_email -- check the password" >&2; rm -f "$_tol_jar"; return 1; }
+
+  # Fresh GET rather than -L off the POST, same as gitea_oidc_login: curl would replay the POST
+  # body at the callback otherwise.
+  curl -sk --max-time 20 -b "$_tol_jar" -c "$_tol_jar" -o /dev/null -L --max-redirs 10 -X GET "$_tol_cb"
+  grep -q turnstone_auth_console "$_tol_jar" || { echo "error: no turnstone_auth_console cookie after the OIDC callback" >&2; rm -f "$_tol_jar"; return 1; }
+  printf '%s' "$_tol_jar"
+}
+
 # gitea_mint_pat <username> <scopes-csv> -- mints a fresh Personal Access Token for an existing
 # Gitea user via the CLI (no login needed once the account exists), and prints it. Token names
 # must be unique per user in Gitea and can't be reused once consumed, so this always mints a
@@ -356,31 +393,67 @@ gitea_ensure_team_credentials() {
 
 # --- Harbor -----------------------------------------------------------------------------------
 
-# harbor_ensure_project / harbor_mirror are NOT used by the Bookinfo seed below: Bookinfo's four
+# harbor_token -- a platform-admin OIDC access token, accepted by Harbor's API as a bearer
+# credential. Harbor runs in auth_mode oidc_auth against the same Keycloak realm as everything
+# else here, so the platform's own admin identity IS a Harbor admin identity -- no second
+# credential, no bootstrap password, nothing app-specific. Verified live 2026-08-30: GET /users
+# and GET /configurations (both admin-only, both 401 for anonymous AND for a bogus bearer) return
+# 200, and a PUT to /projects/{id} succeeds, all with this token.
+#
+# What does NOT work, and is the trap worth remembering: platform-admin's Keycloak PASSWORD as
+# HTTP basic auth. Harbor rejects it with 401, identically to anonymous -- OIDC-provisioned
+# accounts carry no local password the API accepts, exactly as MCP.md records for Gitea. The
+# credential is the token, not the password. (Beware measuring this against a PUBLIC project's
+# read endpoints: those answer 200 for anyone, including a bogus credential, so they cannot tell
+# you whether authentication happened. Use an admin-only endpoint.)
+#
+# Minted fresh on every call rather than cached: these helpers are called around multi-minute image
+# builds, and kc_platform_admin_token's own comment records tokens expiring across exactly such a
+# wait. Four kubectl gets and one curl is cheap next to what it sits between.
+harbor_token() {
+  kc_platform_admin_token "${OAUTH2_PROXY_CLIENT_SECRET_NAME:-oauth2-proxy-client-access}"
+}
+
+# harbor_ensure_project is NOT used by the Bookinfo seed below: Bookinfo's four
 # Dockerfiles keep their upstream public `FROM` lines (python/ruby/node/gradle/open-liberty) and
 # kaniko pulled every one of them straight from the public registry, confirmed live 2026-08-29 --
 # all four `docker-trigger-build-*` PipelineRuns Succeeded. Those same builds also install packages
 # over the network (pip/bundle/npm/gradle/featureUtility), so in-cluster builds on this lab reach
 # both public registries and public package indexes fine.
 #
-# These two are kept deliberately, unused, as the ready-made fallback if that ever stops being
-# true on some future cluster. The recipe, in full, so it does not depend on any other file:
+# harbor_ensure_project is kept, unused, as the ready-made fallback if that ever stops being true
+# on some future cluster. harbor_mirror, which used to sit beside it, was DELETED on 2026-08-30:
+# it was the last thing reaching for the Harbor bootstrap password, and since nothing sets that
+# variable any more it could not have run as written. The recipe it encoded is preserved here in
+# full, which is all it was ever worth -- three commands, no state, run from the HOST because that
+# is what has unrestricted egress:
 #
 #   1. harbor_ensure_project "<project>"                       # e.g. the team's own project
-#   2. harbor_mirror "python:3.13.3-slim" "<project>/python:3.13.3-slim"   # once per base image,
-#                                                              # run from the HOST, which has
-#                                                              # unrestricted egress
+#   2. docker run --rm --network host quay.io/skopeo/stable:latest \
+#        copy --dest-tls-verify=false --dest-creds "admin:<harbor bootstrap password>" \
+#        "docker://python:3.13.3-slim" \
+#        "docker://harbor.$DOMAIN/<project>/python:3.13.3-slim"          # once per base image
 #   3. sed -i "s|^FROM python:3.13.3-slim|FROM harbor.$DOMAIN/<project>/python:3.13.3-slim|" \
 #        <pushed Dockerfile>                                   # repoint FROM at the Harbor copy
 #
-# Do not delete them just because nothing calls them today: rediscovering this costs an afternoon,
-# and the seed deliberately does not rewrite `FROM` because the unmodified upstream source IS the
-# demo content -- rewriting it would make the demo a fork of Bookinfo rather than a copy of it.
+# `--dest-tls-verify=false` is required in step 2: the host's Docker daemon does not trust the
+# platform's self-signed CA any more than a pod does, which is also why a plain `docker push` fails
+# here (see CLAUDE.md's CA note). skopeo copy is idempotent -- it overwrites the same tag.
+#
+# Step 2 is the one place the bootstrap password is still the right credential and OIDC is not:
+# skopeo talks to the REGISTRY, not the API, and registry auth for an OIDC user is a per-user CLI
+# secret rather than a bearer token. Everything API-shaped moved to OIDC; this cannot.
+# `kubectl get secret harbor-admin-password -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}'`
+# still yields it, base64-decoded.
+#
+# The seed deliberately does not rewrite `FROM`: the unmodified upstream source IS the demo
+# content, and rewriting it would make the demo a fork of Bookinfo rather than a copy of it.
 
 # harbor_ensure_project <project> -- creates a public Harbor project if it doesn't already exist.
 harbor_ensure_project() {
   _project=$1
-  _http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+  _hep_tok=$(harbor_token) || return 1
+  _http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_hep_tok" \
     -X POST "https://harbor.$DOMAIN/api/v2.0/projects" -H "Content-Type: application/json" \
     -d "{\"project_name\":\"$_project\",\"public\":true}")
   case "$_http" in
@@ -390,24 +463,8 @@ harbor_ensure_project() {
   esac
 }
 
-# harbor_mirror <source-image> <dest-repo:tag> -- mirrors a public image into Harbor from the
-# HOST's network, for the fallback described above. Idempotent: skopeo copy overwrites the same tag
-# either way. Note `--dest-tls-verify=false`: the host's Docker daemon does not trust the
-# platform's self-signed CA any more than a pod does, which is also why a plain `docker push` fails
-# here (see CLAUDE.md's CA note).
-harbor_mirror() {
-  _source=$1
-  _dest=$2
-  # Bounded (CLAUDE.md rule 1): this pulls from the public internet, and a stalled registry
-  # connection inside the container is exactly the kind of thing that hangs forever otherwise --
-  # skopeo has no default timeout of its own.
-  timeout 300 docker run --rm --network host quay.io/skopeo/stable:latest \
-    copy --dest-tls-verify=false --dest-creds "admin:$HARBOR_ADMIN_PASSWORD" \
-    "docker://$_source" "docker://harbor.$DOMAIN/$_dest"
-}
-
 # harbor_has_tag <project> <repo> <tag> -- 0 if that exact tag exists in Harbor. Needs
-# $HARBOR_ADMIN_PASSWORD in the environment (same as the two above). Used to answer "is there
+# a platform-admin OIDC token via harbor_token (same as the others). Used to answer "is there
 # already a built image for this repo?" without re-running a build -- the seed only rebuilds when
 # the pushed source actually changed, so on a rerun this is what proves the previous run's build
 # really produced something.
@@ -419,10 +476,11 @@ harbor_mirror() {
 # A persistent non-answer still returns 1 (callers use this in an `if`), but says so on stderr
 # rather than passing silently for "no".
 harbor_has_tag() {
+  _ht_tok=$(harbor_token) || return 1
   _ht_i=0
   while [ "$_ht_i" -lt 3 ]; do
     _ht_i=$((_ht_i + 1))
-    _ht_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+    _ht_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_ht_tok" \
       "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
     case "$_ht_code" in
       # Written out rather than `[ ... ]; return $?`: a bare failing test is fatal under errexit,
@@ -436,8 +494,8 @@ harbor_has_tag() {
   return 1
 }
 
-# harbor_make_project_public <project> -- flip an EXISTING Harbor project to public. Needs
-# $HARBOR_ADMIN_PASSWORD in the environment, like the two above.
+# harbor_make_project_public <project> -- flip an EXISTING Harbor project to public. Authenticates
+# with a platform-admin OIDC token via harbor_token, like the others.
 #
 # Separate from harbor_ensure_project because the platform operator creates a team's project itself,
 # as PRIVATE -- so the create call 409s and the visibility never changes. A private project is fine
@@ -445,10 +503,11 @@ harbor_has_tag() {
 # job: every team's kaniko build does COPY --from against team-platform/agent-base.
 harbor_make_project_public() {
   _hmp_project=$1
-  _hmp_id=$(curl -sk --max-time 15 -u "admin:$HARBOR_ADMIN_PASSWORD" \
+  _hmp_tok=$(harbor_token) || return 1
+  _hmp_id=$(curl -sk --max-time 15 -H "Authorization: Bearer $_hmp_tok" \
     "https://harbor.$DOMAIN/api/v2.0/projects?name=$_hmp_project" 2>/dev/null | jq -r '.[0].project_id // empty')
   [ -n "$_hmp_id" ] || { echo "error: Harbor project '$_hmp_project' not found" >&2; return 1; }
-  _hmp_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+  _hmp_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_hmp_tok" \
     -X PUT "https://harbor.$DOMAIN/api/v2.0/projects/$_hmp_id" -H "Content-Type: application/json" \
     -d '{"metadata":{"public":"true"}}')
   case "$_hmp_code" in
@@ -457,8 +516,8 @@ harbor_make_project_public() {
   esac
 }
 
-# harbor_delete_tag <project> <repo> <tag> -- delete one tag's artifact. Needs
-# $HARBOR_ADMIN_PASSWORD, like the others.
+# harbor_delete_tag <project> <repo> <tag> -- delete one tag's artifact. Authenticates with a
+# platform-admin OIDC token via harbor_token, like the others.
 #
 # Used only by SEED_FORCE_RUNNER_BUILD. The runner build is trigger:false and seed:runners skips it
 # when the tag exists, so deleting the tag is what makes a changed .gitea/runner/Dockerfile
@@ -466,11 +525,12 @@ harbor_make_project_public() {
 harbor_delete_tag() {
   # Same empty-status retry as harbor_has_tag, and for the same reason: this runs at the very start
   # of seed:runners, four teams at once, which is exactly when Harbor is least likely to answer.
+  _hdt_tok=$(harbor_token) || return 1
   _hdt_i=0
   _hdt_code=""
   while [ "$_hdt_i" -lt 3 ]; do
     _hdt_i=$((_hdt_i + 1))
-    _hdt_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+    _hdt_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_hdt_tok" \
       -X DELETE "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
     case "$_hdt_code" in
       [0-9][0-9][0-9]) break ;;

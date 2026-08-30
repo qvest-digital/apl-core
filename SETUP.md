@@ -1337,8 +1337,28 @@ curl -sk "https://vikunja.$D/api/v1/info" | jq '.auth.openid_connect'
 
 ### The admin account, and why `Job Complete` is not enough ✅
 
-`vikunja-bootstrap-admin` creates a service-account admin user, used for API-level checks like this
-one. The Job reports `Complete` on a re-run that did nothing. Prove the credential instead:
+`vikunja-bootstrap-admin` creates a service-account admin user. It exists because OIDC cannot
+bootstrap itself — an app with no users refuses SSO login — so this check proves *that* credential
+still works, and nothing more. It is **not** the pattern for reaching Vikunja's API in scripts:
+
+> ### RULE — do not break this one
+>
+> **The platform identity is the credential, and the OIDC *flow* is how you present it.** Every app
+> here federates to the same Keycloak realm, so `platform-admin` already **is** an admin in Gitea,
+> Harbor, Vikunja and Turnstone — the identity the Console's apps page signs you in with. Reach an
+> app's API by completing its authorization-code round trip with a cookie jar and keeping the
+> session/JWT that lands there: `gitea_oidc_login`, `vikunja_oidc_login`, or Turnstone's
+> `GET /v1/api/auth/oidc/authorize` (all `.taskfiles/seed-lib.sh` shape). Copy one; never invent a
+> flow.
+>
+> **Do not** reach for a per-app bootstrap admin password out of a Kubernetes Secret because the app
+> "has its own admin". **Do not** conclude an API is closed because a raw Keycloak bearer returned
+> `401` — a raw bearer is not the OIDC flow. (Harbor is the lone app that also accepts one.)
+> **Do not** test auth against an endpoint that answers anonymously; use an admin-only endpoint and
+> run a bogus credential as a control. Both of those bad tests produced confidently wrong
+> conclusions on 2026-08-30. Full rule in `CLAUDE.md`.
+
+The Job reports `Complete` on a re-run that did nothing. Prove the credential instead:
 
 ```bash
 U=$(kubectl get secret vikunja-admin-credentials -n vikunja -o jsonpath='{.data.username}' | base64 -d)
