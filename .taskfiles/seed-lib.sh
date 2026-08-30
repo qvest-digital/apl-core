@@ -243,6 +243,35 @@ turnstone_oidc_login() {
   printf '%s' "$_tol_jar"
 }
 
+# gitea_refire_push_hook <org> <repo> <pat> -- re-send a push delivery for every push webhook on
+# the repo, via Gitea's own hook test endpoint (it delivers a real payload for the default branch's
+# latest commit, not a synthetic one).
+#
+# Gitea fires `push` EXACTLY ONCE and never retries. A delivery lost for any reason -- the
+# EventListener still starting, a NetworkPolicy mid-apply, Gitea restarting -- means the build is
+# never triggered, and the seed then fails minutes later in a completely different place: a Harbor
+# tag that never appears, or a PipelineRun that was never created. Confirmed live 2026-08-30, when
+# the agent-base build never started: the EventListener's log was EMPTY while a probe POST from the
+# Gitea pod reached it with HTTP 202, so connectivity was fine and the delivery simply never
+# happened. Re-firing this one endpoint fixed it in seconds.
+#
+# Same reasoning as runner_drain_queued, which recovers the equivalent loss for `workflow_job`.
+gitea_refire_push_hook() {
+  _grh_org=$1
+  _grh_repo=$2
+  _grh_pat=$3
+  _grh_ids=$(curl -sk --max-time 15 -H "Authorization: token $_grh_pat" \
+    "https://gitea.$DOMAIN/api/v1/repos/$_grh_org/$_grh_repo/hooks" \
+    | jq -r '.[]? | select((.events // []) | index("push")) | .id' 2>/dev/null || true)
+  [ -n "$_grh_ids" ] || { echo "  no push webhook on $_grh_org/$_grh_repo to re-fire" >&2; return 1; }
+  for _grh_id in $_grh_ids; do
+    _grh_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST \
+      -H "Authorization: token $_grh_pat" \
+      "https://gitea.$DOMAIN/api/v1/repos/$_grh_org/$_grh_repo/hooks/$_grh_id/tests" 2>/dev/null || true)
+    echo "  re-fired the push delivery for hook $_grh_id on $_grh_org/$_grh_repo (HTTP $_grh_code)"
+  done
+}
+
 # gitea_mint_pat <username> <scopes-csv> -- mints a fresh Personal Access Token for an existing
 # Gitea user via the CLI (no login needed once the account exists), and prints it. Token names
 # must be unique per user in Gitea and can't be reused once consumed, so this always mints a

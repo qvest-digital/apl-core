@@ -720,8 +720,31 @@ tasks:
         wait_for_agent_base_image() {
           set -euo pipefail
           _tries=0
+          _refired=false
           while [ "$_tries" -lt 60 ]; do
             if harbor_has_tag "team-$TEAM" "agent-base" "main"; then return 0; fi
+            # Same lost-delivery recovery as wait_for_triggered_build, checked against the
+            # PipelineRun rather than the tag: no run after ~60s means nothing was ever triggered.
+            # This is the exact stall seen live on 2026-08-30 -- the wait sat here for its full
+            # 900s while the EventListener had received nothing at all. The credential is minted
+            # only on this path (apl_run calls each step in a subshell, so the build step's PAT is
+            # long gone by now), which keeps the happy path free of an extra login.
+            if [ "$_tries" -ge 4 ] && [ "$_refired" = "false" ]; then
+              _any_pr=$(kubectl --context "$KIND_CTX" --request-timeout=15s get pipelinerun -n "team-$TEAM" \
+                -o name 2>/dev/null | grep -c "docker-trigger-build-$REPO" || true)
+              if [ "${_any_pr:-0}" -eq 0 ]; then
+                _refired=true
+                echo "  no PipelineRun for $REPO after ${_tries} tries -- assuming the push delivery was lost"
+                _rf_pw=$(cat {{.STATE_DIR}}/seed_pw_${TEAM}_dev.txt 2>/dev/null || true)
+                if [ -n "$_rf_pw" ]; then
+                  _rf_gu=$(gitea_oidc_login "dev-$TEAM@$DOMAIN" "$_rf_pw" 2>/dev/null || true)
+                  if [ -n "$_rf_gu" ]; then
+                    _rf_pat=$(gitea_mint_pat "$_rf_gu" "read:user,write:repository,read:organization" 2>/dev/null || true)
+                    [ -n "$_rf_pat" ] && { gitea_refire_push_hook "team-$TEAM" "$REPO" "$_rf_pat" || true; }
+                  fi
+                fi
+              fi
+            fi
             _tries=$((_tries + 1)); sleep 15
           done
           echo "error: harbor.$DOMAIN/team-$TEAM/agent-base:main never appeared (900s). Check: kubectl get pipelinerun -n team-$TEAM" >&2
@@ -874,12 +897,16 @@ tasks:
         # transient failure there would otherwise kill the WHOLE function on try 1 through the
         # caller's `set -euo pipefail`, silently, before the explicit timeout message below could
         # ever be reached.
+        # <team> <repo> <push-since> [pat] -- the optional PAT enables the lost-delivery recovery
+        # below; without it the wait still works, it just cannot rescue a delivery Gitea dropped.
         wait_for_triggered_build() {
           _wb_team=$1
           _wb_repo=$2
           _wb_since=$3
+          _wb_pat=${4:-}
           _wb_tries=0
           _wb_status=""
+          _wb_refired=false
           while [ "$_wb_tries" -lt 30 ]; do
             _wb_pr=$(kubectl --context "$KIND_CTX" --request-timeout=15s get pipelinerun -n "team-$_wb_team" -o json 2>/dev/null \
               | jq -r --arg p "docker-trigger-build-$_wb_repo-" --arg since "$_wb_since" '
@@ -892,6 +919,15 @@ tasks:
             [ "$_wb_status" = "True" ] && break
             [ "$_wb_status" = "False" ] && break
             _wb_tries=$((_wb_tries + 1))
+            # No PipelineRun AT ALL after ~40s means the push delivery was lost, not that the build
+            # is slow -- a delivered event creates the run immediately. Gitea never retries, so
+            # without this the remaining 26 polls are spent waiting for something that can no longer
+            # happen. Re-fired once: a second failure is a real fault worth surfacing.
+            if [ -z "$_wb_pr" ] && [ "$_wb_tries" -ge 4 ] && [ "$_wb_refired" = "false" ] && [ -n "$_wb_pat" ]; then
+              _wb_refired=true
+              echo "  no PipelineRun after ${_wb_tries} tries -- assuming the push delivery was lost"
+              gitea_refire_push_hook "team-$_wb_team" "$_wb_repo" "$_wb_pat" || true
+            fi
             echo "waiting for the webhook-triggered build of team-$_wb_team/$_wb_repo (try $_wb_tries/30, last: ${_wb_pr:-no PipelineRun yet})..."
             sleep 10
           done
@@ -1028,7 +1064,7 @@ tasks:
 
           # What actually produces the image, in the three states this can be in.
           if [ "$_pushed" = "true" ]; then
-            wait_for_triggered_build "$_team" "$_repo" "$_push_since" || return 1
+            wait_for_triggered_build "$_team" "$_repo" "$_push_since" "$GITEA_PAT" || return 1
           elif harbor_has_tag "team-$_team" "$_repo" main; then
             # Source unchanged AND an image already exists -- a rerun against an already-seeded
             # cluster costs no build at all. This is the whole point of gitea_push_tree's
