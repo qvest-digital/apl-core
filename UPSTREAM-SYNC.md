@@ -179,6 +179,53 @@ Two caveats worth knowing before starting:
 `from: team-platform`, the team's HTTPRoutes report `ResolvedRefs=True`, and the Argo application
 turns Healthy.
 
+## 4d. Known upstream inconsistency: the `k8s-deployment-otel` catalog chart is orphaned
+
+Found live 2026-08-31, recorded rather than worked around. Nothing in this fork is broken by it; the
+cost is that a catalog tile the Console offers cannot do what it says.
+
+The default catalog (`linode/apl-charts`) offers **`k8s-deployment-otel`** beside `k8s-deployment`.
+The two charts are identical apart from an `instrumentation` block, an `Instrumentation` CR, and two
+pod annotations that make the OpenTelemetry Operator inject an auto-instrumentation agent. The CR
+hardcodes where the agent sends its spans:
+
+```yaml
+exporter:
+  endpoint: http://otel-collector-collector.otel.svc.cluster.local:4317
+```
+
+**Nothing on this platform serves that address, and nothing can be switched on to make it.**
+`values/otel-operator/otel-operator-raw.gotmpl` (228 lines, **pristine upstream** — zero diff against
+the fork point) creates exactly one `OpenTelemetryCollector`, `platform-logs`, gated on
+`apps.loki.enabled`, whose only pipeline is `logs`. `apps.otel` in `values-schema.yaml` exposes only
+`operator.replicaCount` and `resources.{logsCollector,manager}` — there is no traces knob to find.
+
+The chart's own README explains the intent and dates it: it lists the prerequisites for viewing
+traces as Istio tracing, *"Loki and **Tempo** enabled"*, and Grafana. App Platform
+[removed Tempo in v4.14.0](https://techdocs.akamai.com/app-platform/changelog/v4-14-0) (2026-02-24),
+completing a deprecation — the release notes give cleanup commands and name **no replacement trace
+backend**. So the catalog chart still points at a store the platform deleted from under it.
+
+Two further limits, both confirmed from the vendored chart rather than from documentation:
+
+- **The operator cannot instrument Ruby.** `charts/otel-operator/crds/crd-opentelemetryinstrumentation.yaml`
+  (operator 0.158.0) has sections for `dotnet`, `go`, `java`, `nginx`, `nodejs`, `python` and
+  `apacheHttpd`. There is no `ruby`. The demo's `details` service is `ruby:3.4.3-slim`, so one of the
+  four teams could never be injected at all. Ruby's own
+  [`opentelemetry-ruby-instrumentation`](https://github.com/open-telemetry/opentelemetry-ruby-instrumentation)
+  gems exist, but they are in-process libraries added to the app, not something the operator injects.
+- **The chart defaults to `instrumentation.language: java`.** Leave it unset on a Python or Node
+  service and it injects a Java agent. The language is per service, which would make it the first
+  genuinely per-team value in `setup_team_service`.
+
+**What was done instead.** Nothing: the demo workloads stay on `k8s-deployment`
+(`SEED_WORKLOAD_CHART_PATH` in `.taskfiles/seed.yml`). Istio's own data-plane metrics cover the
+service-to-service view for all four teams with no app changes — see the `apps.otel` entry in
+`CLAUDE.md` for what that app actually gates, and note that the platform already ships
+`charts/grafana-dashboards/istio-admin/workload-dashboard.json`, which consumes exactly those metrics
+while nothing scrapes them. Reviving `k8s-deployment-otel` means providing a trace store first; that
+is a real integration, not a setting.
+
 ## 5. Record the new sync point
 
 Once the merge lands on `main`, move `reference/base` to the new merge commit (or create a new

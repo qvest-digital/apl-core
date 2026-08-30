@@ -530,6 +530,29 @@ mistakes were made live on 2026-08-30: a `200` from an anonymous endpoint read a
 works", and a `401` from a raw bearer read as "platform-admin cannot use this API". Both
 conclusions were wrong, and the second one is the one that keeps coming back.
 
+**`apps.otel` is the observability plumbing, not tracing — do not switch it off to save memory.**
+The name suggests distributed tracing, and tracing is the one thing it does *not* deliver (see
+`UPSTREAM-SYNC.md` §4d). What it actually gates, both confirmed live 2026-08-31:
+
+- **Log shipping into Loki.** Upstream replaced Promtail with an OpenTelemetry collector, so
+  `platform-logs` (`values/otel-operator/otel-operator-raw.gotmpl`, gated on `apps.loki.enabled`) is
+  what puts pod logs in front of Loki at all. No otel, no logs — and the agent's `logs` tool
+  (`AGENT-ENVIRONMENTS.md` §17) goes with them.
+- **Istio access logging.** `istio-resources-artifacts` is `installed: {{ $a | get "otel.enabled" }}`
+  (`helmfile.d/helmfile-91.artifacts.yaml.gotmpl`), and the release is one `Telemetry` CR turning on
+  Envoy access logs. Those carry the request id that made the four-service request trace in §17
+  possible.
+
+So turning otel off silently removes both the logs and the correlation id, in a way that looks like
+Loki being broken. Leave it on.
+
+Related, and the reason tracing is absent: Istio's own **data-plane** metrics
+(`istio_requests_total`, `istio_request_duration_milliseconds`, …) are exposed by every Envoy right
+now, and **nothing scrapes them** — there is a ServiceMonitor for `istiod` only. The platform even
+ships the dashboard that consumes them
+(`charts/grafana-dashboards/istio-admin/workload-dashboard.json`). The hook to fix it exists and is
+empty: `additionalPodMonitors` in `values/prometheus-operator/pod-monitors.gotmpl`.
+
 **Never run `docker system prune -a`.** It will destroy unrelated containers, images and volumes
 belonging to other projects on this machine. If you need disk, `docker builder prune` is safe.
 

@@ -127,10 +127,25 @@ What it looks like when missing: five `pip` retries against
 it is not DNS and not a NetworkPolicy — a team namespace has **no egress NetworkPolicy at all**, so
 that lead is a dead end.
 
-One observation left deliberately unexplained: the blocked pod listed only its own container, with
-no `istio-proxy` alongside, yet its egress was still intercepted. Whatever the interception
-mechanism, the annotation is what controls it. Do not conclude "no sidecar container, therefore not
-the mesh" — that inference cost time here.
+One observation was left unexplained here for a long time: the blocked pod listed only its own
+container, with no `istio-proxy` alongside, yet its egress was still intercepted. Whatever the
+interception mechanism, the annotation is what controls it. Do not conclude "no sidecar container,
+therefore not the mesh" — that inference cost time here.
+
+**Resolved 2026-08-31: `istio-proxy` is a *native* sidecar, so it lives in `initContainers`.**
+Kubernetes 1.33+ keeps an init container with `restartPolicy: Always` running for the whole life of
+the pod, and that is the form Istio injects here. Measured on `team-reviews/app`:
+
+```
+containers:     app
+initContainers: istio-init  istio-proxy      <- istio-proxy restartPolicy=Always
+```
+
+So `kubectl get pod -o jsonpath='{.spec.containers[*].name}'` honestly reports one container while a
+fully working proxy intercepts every packet. Nothing else changes: `kubectl exec … -c istio-proxy`
+and `kubectl logs … -c istio-proxy` both work once you know where to look. **When checking whether a
+pod is in the mesh, print both lists** — otherwise a pod with a sidecar is indistinguishable from one
+without.
 
 ## 6. Ingress to an EventListener is label-gated
 
