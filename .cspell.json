@@ -3,7 +3,7 @@
   "allowCompoundWords": true,
   "enableFiletypes": ["dockerfile", "md", "yaml"],
   "enabledLanguageIds": ["json", "jsonc", "markdown", "typescript", "typescriptreact", "yaml", "yml"],
-  "ignorePaths": ["CHANGELOG.md", "*.json"],
+  "ignorePaths": ["CHANGELOG.md", "*.json", "NEXT-SESSION.md"],
   "ignoreRegExpList": ["/'s\\b/"],
   "ignoreWords": [
     "adrs",
