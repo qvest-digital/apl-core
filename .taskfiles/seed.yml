@@ -562,6 +562,13 @@ tasks:
         export SEED_RUNNER_URL="{{.SEED_RUNNER_URL}}"
         export SEED_RUNNER_SHA256="{{.SEED_RUNNER_SHA256}}"
         export SEED_RUNNER_VERSION="{{.SEED_RUNNER_VERSION}}"
+        # harbor_has_tag / harbor_delete_tag both need this, and this task never set it -- so
+        # harbor_has_tag's curl authenticated as "admin:" , got 401, and returned false EVERY time.
+        # The "runner image already in Harbor" skip below therefore never fired, and the build wait
+        # was satisfied instead by whatever old PipelineRun of the same name was lying around.
+        HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
+          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
+        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
         HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
           -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
         [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
@@ -1308,6 +1315,13 @@ tasks:
           # nothing and the skip below still fires, which is exactly how it was found.
           if [ "${SEED_FORCE_RUNNER_BUILD:-false}" = "true" ]; then
             harbor_delete_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main || true
+            # Deleting the tag alone changes nothing: docker-build-<name> is a chart-defined,
+            # one-shot PipelineRun that has ALREADY succeeded, and wait_for_runner_build below is
+            # satisfied the moment it sees that. Deleting it makes ArgoCD recreate it (sync-wave 5),
+            # and the recreated run builds from current main.
+            kubectl --context "$KIND_CTX" --request-timeout=30s -n "team-$_team" \
+              delete pipelinerun "docker-build-$_build" --ignore-not-found >/dev/null 2>&1 || true
+            echo "  forced rebuild: removed the tag and the completed PipelineRun for $_build"
           fi
           if harbor_has_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main; then
             apl_skip "runner image already in Harbor for team-$_team (SEED_FORCE_RUNNER_BUILD=true rebuilds it)"
