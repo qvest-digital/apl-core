@@ -411,10 +411,29 @@ harbor_mirror() {
 # already a built image for this repo?" without re-running a build -- the seed only rebuilds when
 # the pushed source actually changed, so on a rerun this is what proves the previous run's build
 # really produced something.
+# Retried, because an EMPTY %{http_code} is not an answer. Under real load from concurrent Tekton
+# builds curl returns no status at all (see the note on apl_create_if_missing below), and treating
+# that as "no tag" is a SILENT false negative: seed:runners rebuilds an image it already had, and
+# seed:apps takes the rebuild branch for source it already built. Confirmed live 2026-08-30 -- all
+# four teams got an empty status within the same second, which is why nothing skipped that run.
+# A persistent non-answer still returns 1 (callers use this in an `if`), but says so on stderr
+# rather than passing silently for "no".
 harbor_has_tag() {
-  _ht_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
-    "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
-  [ "$_ht_code" = "200" ]
+  _ht_i=0
+  while [ "$_ht_i" -lt 3 ]; do
+    _ht_i=$((_ht_i + 1))
+    _ht_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+      "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
+    case "$_ht_code" in
+      # Written out rather than `[ ... ]; return $?`: a bare failing test is fatal under errexit,
+      # and this function must stay safe to call outside an `if` condition.
+      [0-9][0-9][0-9])
+        if [ "$_ht_code" = "200" ]; then return 0; else return 1; fi ;;
+      *) sleep 5 ;;
+    esac
+  done
+  echo "error: Harbor never returned a status for $1/$2:$3 in 3 tries -- treating as absent, which may cause a needless rebuild" >&2
+  return 1
 }
 
 # harbor_make_project_public <project> -- flip an EXISTING Harbor project to public. Needs
@@ -445,8 +464,19 @@ harbor_make_project_public() {
 # when the tag exists, so deleting the tag is what makes a changed .gitea/runner/Dockerfile
 # actually rebuild on a cluster that already has the image.
 harbor_delete_tag() {
-  _hdt_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
-    -X DELETE "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
+  # Same empty-status retry as harbor_has_tag, and for the same reason: this runs at the very start
+  # of seed:runners, four teams at once, which is exactly when Harbor is least likely to answer.
+  _hdt_i=0
+  _hdt_code=""
+  while [ "$_hdt_i" -lt 3 ]; do
+    _hdt_i=$((_hdt_i + 1))
+    _hdt_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+      -X DELETE "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
+    case "$_hdt_code" in
+      [0-9][0-9][0-9]) break ;;
+      *) sleep 5 ;;
+    esac
+  done
   case "$_hdt_code" in
     200|404) echo "harbor tag $1/$2:$3 removed (HTTP $_hdt_code)" ;;
     *) echo "error: deleting harbor tag $1/$2:$3 returned HTTP $_hdt_code" >&2; return 1 ;;

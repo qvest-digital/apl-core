@@ -891,6 +891,13 @@ tasks:
         # setup_team_service <role> <team> <repo> <upstream-subdir> -- everything one team owns
         # for its one Bookinfo microservice: its Gitea repo and the real upstream source in it,
         # its coderepo + auto-triggered Tekton build, its workload, and its public service.
+        # Every fallible call in here carries an explicit `|| return 1`, and that is NOT redundant
+        # with the `set -e` below. apl_run_parallel invokes each item from inside an `if` (lib.sh:253
+        # explains why it must), and a function called in a condition runs with errexit DISABLED for
+        # its entire body -- so a bare failing call is silently ignored and the seed reports success.
+        # Found the hard way in setup_team_runner on 2026-08-30: a runner image failed to push, the
+        # seed wired an EventListener for an image that did not exist and declared victory, and the
+        # merge gate then waited ten minutes on a job no runner could ever accept.
         setup_team_service() {
           set -euo pipefail
           _role=$1
@@ -901,7 +908,7 @@ tasks:
 
           GITEA_USER=$(gitea_oidc_login "$_email" "$_password")
           GITEA_PAT=$(gitea_mint_pat "$GITEA_USER" "read:user,write:repository,write:organization,read:organization")
-          gitea_wait_for_org_permission "$GITEA_USER" "team-$_team" "$GITEA_PAT" "can_create_repository"
+          gitea_wait_for_org_permission "$GITEA_USER" "team-$_team" "$GITEA_PAT" "can_create_repository" || return 1
 
           # agent-<team> also provisions itself in Gitea and lands in the team's org -- no repo
           # creation of its own, dev owns that; this is just "find themselves in their respective
@@ -913,19 +920,19 @@ tasks:
           # read:user AND read:organization -- the permissions endpoint below 403s without
           # read:user too (confirmed live, same trap already hit and fixed for dev's PAT scope).
           _agent_gitea_pat=$(gitea_mint_pat "$_agent_gitea_user" "read:user,read:organization")
-          gitea_wait_for_org_permission "$_agent_gitea_user" "team-$_team" "$_agent_gitea_pat" "can_read"
+          gitea_wait_for_org_permission "$_agent_gitea_user" "team-$_team" "$_agent_gitea_pat" "can_read" || return 1
 
           # The vendored tree (upstream Bookinfo + this demo's CI), staged with the verified
           # gitea-runner binary dropped into .gitea/runner/ so the runner image can be built
           # in-cluster from this same repo. No network, no upstream drift.
           _src=$(stage_service_tree "$_role")
 
-          gitea_create_org_repo "team-$_team" "$_repo" "$GITEA_PAT"
+          gitea_create_org_repo "team-$_team" "$_repo" "$GITEA_PAT" || return 1
 
           # Branch protection blocks the force-push below (enable_push:false). On a first run there
           # is nothing to remove; on a re-run against a cluster this seed already protected, this
           # is what stops the push from failing. Re-applied after the push, in seed:gates.
-          gitea_unprotect_branch "team-$_team" "$_repo" "$GITEA_PAT"
+          gitea_unprotect_branch "team-$_team" "$_repo" "$GITEA_PAT" || return 1
 
           _pushed=false
           # Captured immediately before the push, and only ever moved forward by push_source: this
@@ -949,7 +956,7 @@ tasks:
           apl_create_if_missing \
             "$API/v2/teams/$_team/coderepos/$_repo" "$API/v2/teams/$_team/coderepos" "$API_TOKEN" \
             "{\"kind\":\"AplTeamCodeRepo\",\"metadata\":{\"name\":\"$_repo\"},\"spec\":{\"gitService\":\"gitea\",\"repositoryUrl\":\"https://gitea.$DOMAIN/team-$_team/$_repo.git\",\"private\":true}}" \
-            "coderepo $_repo ($_team)"
+            "coderepo $_repo ($_team)" || return 1
 
           # Docker build args, if this service needs any (reviews does: service_version=v3 etc).
           # AplTeamBuild's spec.mode.docker.envVars maps 1:1 onto kaniko's --build-arg -- see
@@ -970,7 +977,7 @@ tasks:
             "$API/v2/teams/$_team/builds/$_repo" "$API/v2/teams/$_team/builds" "$API_TOKEN" \
             "$(jq -n --arg name "$_repo" --arg url "https://gitea.$DOMAIN/team-$_team/$_repo.git" --argjson env "$_envvars" \
               '{kind:"AplTeamBuild", metadata:{name:$name}, spec:{imageName:$name, tag:"main", trigger:true, scanSource:false, mode:{type:"docker", docker:({repoUrl:$url, path:"./Dockerfile", revision:"main"} + (if ($env|length) > 0 then {envVars:$env} else {} end))}}}')" \
-            "build $_repo ($_team)"
+            "build $_repo ($_team)" || return 1
 
           # Bounded wait for the operator to reconcile the build into an actual Gitea webhook on
           # THIS repo (checked directly, not guessed at with a fixed sleep) before pushing content.
@@ -1010,7 +1017,7 @@ tasks:
 
           # What actually produces the image, in the three states this can be in.
           if [ "$_pushed" = "true" ]; then
-            wait_for_triggered_build "$_team" "$_repo" "$_push_since"
+            wait_for_triggered_build "$_team" "$_repo" "$_push_since" || return 1
           elif harbor_has_tag "team-$_team" "$_repo" main; then
             # Source unchanged AND an image already exists -- a rerun against an already-seeded
             # cluster costs no build at all. This is the whole point of gitea_push_tree's
@@ -1063,7 +1070,7 @@ tasks:
             "$(jq -n --arg name "{{.SEED_WORKLOAD_NAME}}" --arg values "$VALUES" --arg url "{{.SEED_CATALOG_CHART_URL}}" \
                 --arg path "{{.SEED_WORKLOAD_CHART_PATH}}" --arg repo "$_image_repo" \
               '{kind:"AplTeamWorkload", metadata:{name:$name}, spec:{url:$url, chartProvider:"git", path:$path, revision:"main", values:$values, imageUpdateStrategy:{type:"digest", digest:{imageRepository:$repo, tag:"main", imageParameter:"image.repository", tagParameter:"image.tag"}}}}')" \
-            "workload {{.SEED_WORKLOAD_NAME}} ($_team)"
+            "workload {{.SEED_WORKLOAD_NAME}} ($_team)" || return 1
 
           # useDefaultHost gives each team its own public URL at
           # https://{{.SEED_WORKLOAD_NAME}}-<team>.<domain>/ (routes.yaml names the host
@@ -1073,7 +1080,7 @@ tasks:
             "$API/v2/teams/$_team/services/{{.SEED_WORKLOAD_NAME}}" "$API/v2/teams/$_team/services" "$API_TOKEN" \
             "$(jq -n --arg name "{{.SEED_WORKLOAD_NAME}}" --argjson port {{.SEED_SERVICE_PORT}} \
               '{kind:"AplTeamService", metadata:{name:$name}, spec:{port:$port, ingress:{type:"public", useDefaultHost:true}}}')" \
-            "service {{.SEED_WORKLOAD_NAME}} ($_team)"
+            "service {{.SEED_WORKLOAD_NAME}} ($_team)" || return 1
 
           # Bounded wait for the public route to actually serve this microservice. /health, not
           # /: all four Bookinfo services expose it, but only productpage serves anything at the
@@ -1248,26 +1255,69 @@ tasks:
         # wait_for_runner_build <team> <build-name> -- bounded wait on the ONE-SHOT PipelineRun a
         # `trigger: false` build renders (ArgoCD creates it at sync-wave 5, named after the build,
         # not generateName'd like the webhook-triggered ones).
+        #
+        # A terminal failure is retried EXACTLY ONCE, by deleting the run so ArgoCD recreates it.
+        # Without that, a one-shot run is unrecoverable: it stays Failed forever, no re-run of the
+        # seed can clear it, and the only escape is SEED_FORCE_RUNNER_BUILD -- a flag whose
+        # documented job is "I changed the Dockerfile", not "the registry blipped". Confirmed live
+        # 2026-08-30: kaniko built prodpage's runner fine and failed the PUSH with DIGEST_INVALID
+        # (a corrupt blob upload; the other three teams pushed the same base layers seconds later),
+        # which wedged the whole seed behind a merge gate no runner could satisfy.
+        #
+        # ONE retry, deliberately. It is what separates "the registry blipped" from "this Dockerfile
+        # does not build" -- retrying forever would hide the second case behind a 30-minute wait.
+        # The retry does NOT delete the Harbor tag: this is recovery, not a forced rebuild, and
+        # conflating the two would let it mask a legitimate skip.
         wait_for_runner_build() {
           _wrb_team=$1
           _wrb_name=$2
           _wrb_pr="docker-build-$_wrb_name"
           _wrb_i=0
+          _wrb_retried=false
+          # UID of a run we have deleted, so its terminal status is never read again. A name-based
+          # check cannot express this: the recreated run carries the SAME name, and for the seconds
+          # between the delete call and ArgoCD's recreate, `get` still returns the old object. That
+          # is the same stale-run trap that let a completed run from an earlier seed satisfy this
+          # function in ~3 seconds -- see the SEED_FORCE_RUNNER_BUILD comment below.
+          _wrb_dead_uid=""
           # 90 x 20s = 30 minutes: the reviews runner is a ~700MB Java image and this cluster
           # builds it from scratch the first time.
           while [ "$_wrb_i" -lt 90 ]; do
             _wrb_i=$((_wrb_i + 1))
-            _wrb_status=$(kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_wrb_team" \
-              get pipelinerun "$_wrb_pr" -o jsonpath='{.status.conditions[0].reason}' 2>/dev/null || true)
-            case "$_wrb_status" in
-              Succeeded | Completed) echo "  build $_wrb_pr succeeded"; return 0 ;;
-              Failed | PipelineRunTimeout | CouldntGetPipeline | PipelineRunCouldntCancel)
-                echo "error: PipelineRun $_wrb_pr ended '$_wrb_status' in team-$_wrb_team" >&2
-                kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_wrb_team" \
-                  get pipelinerun "$_wrb_pr" -o jsonpath='{.status.conditions[0].message}' >&2 2>/dev/null || true
-                return 1 ;;
-              *) : ;;
-            esac
+            # One call for both fields: two calls could straddle a recreate and pair a fresh UID
+            # with the dead run's status.
+            _wrb_got=$(kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_wrb_team" \
+              get pipelinerun "$_wrb_pr" -o jsonpath='{.metadata.uid}{"|"}{.status.conditions[0].reason}' 2>/dev/null || true)
+            _wrb_uid=${_wrb_got%%|*}
+            _wrb_status=${_wrb_got#*|}
+            [ "$_wrb_got" = "$_wrb_uid" ] && _wrb_status=""
+            # The run we killed is still being served by the API. Not an outcome -- keep waiting.
+            if [ -n "$_wrb_dead_uid" ] && [ "$_wrb_uid" = "$_wrb_dead_uid" ]; then
+              _wrb_status=""
+            else
+              case "$_wrb_status" in
+                Succeeded | Completed) echo "  build $_wrb_pr succeeded"; return 0 ;;
+                Failed | PipelineRunTimeout | CouldntGetPipeline | PipelineRunCouldntCancel)
+                  echo "error: PipelineRun $_wrb_pr ended '$_wrb_status' in team-$_wrb_team" >&2
+                  kubectl --context "$KIND_CTX" --request-timeout=15s -n "team-$_wrb_team" \
+                    get pipelinerun "$_wrb_pr" -o jsonpath='{.status.conditions[0].message}' >&2 2>/dev/null || true
+                  if [ "$_wrb_retried" = "true" ]; then
+                    echo "error: $_wrb_pr failed again after a retry -- this is a real build failure, not a transient one" >&2
+                    return 1
+                  fi
+                  _wrb_retried=true
+                  _wrb_dead_uid=$_wrb_uid
+                  echo "  retrying $_wrb_pr once: deleting the failed run so ArgoCD recreates it (sync-wave 5)"
+                  kubectl --context "$KIND_CTX" --request-timeout=30s -n "team-$_wrb_team" \
+                    delete pipelinerun "$_wrb_pr" --ignore-not-found >/dev/null 2>&1 || true
+                  # Full budget for the rebuild: the failure may have come minutes in, and a cold
+                  # ~700MB Java image genuinely needs the whole 30 minutes.
+                  _wrb_i=0
+                  _wrb_status=""
+                  ;;
+                *) : ;;
+              esac
+            fi
             [ $((_wrb_i % 3)) -eq 0 ] && echo "  building $_wrb_pr (${_wrb_status:-not created yet}, ${_wrb_i}/90)"
             sleep 20
           done
@@ -1326,7 +1376,16 @@ tasks:
           if harbor_has_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main; then
             apl_skip "runner image already in Harbor for team-$_team (SEED_FORCE_RUNNER_BUILD=true rebuilds it)"
           else
-            wait_for_runner_build "$_team" "$_build"
+            # `|| return 1` is NOT redundant with this function's `set -e`. apl_run_parallel calls
+            # every item from inside an `if` (see lib.sh:253 for why it must), and a function called
+            # in a condition runs with errexit DISABLED for its whole body -- so a bare failing call
+            # here is ignored. Confirmed live 2026-08-30: prodpage's runner build failed its push
+            # with DIGEST_INVALID, wait_for_runner_build correctly returned 1, and the seed went on
+            # to mint a token and wire an EventListener for an image that did not exist, then
+            # reported "all four teams create a CI runner on demand". The gate then sat on a job no
+            # runner could ever take (ImagePullBackOff) until it timed out 10 minutes later.
+            # Every other fallible call in this function is guarded the same way for this reason.
+            wait_for_runner_build "$_team" "$_build" || return 1
           fi
 
           # The registration token is a runtime credential for demo content, NOT platform
