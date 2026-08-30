@@ -190,25 +190,26 @@ service shape that produces the hostname is
 `{ingress: {type: public, useDefaultHost: true}, ingressClassName: platform, port: 9080}` — the
 hostname follows the service name, so a service named `pr-demo` becomes `pr-demo-<team>.<domain>`.
 
-## 10. The open blocker for a whole-environment copy
+## 10. A whole-environment copy — solved by making Harbor projects public
 
-The above is one service. A full Bookinfo environment is four, and they do not fit in one
-namespace as things stand:
+A full Bookinfo environment is four services owned by four teams, and it originally would not fit
+in one namespace: Harbor projects are created **private** and `harbor-pullsecret` is team-scoped, so
+`team-reviews` could not pull `team-prodpage/productpage`.
+
+The fix chosen is the same one already applied to Gitea: in this demo lab "public" means *company
+internal*, so a read-only public project is the right visibility. Every project is now public:
 
 ```
-library         public=true
-team-admin      public=false
-team-details    public=false
-team-prodpage   public=false
-team-ratings    public=false
-team-reviews    public=false
+library  team-details  team-prodpage  team-ratings  team-reviews   -> all public=true
 ```
 
-Harbor projects are per team and **private**, and `harbor-pullsecret` is team-scoped, so
-`team-reviews` cannot pull `team-prodpage/productpage`. A single-namespace environment therefore
-needs one of: a Harbor grant (robot account or project visibility), a per-environment pull secret,
-or an environment that spans namespaces. Unresolved, and it shapes what the catalog entry in §11
-can look like.
+With that, a single namespace can run the whole environment, and `team-reviews` hosts all four
+`env-demo-*` services.
+
+**This is not yet in the seed.** It was applied live. `.taskfiles/seed-lib.sh` already carries an
+unused `harbor_ensure_project` helper that creates projects with `"public":true` — folding it into
+`seed:apps` is the outstanding work, and until then a rebuilt lab returns to private projects and
+this blocker comes back.
 
 ## 11. Catalogs are the mechanism for "the entire environment" — not yet built
 
@@ -240,3 +241,158 @@ values. Two properties of the mechanism matter before relying on it, both from t
   `GET /v1/api/events/global` requires the `service` scope by design — the code comment says an
   authenticated end-user must not subscribe. A browser there gets a permanent `403` on that
   stream. Use the console's own URL and let it route.
+
+## 13. The full loop, proven end to end
+
+On 2026-08-30 an agent running on an ephemeral node did what a human developer does, and the change
+was visible in a browser. Every step was performed by hand — nothing is wired to a trigger yet — but
+each one is now known to work:
+
+1. mint a scoped Gitea token for the team's `agent-<team>` user (§14)
+2. create the node with that credential mounted as a file (§14)
+3. the agent clones, edits, commits, pushes a branch, and opens a pull request
+4. the team's existing merge gate runs on the PR — unchanged, no special casing
+5. build an image from the PR branch (§15)
+6. repoint the environment's workload at that image through apl-api (§15)
+
+The result, same page, two environments, differing only by an open pull request:
+
+| | reviewers rendered |
+|---|---|
+| ephemeral `env-demo` (PR #3) | `Alice`, `Bob` |
+| production `app` (`main`) | `Reviewer1`, `Reviewer2` |
+
+`main` was never touched and the PR stayed open throughout. A second push to the same branch
+updated the existing PR rather than opening a new one — the behaviour wanted for production,
+working without extra effort.
+
+## 14. Giving the agent a forge identity
+
+**Use the team's `agent-<team>` user, not the org bot.** Every team namespace already holds
+`gitea-credentials` for `organization-team-<id>`, which is tempting and wrong: commits must be
+attributed to the agent for the demo to mean anything, and the blast radius of a leaked credential
+should be one team member.
+
+But note what is *not* true: `agent-<team>` is **not** less privileged. Its token reports
+`{"admin": true, "push": true, "pull": true}` on the team's repo, because on this platform every
+team member lands as an org owner. **What bounds the agent is token scope, not user identity.**
+Mint with `--scopes write:repository` and verify the bound holds — `GET /api/v1/user` returns `403`,
+because that needs `read:user`.
+
+The gate itself is safe against a direct push regardless: `enable_push:false` with no whitelist
+(`.taskfiles/seed-lib.sh`) refuses everyone, owners included.
+
+**Token lifecycle.** Mint per environment, name it after the environment (`agent-<envid>`), revoke
+at teardown. `gitea admin user generate-access-token` takes `--username`, `--token-name`,
+`--scopes`, `--raw` and **no expiry option** — tokens live until explicitly revoked. So the security
+property depends entirely on teardown running, which is exactly the step that gets skipped when a
+run fails or a cluster is rebuilt. Treat a sweeper that revokes `agent-env-*` tokens whose
+environment no longer exists as permanent infrastructure, not scaffolding — the same reasoning as
+the lost-webhook replay path in `EPHEMERAL-AND-TEAM-WORKLOADS.md` §8.
+
+**Deliver the credential as a file, never an environment variable.** Turnstone strips every variable
+matching `_TOKEN`, `_PASSWORD`, `_CREDENTIAL(S)`, `_KEY`, `_SECRET` before every subprocess (§5), and
+the `passthrough=` escape hatch in `scrubbed_env()` has **no production caller** in 1.8.1 — its only
+use in the tree is a unit test. A `GITEA_TOKEN` in the pod env is simply absent when the agent runs
+`git push`, with no error to explain it.
+
+**Do not use `store --file` on a read-only mount.** It authenticates, but git tries to write the
+credential back on every operation and emits
+
+```
+fatal: unable to get credential storage lock in 1000 ms: Read-only file system
+```
+
+— a second of latency and the word `fatal` in the agent's output while the command actually
+succeeds, which is precisely the kind of thing that derails an agent. A read-only helper avoids it:
+
+```
+[credential]
+	helper = "!f() { printf 'url=%s\n' \"$(cat /etc/turnstone-git/credentials)\"; }; f"
+[user]
+	name = agent-<team>
+	email = agent-<team>@<domain>
+[http]
+	sslVerify = false
+```
+
+Mount the credential outside `$HOME` (`/etc/turnstone-git`) and the gitconfig into `$HOME` via
+`subPath`, so the volume does not shadow the home directory. `HOME` is on Turnstone's safe list, so
+this survives scrubbing; `GIT_CONFIG_GLOBAL` is explicitly scrubbed, so the config must live at the
+default path and cannot be pointed at by an env var.
+
+**The file is readable by the agent, and that is the point to be honest about.** The node image
+ships no forge CLI — no `gitea`, no `gh`, no `glab`, only `curl`, `jq`, `git` and `python3` — so
+when the agent created and closed pull requests it did so by reading the token out of
+`/etc/turnstone-git/credentials` and calling the REST API with `curl`. File delivery is not
+confinement. The scope on the token is the only real boundary.
+
+That hand-rolled shape is also why a **forge tool, packaged as a Turnstone skill**, is the next
+piece of work: tool calling instead of improvised HTTP, for token efficiency and a reviewable call
+surface. It is a separate thing from the general-purpose `gitea-mcp` server in `MCP.md`; do not
+conflate them.
+
+## 15. Building and deploying a pull request branch
+
+**A hand-written PipelineRun needs the mesh opt-out as a `label`.** The first branch build died with
+kaniko unable to reach Docker Hub — `BlackHoleCluster ... index.docker.io` in the istio-proxy log,
+`build-push` `StepFailed`, `fetch-source` green. `charts/team-ns/templates/builds/docker.yaml:119`
+puts `sidecar.istio.io/inject: "false"` in the PipelineRun's **labels**, and Tekton propagates it to
+the pods. This is `EPHEMERAL-AND-TEAM-WORKLOADS.md` §5 resurfacing in a new place: there the
+annotation goes on a pod template, here it must be a label on the run.
+
+The team's `Pipeline` hardcodes `revision: main` and the `:main` tag, so a branch build means a
+one-off `PipelineRun` with an inline `pipelineSpec` copied from it, with `revision` and `IMAGE`
+overridden and every other parameter — the `--build-arg`s especially — left alone.
+
+**Tag by commit SHA, not by branch name.** A branch-named tag is mutable, and this bit immediately:
+a build launched before a fix landed finished afterwards and left the broken commit sitting under
+the tag a later build expected. Pinning the tag to the SHA makes an environment reference an exact
+revision and makes a late-finishing build harmless.
+
+**Change the environment's image through apl-api, never `kubectl patch`.** The `env-demo-*`
+deployments carry an Argo tracking-id and are Helm-managed by the central `k8s-deployment` chart, so
+a direct patch is reverted by `selfHeal`. The image lives in `spec.values` on the `AplTeamWorkload`:
+
+```
+GET  /api/v2/teams/<team>/workloads/<name>     # spec.values holds image.repository / image.tag
+PUT  /api/v2/teams/<team>/workloads/<name>     # same object, tag replaced
+```
+
+A `PUT` returned `200` and Argo rolled the new pods within 60 seconds. This is `CLAUDE.md` rule 6
+holding up in practice, and it has a second benefit: the change is a normal, Console-visible
+workload edit rather than a live-only hack.
+
+## 16. What the environment caught that the merge gate could not
+
+Two agent changes passed compile and lint and would have passed the merge gate, and both were only
+observable by running them. This is the argument for ephemeral environments, stated in evidence
+rather than in principle.
+
+**A change with zero runtime effect.** Asked to make the review stars green, the agent changed the
+Java fallback:
+
+```java
+System.getenv("STAR_COLOR") == null ? "green" : System.getenv("STAR_COLOR")
+```
+
+But `Dockerfile:41` is `ENV STAR_COLOR=${star_color:-black}` and the team's build passes
+`--build-arg=star_color=red`, so `STAR_COLOR` is always set and the new default is dead code. The
+stars stay red.
+
+The general lesson is sharper than the bug: **`star_color` is configured in the `AplTeamBuild`, which
+lives in the platform values, not in the repository.** An agent that can only see its checkout will
+confidently produce a correct-looking change to something configured outside it. Either build
+arguments move into the repo, or the agent needs visibility into the build configuration.
+
+**Malformed output that compiles.** Asked to rename the reviewers, the agent dropped a trailing
+comma:
+
+```java
+result += "  \"reviewer\": \"Bob\"";        // was: \"Reviewer2\",
+result += "  \"text\": \"Absolutely fun and entertaining...\"";
+```
+
+Java concatenates strings happily, so this compiles, lints and passes CI, and emits
+`"reviewer": "Bob"  "text": ...` — invalid JSON that breaks only when productpage parses the
+response. Correcting it and pushing to the same branch updated the existing PR in place.
