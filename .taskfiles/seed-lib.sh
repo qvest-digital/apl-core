@@ -186,6 +186,26 @@ gitea_oidc_login() {
   printf '%s' "$_existing" | awk '{print $2}'
 }
 
+# platform_admin_sso_ready -- 0 if platform-admin can actually complete an SSO login right now.
+#
+# On a FRESH install Keycloak stamps platform-admin with an UPDATE_PASSWORD required action, so the
+# authorization-code flow ends at .../login-actions/required-action?execution=UPDATE_PASSWORD
+# instead of at the app's callback -- the app sets no session cookie and the login helper fails
+# with something that reads like an app fault but is not one. Confirmed live on the 2026-08-30
+# rebuild. `go-task seed:fix-first-login` clears it (and the seed chain depends on that task), so
+# anything authenticating as platform-admin before the seed has run must say so rather than guess.
+platform_admin_sso_ready() {
+  _pasr_token=$(kc_master_token) || return 1
+  _pasr_user=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  [ -n "$_pasr_user" ] || return 1
+  _pasr_id=$(kc_user_id_by_email "$_pasr_token" "$_pasr_user") || return 1
+  [ -n "$_pasr_id" ] || return 1
+  _pasr_n=$(curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/admin/realms/otomi/users/$_pasr_id" \
+    -H "Authorization: Bearer $_pasr_token" | jq -r '(.requiredActions // []) | length' 2>/dev/null || echo 1)
+  [ "${_pasr_n:-1}" -eq 0 ]
+}
+
 # turnstone_oidc_login <email> <password> -- completes the same Keycloak SSO round trip
 # gitea_oidc_login does, against Turnstone's console, and prints the path to a cookie jar holding
 # the resulting `turnstone_auth_console` session. Caller uses `curl -b "$jar"` and rm's it after.

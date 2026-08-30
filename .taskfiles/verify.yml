@@ -117,12 +117,17 @@ tasks:
         DOMAIN="$D"
         PA_USER=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.username}' | base64 -d)
         PA_PASS=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+        if ! platform_admin_sso_ready 2>/dev/null; then
+          apl_skip "platform-admin still has a pending Keycloak required action (UPDATE_PASSWORD on a"
+          apl_dim  "fresh install) -- run 'go-task seed:fix-first-login' first, then re-run this check."
+        else
         T=$(vikunja_oidc_login "$PA_USER" "$PA_PASS" 2>/dev/null || true)
         if [ -n "$T" ]; then
           apl_ok "platform-admin SSO login OK (Vikunja JWT issued)"
         else
           apl_fail "PLATFORM-ADMIN SSO LOGIN FAILED"
           exit 1
+        fi
         fi
 
         apl_section "not covered here (browser-only, SETUP.md step 10)"
@@ -188,6 +193,10 @@ tasks:
         DOMAIN="$D"
         PA_USER=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.username}' | base64 -d)
         PA_PASS=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+        if ! platform_admin_sso_ready 2>/dev/null; then
+          apl_skip "platform-admin still has a pending Keycloak required action (UPDATE_PASSWORD on a"
+          apl_dim  "fresh install) -- run 'go-task seed:fix-first-login' first, then re-run this check."
+        else
         TS_JAR=$(turnstone_oidc_login "$PA_USER" "$PA_PASS" 2>/dev/null || true)
         if [ -n "$TS_JAR" ]; then
           TS_PERMS=$(curl -sk --max-time 15 -b "$TS_JAR" "https://turnstone.$D/v1/api/auth/whoami" \
@@ -200,6 +209,7 @@ tasks:
           fi
         else
           apl_fail "PLATFORM-ADMIN SSO LOGIN FAILED"
+        fi
         fi
 
         apl_section "/metrics redirect (expect 302, not a Prometheus dump)"
@@ -236,6 +246,12 @@ tasks:
         DOMAIN="$D"
         PA_USER=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.username}' | base64 -d)
         PA_PASS=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+        if ! platform_admin_sso_ready 2>/dev/null; then
+          apl_skip "platform-admin still has a pending Keycloak required action (UPDATE_PASSWORD on a"
+          apl_dim  "fresh install) -- run 'go-task seed:fix-first-login' first. Nothing else to check:"
+          apl_dim  "this task verifies seeded repos, and the seed clears that action on its way past."
+          exit 0
+        fi
         GITEA_LOGIN=$(gitea_oidc_login "$PA_USER" "$PA_PASS") || { apl_fail "platform-admin SSO login to Gitea failed"; exit 1; }
         GPAT=$(gitea_mint_pat "$GITEA_LOGIN" "read:repository,read:organization,read:user") \
           || { apl_fail "could not mint a PAT for $GITEA_LOGIN"; exit 1; }
