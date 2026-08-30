@@ -417,6 +417,27 @@ harbor_has_tag() {
   [ "$_ht_code" = "200" ]
 }
 
+# harbor_make_project_public <project> -- flip an EXISTING Harbor project to public. Needs
+# $HARBOR_ADMIN_PASSWORD in the environment, like the two above.
+#
+# Separate from harbor_ensure_project because the platform operator creates a team's project itself,
+# as PRIVATE -- so the create call 409s and the visibility never changes. A private project is fine
+# until something outside the team has to pull from it, which is exactly the platform agent layer's
+# job: every team's kaniko build does COPY --from against team-platform/agent-base.
+harbor_make_project_public() {
+  _hmp_project=$1
+  _hmp_id=$(curl -sk --max-time 15 -u "admin:$HARBOR_ADMIN_PASSWORD" \
+    "https://harbor.$DOMAIN/api/v2.0/projects?name=$_hmp_project" 2>/dev/null | jq -r '.[0].project_id // empty')
+  [ -n "$_hmp_id" ] || { echo "error: Harbor project '$_hmp_project' not found" >&2; return 1; }
+  _hmp_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+    -X PUT "https://harbor.$DOMAIN/api/v2.0/projects/$_hmp_id" -H "Content-Type: application/json" \
+    -d '{"metadata":{"public":"true"}}')
+  case "$_hmp_code" in
+    200) echo "Harbor project '$_hmp_project' is public" ;;
+    *) echo "error: making Harbor project '$_hmp_project' public returned HTTP $_hmp_code" >&2; return 1 ;;
+  esac
+}
+
 # --- apl-api: create-if-missing ---------------------------------------------------------------
 
 # apl_create_if_missing <get_url> <post_url> <token> <body> <label> -- unlike /v2/teams (which
@@ -558,6 +579,19 @@ stage_service_tree() {
     || { echo "error: $_sst_vendor has no .gitea/runner/Dockerfile" >&2; return 1; }
   cp "$_sst_bin" "$_sst_dir/.gitea/runner/gitea-runner"
   chmod +x "$_sst_dir/.gitea/runner/gitea-runner"
+
+  # The platform agent layer (AGENT-ENVIRONMENTS.md section 18) is pulled into every team's runner
+  # image with COPY --from, and its reference is domain-dependent -- so it is substituted here
+  # rather than hardcoded in the vendored Dockerfile. Same reasoning as the gitea-runner binary
+  # above: this build context is assembled by the seed, not committed ready-to-build.
+  _sst_agent_base="harbor.$DOMAIN/team-${SEED_PLATFORM_TEAM:-platform}/agent-base:main"
+  sed -i "s|__AGENT_BASE_IMAGE__|$_sst_agent_base|g" "$_sst_dir/.gitea/runner/Dockerfile"
+  # Fail loudly rather than shipping a Dockerfile kaniko will choke on with an opaque message:
+  # an unsubstituted placeholder is not a valid image reference.
+  if grep -q '__AGENT_BASE_IMAGE__' "$_sst_dir/.gitea/runner/Dockerfile"; then
+    echo "error: __AGENT_BASE_IMAGE__ left unsubstituted in $_sst_role's runner Dockerfile" >&2
+    return 1
+  fi
   printf '%s' "$_sst_dir"
 }
 
@@ -602,6 +636,25 @@ _runner_fetch_binary_locked() {
   chmod +x "$_rfb_bin"
   echo "downloaded and verified gitea-runner $SEED_RUNNER_VERSION" >&2
   printf '%s' "$_rfb_bin"
+}
+
+# stage_agent_base_tree -- assemble the platform agent-base build context and print its path.
+#
+# Same shape as stage_service_tree: the vendored tree plus the checksum-verified gitea-runner
+# binary, which is deliberately NOT committed to apl-core. The agent-base image owns the runner
+# binary and its config for ALL teams now, which is what removes the four-way download race that
+# GITEA-ACTIONS-CI.md trap 16 documents (four teams curling one shared path concurrently).
+stage_agent_base_tree() {
+  _sabt_vendor="${SEED_AGENT_BASE_DIR:-demo-seed/agent-base}"
+  [ -d "$_sabt_vendor" ] || { echo "error: vendored tree $_sabt_vendor does not exist" >&2; return 1; }
+  _sabt_bin=$(runner_fetch_binary) || return 1
+  _sabt_dir="${APL_STATE_DIR:-.taskfiles/state}/seed_tree_agent_base"
+  rm -rf "$_sabt_dir"
+  mkdir -p "$_sabt_dir"
+  cp -a "$_sabt_vendor/." "$_sabt_dir/"
+  cp "$_sabt_bin" "$_sabt_dir/gitea-runner"
+  chmod +x "$_sabt_dir/gitea-runner"
+  printf '%s' "$_sabt_dir"
 }
 
 # gitea_push_tree <org> <repo> <pat> <gitea-username> <srcdir> <message> -- force-pushes the whole

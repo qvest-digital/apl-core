@@ -595,17 +595,33 @@ One more step that is easy to miss: a user freshly created through `POST /v1/use
 
 ## 19. What is live-only — the persistence backlog
 
-Everything proven above was done against a running cluster. **None of it is in the seed**, so a
-rebuild loses all of it. In rough dependency order:
+Everything above was proven against a running cluster. Some of it is now in the seed and some is
+still live-only; a rebuild keeps the first group and loses the second.
 
-| change | where | why it matters |
-|---|---|---|
-| Harbor projects created **public** | `harbor_ensure_project`, already written and unused | without it a single-namespace environment cannot pull the other teams' images, and no team can pull the platform layer |
-| `replicaCount: 1` on every workload | wherever the seed POSTs a workload | the `k8s-deployment` chart defaults to **2**, silently doubling every pod on a host that is already swapping |
-| a `platform` team + its `dev-platform` user | new, mirrors `setup_team_service` | owner of the shared image |
-| `agent-base` repo + build + push | new | the layer does not exist otherwise |
-| `COPY --from` in all four runner Dockerfiles | `demo-seed/bookinfo/*/.gitea/runner/Dockerfile` | currently only `reviews`, and only on a branch |
-| ordering: `agent-base` before `seed:runners` | `seed.yml` | team builds now depend on the platform image; a missing base fails with a confusing `manifest unknown` |
+**Now in the seed** (`seed:agent-base`, which `seed:apps` depends on):
 
-Note the last row is a genuine new failure mode, and it deserves the same treatment `seed:runners`
-already gives the Argo-sync race: an explicit wait, not a hopeful ordering.
+- the `platform` team and its `dev-platform` user, including
+  `kc_make_password_permanent` — a user created through `POST /v1/users` arrives with
+  `requiredActions: ["UPDATE_PASSWORD"]` and cannot SSO-login until that is cleared
+- its Harbor project flipped **public**, via the new `harbor_make_project_public` helper. The
+  platform operator creates a team's project itself, as *private*, so `harbor_ensure_project`
+  409s and the visibility never changes — a separate call is needed
+- the `agent-base` repo, coderepo, build and push, in the order `setup_team_service` established:
+  SSO login → PAT → org-permission wait → **create the repo** → coderepo + build → webhook wait →
+  push
+- `COPY --from` in all four runner Dockerfiles, via an `__AGENT_BASE_IMAGE__` placeholder that
+  `stage_service_tree` substitutes. The reference is domain-dependent and this build context is
+  already seed-assembled (the `gitea-runner` binary is dropped in the same way), so substitution
+  is the existing pattern rather than a new one. An unsubstituted placeholder fails the stage
+  loudly instead of reaching kaniko as an invalid image reference
+- a wait on the Harbor **tag**, not on the PipelineRun: a run that reports success has still not
+  helped until the artifact is actually pushed, and `seed:runners` cannot start before it is
+
+**Still live-only:**
+
+| change | why it matters |
+|---|---|
+| the four *demo* teams' Harbor projects made public | needed for a single-namespace ephemeral environment, where one team's namespace runs four teams' images; unrelated to the platform layer, which is covered above |
+| `replicaCount: 1` on every workload | the `k8s-deployment` chart defaults to **2**, silently doubling every pod on a host that is already swapping |
+| enabling Loki (and with it the OTel collector) | the agent's log access in §17 depends on it; it is an ordinary Console app toggle, not seeded |
+| the ephemeral environment itself | every `env-demo-*` workload, the Turnstone node, its mounted git and Loki credentials, and the branch build that put the environment on a PR — all created by hand, none of it triggered by anything yet |

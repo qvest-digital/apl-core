@@ -101,7 +101,15 @@ Istio Bookinfo microservice per team wired to the others, and — added later �
 **merge gate**: a Gitea Actions lint+build check, an ephemeral runner whose image this platform
 builds itself, and `main` protected behind that check. Vikunja provisioning runs last.
 
-Sub-tasks, each independently re-runnable (`seed:apps` → `seed:runners` → `seed:gates`):
+Sub-tasks, each independently re-runnable (`seed:agent-base` → `seed:apps` → `seed:runners` → `seed:gates`):
+
+- `seed:agent-base` — a fifth, non-Bookinfo team called `platform` and the shared
+  `agent-base` image it owns: Turnstone plus the CLIs an agent calls as tools (`tea`,
+  `logcli`, `vikunja-cli`) and the `gitea-runner` binary, assembled as a relocatable
+  `/opt/platform` layer. **Every team's runner Dockerfile does `COPY --from` against it**, so
+  it must exist in Harbor before `seed:runners` builds anything — hence `seed:apps` depends on
+  it. One image per team then serves as both the CI runner and the image that team's agent
+  node runs, which is what stops the two drifting. See `AGENT-ENVIRONMENTS.md` §18.
 
 - `seed:apps` — repos, Tekton builds, workloads, public services, cross-team netpols
 - `seed:runners` — each team's ephemeral Actions runner: second `AplTeamBuild` off the same repo,

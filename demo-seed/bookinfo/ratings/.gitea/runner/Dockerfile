@@ -26,6 +26,27 @@ RUN apt-get update \
 # workflow points NODE_PATH at `npm root -g` for eslint.config.js's requires.
 RUN npm install -g eslint@9 @eslint/js@9 globals@15
 
+# --- Platform agent layer ------------------------------------------------------------------------
+#
+# Supplied by the `platform` team, built once, consumed by every team: Turnstone plus the CLIs an
+# agent calls as tools (tea, logcli, vikunja-cli). See AGENT-ENVIRONMENTS.md section 18.
+#
+# COPY --from, not FROM, so this image keeps its own curated toolchain pin above -- none of the four
+# team bases are reproducible from Debian apt at those versions, and at least one is a deliberate,
+# documented version choice. Everything under /opt/platform is relocatable and self-contained (its
+# Python is a standalone build, not the distro's), so it lands cleanly even on a base with no Python
+# at all. The path must stay /opt/platform: console-script shebangs bake it in.
+#
+# One image, two roles. This is the team's CI runner AND the image its agent node runs, so the agent
+# reproduces the merge gate with the same toolchain and the same host-mode workarounds by
+# construction -- there is only one artifact, so the two cannot drift.
+#
+# The image reference on the COPY line below is a placeholder, substituted by
+# stage_service_tree at seed time: the reference is domain-dependent, and this build context is
+# already seed-assembled (see the gitea-runner note above), so it cannot be hardcoded here.
+COPY --from=__AGENT_BASE_IMAGE__ /opt/platform /opt/platform
+ENV PATH=/opt/platform/bin:/opt/platform/python/bin:$PATH
+
 COPY gitea-runner /usr/local/bin/gitea-runner
 COPY config.yaml /data/config.yaml
 COPY entrypoint.sh /entrypoint.sh

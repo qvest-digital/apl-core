@@ -125,6 +125,14 @@ vars:
   # upstream drift mid-demo) and is why there is no longer an upstream ref pinned here.
   SEED_BOOKINFO_VENDOR: "demo-seed/bookinfo"
 
+  # The platform team owns assets shared by every other team -- currently the agent-base image (see
+  # AGENT-ENVIRONMENTS.md section 18). A NORMAL team on purpose: `team-admin` cannot be used,
+  # because its Gitea org has no human members and the admin team is special-cased throughout
+  # (`team-admin` collides with the isTeamAdmin group marker -- see CLAUDE.md).
+  SEED_PLATFORM_TEAM: platform
+  SEED_AGENT_BASE_VENDOR: "demo-seed/agent-base"
+  SEED_AGENT_BASE_REPO: agent-base
+
   # --- Gitea Actions runners ------------------------------------------------------------------
   # gitea.com/gitea/runner ("act_runner"). Downloaded ON THE HOST and checksum-verified, then
   # pushed inside each team's repo so the Dockerfile only has to COPY it -- the one artifact where
@@ -530,9 +538,200 @@ tasks:
             fix_all || exit $?
         fi
 
+  agent-base:
+    desc: "The platform team and its shared agent-base image (turnstone + tea/logcli/vikunja-cli) that every team's runner image layers in"
+    deps: [users]
+    # Polls for a Keycloak reconcile, a Gitea org, a Harbor project and a kaniko build -- all of
+    # which print progress as they go, and all of which Taskfile.yml's global `output: group` would
+    # buffer until the task ends. See CLAUDE.md's note on `interactive: true`.
+    interactive: true
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        API="https://console.$DOMAIN/api"
+        TEAM="{{.SEED_PLATFORM_TEAM}}"
+        REPO="{{.SEED_AGENT_BASE_REPO}}"
+        PW_FILE={{.STATE_DIR}}/seed_pw_${TEAM}_dev.txt
+        # Consumed by seed-lib.sh's stage_agent_base_tree / runner_fetch_binary. Exported because
+        # every cmds block runs in its own shell.
+        export SEED_AGENT_BASE_DIR="{{.ROOT_DIR}}/{{.SEED_AGENT_BASE_VENDOR}}"
+        export SEED_RUNNER_URL="{{.SEED_RUNNER_URL}}"
+        export SEED_RUNNER_SHA256="{{.SEED_RUNNER_SHA256}}"
+        export SEED_RUNNER_VERSION="{{.SEED_RUNNER_VERSION}}"
+        HARBOR_ADMIN_PASSWORD=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret harbor-admin-password \
+          -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)
+        [ -n "$HARBOR_ADMIN_PASSWORD" ] || { apl_fail "harbor-admin-password secret came back empty"; exit 1; }
+
+        # A NORMAL team, deliberately. `team-admin` looks like the obvious owner for platform-wide
+        # assets and is unusable: its Gitea org has no human members, so platform-admin is not even
+        # offered it as a repo owner, and the admin team is special-cased throughout because
+        # `team-admin` collides with the isTeamAdmin group marker. See CLAUDE.md and
+        # AGENT-ENVIRONMENTS.md section 18.
+        create_platform_team() {
+          set -euo pipefail
+          _tok=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+          _out={{.STATE_DIR}}/seed_team_create_$TEAM.json
+          _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X POST "$API/v2/teams" \
+            -H "Authorization: Bearer $_tok" -H "Content-Type: application/json" \
+            -d "{\"kind\":\"AplTeamSettingSet\",\"metadata\":{\"name\":\"$TEAM\",\"labels\":{\"apl.io/teamId\":\"$TEAM\"}},\"spec\":{\"managedMonitoring\":{\"grafana\":false,\"alertmanager\":false},\"networkPolicy\":{\"ingressPrivate\":true,\"egressPublic\":true},\"selfService\":{\"teamMembers\":{\"createServices\":true,\"editSecurityPolicies\":false,\"useCloudShell\":false,\"downloadKubeconfig\":false,\"downloadDockerLogin\":false}}}}")
+          [ "$_http" -lt 300 ] || { echo "error: POST /v2/teams ($TEAM) returned HTTP $_http: $(head -c 300 "$_out")" >&2; return 1; }
+        }
+
+        # One dev user, because the whole Gitea half of this task must run AS a team member:
+        # gitea_oidc_login is what provisions the Gitea account and syncs its org membership from
+        # the JWT `groups` claim, and only an org member may create the repo.
+        create_platform_dev_user() {
+          set -euo pipefail
+          _tok=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+          _out={{.STATE_DIR}}/seed_user_${TEAM}_dev.json
+          _http=$(curl -sk --max-time 15 -o "$_out" -w '%{http_code}' -X POST "$API/v1/users" \
+            -H "Authorization: Bearer $_tok" -H "Content-Type: application/json" \
+            -d "{\"email\":\"dev-$TEAM@$DOMAIN\",\"firstName\":\"Dev\",\"lastName\":\"Platform\",\"isPlatformAdmin\":false,\"isTeamAdmin\":true,\"teams\":[\"$TEAM\"]}")
+          # apl-api 409s on a repeat POST and never re-exposes initialPassword, so a re-run relies
+          # on the password recorded the first time -- same reasoning as seed:users.
+          if [ "$_http" = "409" ]; then
+            [ -s "$PW_FILE" ] || { echo "error: dev-$TEAM exists but $PW_FILE is missing -- delete the user or restore the file" >&2; return 1; }
+            echo "dev-$TEAM already exists, reusing the recorded password"
+            return 0
+          fi
+          [ "$_http" -lt 300 ] || { echo "error: POST /v1/users (dev-$TEAM) returned HTTP $_http: $(head -c 300 "$_out")" >&2; return 1; }
+          _pw=$(jq -r '.initialPassword // empty' "$_out")
+          [ -n "$_pw" ] || { echo "error: apl-api returned no initialPassword for dev-$TEAM" >&2; return 1; }
+          printf '%s' "$_pw" > "$PW_FILE"; chmod 600 "$PW_FILE"
+          _mb="# --- demo-user: dev-$TEAM@$DOMAIN (generated by 'task seed:agent-base') ---"
+          _me="# --- end demo-user: dev-$TEAM@$DOMAIN ---"
+          [ -f passwords.txt ] && sed -i "/^${_mb//\//\\/}\$/,/^${_me//\//\\/}\$/d" passwords.txt
+          { echo "$_mb"; printf 'team:     %s\nrole:     dev (team-admin)\nusername: dev-%s@%s\npassword: %s\n' \
+              "$TEAM" "$TEAM" "$DOMAIN" "$_pw"; echo "$_me"; } >> passwords.txt
+          chmod 600 passwords.txt
+        }
+
+        # A user created through apl-api arrives with requiredActions ["UPDATE_PASSWORD"] and cannot
+        # complete an SSO login until that is cleared -- reset-password alone is NOT enough, the
+        # action is recorded on the user object too. Same helper seed:fix-first-login uses.
+        fix_platform_dev_login() {
+          set -euo pipefail
+          _pw=$(cat "$PW_FILE")
+          _t=$(kc_master_token)
+          _id=""
+          _tries=0
+          while [ "$_tries" -lt 24 ]; do
+            _id=$(kc_user_id_by_email "$_t" "dev-$TEAM@$DOMAIN")
+            [ -n "$_id" ] && break
+            _tries=$((_tries + 1)); sleep 5
+          done
+          [ -n "$_id" ] || { echo "error: apl-tasks' Keycloak operator never created dev-$TEAM@$DOMAIN (120s)" >&2; return 1; }
+          kc_make_password_permanent "$_t" "$_id" "$_pw"
+        }
+
+        # The operator reconciles a new team into three separate things at its own pace; all three
+        # are needed before anything below can run, so wait for the objects themselves rather than
+        # guessing at a sleep.
+        wait_for_platform_team() {
+          set -euo pipefail
+          _tries=0
+          while [ "$_tries" -lt 40 ]; do
+            _ns=$(kubectl --context "$KIND_CTX" --request-timeout=15s get ns "team-$TEAM" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            _org=$(curl -sk --max-time 10 "https://gitea.$DOMAIN/api/v1/orgs/team-$TEAM" 2>/dev/null | jq -r '.username // empty' 2>/dev/null || true)
+            _hb=$(curl -sk --max-time 10 -u "admin:$HARBOR_ADMIN_PASSWORD" "https://harbor.$DOMAIN/api/v2.0/projects?name=team-$TEAM" 2>/dev/null | jq -r '.[0].name // empty' 2>/dev/null || true)
+            if [ "$_ns" = "Active" ] && [ -n "$_org" ] && [ -n "$_hb" ]; then return 0; fi
+            _tries=$((_tries + 1)); sleep 15
+          done
+          echo "error: team-$TEAM did not get a namespace + Gitea org + Harbor project within 600s (ns=$_ns org=$_org harbor=$_hb)" >&2
+          return 1
+        }
+
+        # Nothing creates the Gitea repository for you: AplTeamCodeRepo does not, apl-gitea-operator
+        # does not (OIDC config and build webhooks only), and push-to-create is off. Registering the
+        # build first leaves the operator looping on createBuildWebHook against a repo that is not
+        # there, which reads like a webhook fault and is not. Order matters -- see CLAUDE.md.
+        build_agent_base() {
+          set -euo pipefail
+          _pw=$(cat "$PW_FILE")
+          _gu=$(gitea_oidc_login "dev-$TEAM@$DOMAIN" "$_pw")
+          [ -n "$_gu" ] || { echo "error: SSO login for dev-$TEAM produced no Gitea user" >&2; return 1; }
+          _pat=$(gitea_mint_pat "$_gu" "read:user,write:repository,write:organization,read:organization")
+          gitea_wait_for_org_permission "$_gu" "team-$TEAM" "$_pat" "can_create_repository"
+          gitea_create_org_repo "team-$TEAM" "$REPO" "$_pat"
+
+          _src=$(stage_agent_base_tree) || return 1
+          _token=$(dev_platform_token)
+          apl_create_if_missing \
+            "$API/v2/teams/$TEAM/coderepos/$REPO" "$API/v2/teams/$TEAM/coderepos" "$_token" \
+            "{\"kind\":\"AplTeamCodeRepo\",\"metadata\":{\"name\":\"$REPO\"},\"spec\":{\"gitService\":\"gitea\",\"repositoryUrl\":\"https://gitea.$DOMAIN/team-$TEAM/$REPO.git\",\"private\":false}}" \
+            "coderepo $REPO ($TEAM)"
+          apl_create_if_missing \
+            "$API/v2/teams/$TEAM/builds/$REPO" "$API/v2/teams/$TEAM/builds" "$_token" \
+            "$(jq -n --arg url "https://gitea.$DOMAIN/team-$TEAM/$REPO.git" \
+              '{kind:"AplTeamBuild", metadata:{name:"agent-base"}, spec:{imageName:"agent-base", tag:"main", trigger:true, scanSource:false, mode:{type:"docker", docker:{repoUrl:$url, path:"./Dockerfile", revision:"main"}}}}')" \
+            "build $REPO ($TEAM)"
+
+          # Registered != able to receive. Wait for the webhook to actually exist on the repo before
+          # pushing, or the push fires into nothing and no build ever starts.
+          _tries=0
+          while [ "$_tries" -lt 18 ]; do
+            _hooks=$(curl -sk --max-time 10 "https://gitea.$DOMAIN/api/v1/repos/team-$TEAM/$REPO/hooks" -H "Authorization: token $_pat" 2>/dev/null | jq -r 'length' 2>/dev/null || true)
+            [ "${_hooks:-0}" -gt 0 ] && break
+            _tries=$((_tries + 1)); sleep 10
+          done
+          [ "${_hooks:-0}" -gt 0 ] || { echo "error: no Gitea webhook appeared for team-$TEAM/$REPO within 180s" >&2; return 1; }
+
+          gitea_push_tree "team-$TEAM" "$REPO" "$_pat" "$_gu" "$_src" \
+            "Platform agent base: turnstone, tea, logcli, vikunja-cli and the gitea-runner, as a relocatable /opt/platform layer" || _rc=$?
+          # rc 2 means "already at this commit, nothing pushed" -- fine, the tag check below decides.
+          case "${_rc:-0}" in 0|2) : ;; *) return 1 ;; esac
+        }
+
+        # dev-<platform>'s own bearer token. Same sixty-second-lifespan caveat as seed:apps'
+        # dev_team_token: fetch it immediately before the calls that use it, never across a wait.
+        dev_platform_token() {
+          _pw=$(cat "$PW_FILE")
+          _cns=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret -A \
+            --field-selector "metadata.name={{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}" -o jsonpath='{.items[0].metadata.namespace}')
+          _cid=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret {{.OAUTH2_PROXY_CLIENT_SECRET_NAME}} -n "$_cns" -o jsonpath='{.data.client-id}' | base64 -d)
+          _cs=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret {{.OAUTH2_PROXY_CLIENT_SECRET_NAME}} -n "$_cns" -o jsonpath='{.data.client-secret}' | base64 -d)
+          _r=$(curl -sk --max-time 15 "https://keycloak.$DOMAIN{{.KEYCLOAK_REALM_PATH}}/protocol/openid-connect/token" \
+            --data-urlencode grant_type=password --data-urlencode client_id="$_cid" --data-urlencode client_secret="$_cs" \
+            --data-urlencode username="dev-$TEAM@$DOMAIN" --data-urlencode password="$_pw" --data-urlencode scope=openid)
+          _t=$(printf '%s' "$_r" | jq -r '.access_token // empty' 2>/dev/null || true)
+          [ -n "$_t" ] || { echo "error: no access token for dev-$TEAM -- Keycloak said: $(printf '%s' "$_r" | head -c 300)" >&2; return 1; }
+          printf '%s' "$_t"
+        }
+
+        # The image must EXIST before seed:runners builds any team image, because every team's
+        # runner Dockerfile does COPY --from against it. Waiting on the Harbor tag is the honest
+        # check: a PipelineRun that reports success has still not helped until the artifact is
+        # pushed. Generous bound -- this build installs a standalone Python and four binaries.
+        wait_for_agent_base_image() {
+          set -euo pipefail
+          _tries=0
+          while [ "$_tries" -lt 60 ]; do
+            if harbor_has_tag "team-$TEAM" "agent-base" "main"; then return 0; fi
+            _tries=$((_tries + 1)); sleep 15
+          done
+          echo "error: harbor.$DOMAIN/team-$TEAM/agent-base:main never appeared (900s). Check: kubectl get pipelinerun -n team-$TEAM" >&2
+          return 1
+        }
+
+        apl_run "seed-platform-team"      "Creating the '$TEAM' team via POST /v2/teams"                 create_platform_team      || exit $?
+        apl_run "seed-platform-user"      "Creating dev-$TEAM (isTeamAdmin=true)"                        create_platform_dev_user  || exit $?
+        apl_run "seed-platform-login-fix" "Making dev-$TEAM's password permanent (clears UPDATE_PASSWORD)" fix_platform_dev_login  || exit $?
+        apl_run "seed-platform-wait"      "Waiting for team-$TEAM's namespace, Gitea org and Harbor project" wait_for_platform_team || exit $?
+        apl_run "seed-platform-harbor"    "Making Harbor project 'team-$TEAM' public so every team can pull the layer" \
+          harbor_make_project_public "team-$TEAM" || exit $?
+        apl_run "seed-agent-base-build"   "Creating team-$TEAM/$REPO and pushing the agent-base build context" build_agent_base || exit $?
+        apl_run "seed-agent-base-image"   "Waiting for harbor.$DOMAIN/team-$TEAM/agent-base:main"        wait_for_agent_base_image || exit $?
+        apl_ok "platform agent base ready: harbor.$DOMAIN/team-$TEAM/agent-base:main -- every team's runner image layers it in"
+
   apps:
     desc: "Istio Bookinfo, one microservice per team: Gitea repo + Tekton build + workload + public service, cross-team wired"
-    deps: [users]
+    # agent-base, not users: every team's runner Dockerfile does COPY --from against the platform
+    # agent layer, so that image must exist in Harbor before seed:runners builds anything. A
+    # missing base fails inside kaniko with an opaque "manifest unknown".
+    deps: [agent-base]
     # This task's own polling loops print real progress every few seconds (webhook waits, build
     # waits, the final cross-team page check) -- but Taskfile.yml's global `output: group` buffers
     # a task's ENTIRE stdout until its script block exits, so without this flag none of it is
