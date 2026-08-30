@@ -722,6 +722,15 @@ tasks:
         apl_run "seed-platform-wait"      "Waiting for team-$TEAM's namespace, Gitea org and Harbor project" wait_for_platform_team || exit $?
         apl_run "seed-platform-harbor"    "Making Harbor project 'team-$TEAM' public so every team can pull the layer" \
           harbor_make_project_public "team-$TEAM" || exit $?
+        # Before the push, never after: the push fires the build webhook immediately, and the
+        # build's fetch-source pod mounts the `gitea-credentials` Secret apl-gitea-operator writes
+        # into the team namespace. A BRAND-NEW team routinely does not have it yet -- upstream
+        # swallows a 403 and never retries -- and the pod then sits at Init:0/2 on a FailedMount
+        # while the wait below times out, with the real cause nowhere near the failure. Confirmed
+        # live on the first run of this task, which is exactly the case seed:apps already guards
+        # for the Bookinfo teams.
+        apl_run "seed-platform-credentials" "Ensuring apl-gitea-operator wrote gitea-credentials into team-$TEAM" \
+          gitea_ensure_team_credentials "$TEAM" || exit $?
         apl_run "seed-agent-base-build"   "Creating team-$TEAM/$REPO and pushing the agent-base build context" build_agent_base || exit $?
         apl_run "seed-agent-base-image"   "Waiting for harbor.$DOMAIN/team-$TEAM/agent-base:main"        wait_for_agent_base_image || exit $?
         apl_ok "platform agent base ready: harbor.$DOMAIN/team-$TEAM/agent-base:main -- every team's runner image layers it in"

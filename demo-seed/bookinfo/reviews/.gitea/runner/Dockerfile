@@ -48,7 +48,14 @@ RUN curl -sSL -o /opt/checkstyle.jar \
 # stage_service_tree at seed time: the reference is domain-dependent, and this build context is
 # already seed-assembled (see the gitea-runner note above), so it cannot be hardcoded here.
 COPY --from=__AGENT_BASE_IMAGE__ /opt/platform /opt/platform
-ENV PATH=/opt/platform/bin:/opt/platform/python/bin:$PATH
+# APPENDED, never prepended. The platform layer ships its own Python, and putting it first
+# shadows the team's toolchain: on the python-based runner `python3`, `pip` and `pip3` all resolved
+# to /opt/platform, so the team's own dependencies (installed into the image's interpreter) simply
+# vanished and CI failed. Confirmed live -- prodpage's merge gate went red on exactly this.
+# Appending keeps the team's toolchain first and still finds tea/logcli/vikunja-cli/turnstone,
+# which nothing else provides. Turnstone's console scripts carry an absolute shebang into
+# /opt/platform/python/bin, so they are unaffected by the ordering either way.
+ENV PATH=$PATH:/opt/platform/bin:/opt/platform/python/bin
 
 COPY gitea-runner /usr/local/bin/gitea-runner
 COPY config.yaml /data/config.yaml
