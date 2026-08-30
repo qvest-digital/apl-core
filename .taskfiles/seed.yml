@@ -143,9 +143,6 @@ vars:
   # Second AplTeamBuild per repo, building .gitea/runner/Dockerfile into this image name.
   SEED_RUNNER_IMAGE_NAME: ci-runner
 
-  # Off by default. See the skip in seed:runners: the runner build is trigger:false, so a changed
-  # .gitea/runner/Dockerfile is invisible to a cluster that already has the image.
-  SEED_FORCE_RUNNER_BUILD: '{{.SEED_FORCE_RUNNER_BUILD | default "false"}}'
   # The status check branch protection requires. "<workflow name> / <job id> (<event>)" -- all four
   # workflows are `name: ci` with a single job `ci`, deliberately, so this one string fits them all.
   SEED_CI_STATUS_CONTEXT: "ci / ci (pull_request)"
@@ -1305,7 +1302,11 @@ tasks:
           #
           # SEED_FORCE_RUNNER_BUILD=true deletes the tag first, which is what makes the build run.
           # A fresh cluster never needs it: there is no tag, so the current Dockerfile always wins.
-          if [ "{{.SEED_FORCE_RUNNER_BUILD}}" = "true" ]; then
+          # Read from the process environment, NOT as a go-task template var: this repo's other
+          # toggles (NONINTERACTIVE, *_ENABLED) are shell-level, and a plain `VAR=true go-task ...`
+          # does not populate {{.VAR}}. Getting that wrong is silent -- the flag simply does
+          # nothing and the skip below still fires, which is exactly how it was found.
+          if [ "${SEED_FORCE_RUNNER_BUILD:-false}" = "true" ]; then
             harbor_delete_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main || true
           fi
           if harbor_has_tag "team-$_team" "{{.SEED_RUNNER_IMAGE_NAME}}" main; then
