@@ -497,3 +497,115 @@ token: Loki OSS has no token concept, the tenant is chosen by basic-auth usernam
 is a long-lived per-team value stored in plaintext. A leak means rotating a shared team credential
 rather than revoking one environment's. Accepted for now because the access is read-only and
 tenant-scoped; recorded here rather than solved.
+
+## 18. The platform agent image — one artifact, two roles
+
+The agent needs Turnstone plus a set of CLIs; the merge gate needs a language toolchain. Making
+those two images is a mistake, because they then drift. **One image per team serves both roles**:
+it is the team's Gitea Actions CI runner *and* the image its agent node runs, so the agent
+reproduces the gate with the same toolchain and the same host-mode workarounds by construction.
+
+### Why the layering is `COPY --from`, not `FROM`
+
+The tempting shape — a platform base image that teams extend — does not survive contact with this
+lab. Each team's runner pins a curated upstream toolchain:
+
+```
+productpage  python:3.13.3-slim     details  ruby:3.4.3-slim
+reviews      gradle:8.13.0-jdk8     ratings  node:21.6-slim
+```
+
+None of those are reproducible from Debian apt at those versions, and at least one is a deliberate,
+documented version choice. Putting a platform base *underneath* would cost all four pins. So the
+platform layer is pulled in instead:
+
+```dockerfile
+FROM gradle:8.13.0-jdk8                      # team owns this
+COPY --from=harbor.<domain>/team-platform/agent-base:main /opt/platform /opt/platform
+ENV PATH=/opt/platform/bin:/opt/platform/python/bin:$PATH
+```
+
+Everything under `/opt/platform` must therefore be **relocatable**: it lands on a Ruby, Node or JDK
+image that may have no Python at all. That is why Turnstone is installed into a **standalone
+CPython** (`astral-sh/python-build-standalone`) rather than a venv over the distro's interpreter — a
+venv is bound to its interpreter, and there are four different ones here. The path must stay
+`/opt/platform`, because console-script shebangs bake it in.
+
+Verified live on `team-reviews/ci-runner:agent-base-layer` — one image reporting both halves, with
+the platform's own Python running on a JDK base that has none:
+
+```
+Gradle 8.13 · JDK 8 (default) · JDK 21 (explicit path) · checkstyle.jar
+turnstone-server · tea · logcli · vikunja-cli · logs · Python 3.13.15
+```
+
+### What is in the layer, and why CLIs rather than MCP
+
+`tea` (Gitea's official CLI), `logcli`, `vikunja-cli`, `gitea-runner`, and the `logs` wrapper — all
+static Go except Turnstone. They are baked in **as CLIs the agent calls as tools**, deliberately: a
+tool call that shells out to a pinned binary costs a fraction of the tokens an improvised REST
+conversation does, and it gives a call surface that can be reviewed. Before this image existed the
+agent hand-rolled `curl` against Gitea's API, having read its own credential file to do it.
+
+This is a *separate* concern from the general-purpose `gitea-mcp` server in `MCP.md`; the intended
+end state is a forge **skill**, not an MCP client. Do not conflate them.
+
+`vikunja-cli` (jo-nike) was chosen over `vja` because it emits JSON an agent can parse. Vikunja's
+own `vikunja` CLI is server administration only, not a user client.
+
+Moving `gitea-runner`, `config.yaml` and `entrypoint.sh` into this layer also **deletes trap 16** in
+`GITEA-ACTIONS-CI.md`: they were four byte-identical copies fetched by four concurrent downloads
+into one shared path, a race that needed a lock and a PID-unique temp file to survive. Owning them
+in one place removes the race rather than guarding it.
+
+### It must live in a normal team, not `team-admin`
+
+`team-admin` looks like the natural owner and is not usable:
+
+- its Gitea org has no human members — only `organization-team-admin` and `otomi-admin` — so
+  `platform-admin` is not offered it as a repo owner at all
+- the admin team is special-cased throughout, because `team-admin` collides with the `isTeamAdmin`
+  group marker (see `CLAUDE.md`); operators deliberately `omit teamConfig "admin"` when looping
+
+A normal team gets everything with no special casing. A team named `platform` was created and every
+step worked first time: namespace, Gitea org, Harbor project, coderepo, build, Pipeline,
+EventListener. **Its Harbor project must be flipped public** so every team's build can pull the
+layer.
+
+### Creating the repo: mirror the seed, do not invent
+
+Costly discovery: **nothing creates the Gitea repository automatically.** `AplTeamCodeRepo` does
+not, `apl-gitea-operator` does not (it manages OIDC config and build webhooks only), and
+push-to-create is off. The operator will sit in a `createBuildWebHook` error loop against a repo
+that does not exist, which reads like a webhook problem and is not.
+
+The seed creates it explicitly, and the order is the content (`seed.yml:678-711`):
+
+1. `gitea_oidc_login` **as the team's dev user** — this provisions the Gitea account *and* its org
+   membership from the JWT `groups` claim
+2. `gitea_mint_pat`
+3. `gitea_wait_for_org_permission … can_create_repository`
+4. **`gitea_create_org_repo`**
+5. `gitea_unprotect_branch`, then coderepo + build via apl-api, then push
+
+One more step that is easy to miss: a user freshly created through `POST /v1/users` comes back with
+`requiredActions: ["UPDATE_PASSWORD"]`, and SSO login fails until `kc_make_password_permanent`
+(`seed-lib.sh:81`) resets the credential with `temporary:false` **and** clears `requiredActions` —
+`reset-password` alone is not enough.
+
+## 19. What is live-only — the persistence backlog
+
+Everything proven above was done against a running cluster. **None of it is in the seed**, so a
+rebuild loses all of it. In rough dependency order:
+
+| change | where | why it matters |
+|---|---|---|
+| Harbor projects created **public** | `harbor_ensure_project`, already written and unused | without it a single-namespace environment cannot pull the other teams' images, and no team can pull the platform layer |
+| `replicaCount: 1` on every workload | wherever the seed POSTs a workload | the `k8s-deployment` chart defaults to **2**, silently doubling every pod on a host that is already swapping |
+| a `platform` team + its `dev-platform` user | new, mirrors `setup_team_service` | owner of the shared image |
+| `agent-base` repo + build + push | new | the layer does not exist otherwise |
+| `COPY --from` in all four runner Dockerfiles | `demo-seed/bookinfo/*/.gitea/runner/Dockerfile` | currently only `reviews`, and only on a branch |
+| ordering: `agent-base` before `seed:runners` | `seed.yml` | team builds now depend on the platform image; a missing base fails with a confusing `manifest unknown` |
+
+Note the last row is a genuine new failure mode, and it deserves the same treatment `seed:runners`
+already gives the Argo-sync race: an explicit wait, not a hopeful ordering.

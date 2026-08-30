@@ -20,7 +20,7 @@ wrong one for the task wastes a session.
 | `VIKUNJA.md` | the worked example behind that playbook — a record of one real integration | you need the concrete detail a rule in the playbook is abbreviating |
 | `TURNSTONE.md` | a second worked example — an app needing an upstream LLM API, and the certificate trap that came with it | your app is not a Go web app, or anything TLS fails in a way `openssl` says is fine |
 | `UPSTREAM-SYNC.md` | an executable runbook: pull new commits from `linode/apl-core` into this fork | you are asked to merge in, sync with, or catch up on upstream |
-| `MCP.md` | a record of deploying MCP servers for Gitea and Vikunja, and every credential/session trap proving them live turned up | you are touching either app's MCP server, wiring an MCP client (Turnstone or otherwise) to them, or need a platform-user credential neither app's OIDC login hands you directly |
+| `MCP.md` | a record of deploying MCP servers for Gitea and Vikunja, and every credential/session trap proving them live turned up | you are touching either app's MCP server, wiring an MCP client (Turnstone or otherwise) to them, or need a platform-user credential neither app's OIDC login hands you directly, or a user shows up in Gitea as somebody else entirely (Gitea links an incoming SSO identity to whichever account is already signed in — last section) |
 | `VIKUNJA-TURNSTONE-PIPELINE.md` | a proof-of-flow: a Vikunja webhook triggers a Tekton pipeline that calls Turnstone through its real Python SDK | you are wiring any app event to trigger a Tekton pipeline, or need a working example of the `turnstone` PyPI SDK from inside a pod |
 | `TEAM-WORKLOAD-CATALOG.md` | the preferred, correct way to give a team a pipeline or other workload: a git-tracked chart + the platform's own `workloads`/`catalogs` mechanism, not raw `kubectl apply` | you are asked to add a pipeline, a workload, or anything a team should own and iterate on going forward |
 | `GITEA-ACTIONS-CI.md` | why the demo teams' lint/build merge gate is built the way it is: Actions rather than Tekton, ephemeral host-mode runners, runner images built by the platform itself | you are touching `seed:runners`/`seed:gates`, any `demo-seed/bookinfo/*/.gitea/` file, or branch protection |
@@ -381,6 +381,26 @@ a long poll loop prints nothing until it is already over — both indistinguisha
 they happen. Marking the task `interactive: true` exempts it from grouping. `install:prompt`,
 `install:values`, `install:watch`, `install:watch-argocd` and `images:load-all` all carry it for
 this reason; any future task of either shape needs it too.
+
+**Nothing creates a Gitea repository for you — the seed does it explicitly.** `AplTeamCodeRepo`
+does not create the repo, `apl-gitea-operator` does not (it manages OIDC config and build webhooks
+only), and push-to-create is off. Register a build against a repo that does not exist and the
+operator sits in a `createBuildWebHook` error loop, which reads like a webhook or trigger fault and
+is not. **Mirror `seed.yml`'s `setup_team_service` (lines ~678-711) rather than inventing a flow:**
+`gitea_oidc_login` as the team's dev user (this provisions the account *and* its org membership from
+the JWT `groups` claim) → `gitea_mint_pat` → `gitea_wait_for_org_permission` →
+**`gitea_create_org_repo`** → `gitea_unprotect_branch` → coderepo + build via apl-api → push. Also:
+a user freshly created via `POST /v1/users` carries `requiredActions: ["UPDATE_PASSWORD"]` and
+cannot SSO-login until `kc_make_password_permanent` (`seed-lib.sh:81`) both resets the credential
+with `temporary:false` and clears `requiredActions` — the reset alone is not enough.
+
+**`team-admin` is not a usable team for anything you want to own.** Its Gitea org contains no
+humans (only `organization-team-admin` and `otomi-admin`), so `platform-admin` is not even offered
+it as a repo owner, and the admin team is special-cased throughout because `team-admin` collides
+with the `isTeamAdmin` group marker (see the `team-admin` collision note below). For shared,
+platform-owned assets create a **normal** team — a team named `platform` worked first try for
+namespace, Gitea org, Harbor project, coderepo, build, Pipeline and EventListener. Remember to flip
+its Harbor project public if other teams must pull from it.
 
 **A half-installed platform is not salvageable.** `helm uninstall apl` removes the operator only;
 every release the *operator* created survives. Delete the cluster instead.

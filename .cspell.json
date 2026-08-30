@@ -221,6 +221,7 @@
     "printf",
     "projektverwaltung",
     "promtail",
+    "psql",
     "psycopg",
     "println",
     "prio",

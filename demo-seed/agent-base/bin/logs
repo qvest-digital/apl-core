@@ -1,0 +1,34 @@
+#!/bin/sh
+# logs [logql-selector] [limit] -- read this ephemeral environment's logs.
+#
+# Thin wrapper over logcli. Its only job is turning FILE-mounted credentials into the environment
+# logcli expects, because Turnstone strips LOKI_PASSWORD (and every other *_PASSWORD/_TOKEN/_KEY/
+# _SECRET/_CREDENTIAL) from the agent's shell before it runs -- see turnstone/core/env.py. Setting
+# it here, inside this wrapper's own process, is unaffected by that.
+#
+# Reads /etc/turnstone-loki/{username,password}, mounted per environment. The username IS the Loki
+# tenant: a reverse proxy on :3101 derives the tenant from it, so no X-Scope-OrgID is needed.
+# Querying loki-gateway:80 instead requires that header and answers "no org id" without it.
+#
+#   logs                                             # everything in this environment
+#   logs '{namespace="team-reviews",deployment="env-demo-reviews"}'
+#   logs '{namespace="team-reviews"} |= "error"' 200
+set -eu
+
+D=${TURNSTONE_LOKI_DIR:-/etc/turnstone-loki}
+[ -r "$D/username" ] && [ -r "$D/password" ] || {
+  echo "logs: no Loki credential at $D -- this node was created without one" >&2; exit 2; }
+
+TENANT=$(cat "$D/username")
+
+# NOTE: assign the default separately. Writing Q="${1:-{namespace=\"x\"}}" ends the parameter
+# expansion at the first '}' inside the default and appends the remainder to the query, producing a
+# malformed selector and a parse error that points nowhere near the cause.
+Q="${1:-}"
+[ -n "$Q" ] || Q="{namespace=\"team-${TENANT}\"}"
+L="${2:-100}"
+
+LOKI_ADDR=${LOKI_ADDR:-http://loki-headless.monitoring:3101} \
+LOKI_USERNAME="$TENANT" \
+LOKI_PASSWORD="$(cat "$D/password")" \
+exec logcli query "$Q" --limit="$L" --since="${LOGS_SINCE:-1h}" --no-labels --quiet

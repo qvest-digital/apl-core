@@ -1,0 +1,17 @@
+# insecure: this lab's Gitea serves a cert from its own auto-generated root CA, which this image's
+# system trust store does not carry. See CLAUDE.md's CA note -- same class of setting as the
+# Tekton Tasks' sslVerify:false / --skip-tls-verify.
+runner:
+  insecure: true
+  # REQUIRED for --ephemeral to work correctly, and its default (0s) is actively harmful here.
+  #
+  # An ephemeral runner initiates shutdown as soon as it ACCEPTS its one job, then relies on this
+  # grace period to let that job finish. At 0s it kills the job it just started
+  # ("shutdown initiated, waiting 0s for running jobs to complete"), Gitea re-queues it, the pod
+  # restarts, and the cycle repeats -- with Kubernetes restart backoff growing each time. Observed
+  # live: a PR check sat queued through 4 pod restarts before a job happened to finish inside the
+  # race window. Short jobs sometimes squeak through, which is what makes this look flaky rather
+  # than broken, and is exactly why it is worth pinning down.
+  #
+  # 1h comfortably exceeds the slowest gate here (the reviews gradle build).
+  shutdown_timeout: 1h

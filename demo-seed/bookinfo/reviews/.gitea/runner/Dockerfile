@@ -29,6 +29,23 @@ RUN apt-get update \
 RUN curl -sSL -o /opt/checkstyle.jar \
       https://github.com/checkstyle/checkstyle/releases/download/checkstyle-14.0.0/checkstyle-14.0.0-all.jar
 
+# --- Platform agent layer ------------------------------------------------------------------------
+#
+# Supplied by the platform team, built once, consumed by every team: Turnstone plus the CLIs an
+# agent calls as tools (tea, logcli, vikunja-cli). Pulled in with COPY --from rather than FROM so
+# this image keeps its own curated toolchain pin above -- gradle:8.13.0-jdk8 here, ruby/node/python
+# in the other three, none of them reproducible from Debian apt at those versions.
+#
+# Everything under /opt/platform is relocatable and self-contained (its Python is a standalone
+# build, not the distro's), so it lands cleanly on a JDK image that has no Python at all. The path
+# must stay /opt/platform: console-script shebangs bake it in.
+#
+# One image, two roles. This is the team's CI runner AND the image its agent node runs, so the
+# agent reproduces the merge gate with the same toolchain and the same host-mode workarounds by
+# construction -- there is only one artifact, so the two cannot drift.
+COPY --from=harbor.172.18.255.200.nip.io/team-platform/agent-base:main /opt/platform /opt/platform
+ENV PATH=/opt/platform/bin:/opt/platform/python/bin:$PATH
+
 COPY gitea-runner /usr/local/bin/gitea-runner
 COPY config.yaml /data/config.yaml
 COPY entrypoint.sh /entrypoint.sh
