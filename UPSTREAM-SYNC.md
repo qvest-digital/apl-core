@@ -118,6 +118,67 @@ is unchanged, so take a look at every pinned image tag/digest under
 `charts/team-ns/templates/tekton-tasks/` while you're already touching this area for a sync,
 rather than assuming a merge keeps any of them current.
 
+## 4c. Known upstream bug, not yet fixed here: a team named `platform` collides
+
+Found live 2026-08-31, recorded rather than fixed — nothing in the lab is blocked by it today, and
+it is a candidate for whenever this fork's divergence gets cleaned up.
+
+`values/kubernetes-gateways/kubernetes-gateways-raw.gotmpl` emits one ReferenceGrant per team, named
+after the team, and then a platform-level one with a hardcoded name:
+
+```gotmpl
+{{- range $teamId := (keys $v.teamConfig | sortAlpha) }}
+      name: {{ $teamId }}-oauth2-proxy-apps          # team loop
+{{- end }}
+      name: platform-oauth2-proxy-apps               # hardcoded, emitted AFTER the loop
+```
+
+A team called `platform` therefore produces an object with exactly the platform-level name. Both are
+rendered into the same raw chart, the hardcoded one is emitted last, and it wins — so the *team's*
+grant silently does not exist. This is the same shape as the `team-admin` collision CLAUDE.md
+already documents: a team id colliding with a platform-level identifier.
+
+**Symptom, and why it does not look like a naming bug.** The team's HTTPRoutes may no longer
+reference `oauth2-proxy` in `istio-system`, so they report
+`ResolvedRefs=False (RefNotPermitted)` and their Argo application sits **Degraded** while every
+resource under it shows `Synced` and no individual resource reports a health problem. On the
+2026-08-31 lab that was `team-platform-tekton-dashboard-platform-artifacts`, 1 of 95 apps, and it
+had been carried in a session handover for two days as "not diagnosed". Compare the grant against a
+working team's — the `from:` list is the tell:
+
+```
+platform-oauth2-proxy-apps   from: argocd, harbor, monitoring, grafana, kfp, otomi, tekton-dashboard
+details-oauth2-proxy-apps    from: team-details
+```
+
+The blast radius is every auth-backed route that team owns. It showed up on only one route because
+`team-platform` happens to own only one, but any public service that team gains would hit it too —
+which matters, because `team-platform` is the team `seed:agent-base` creates to own the shared
+agent image (`AGENT-ENVIRONMENTS.md` §18), and CLAUDE.md actively recommends a team named
+`platform` for shared, platform-owned assets.
+
+**The fix, when someone takes it:** prefix the per-team name — `team-{{ $teamId }}-oauth2-proxy-apps`
+— which removes the whole collision class, since no team-derived name can then match a
+platform-level one. One line. It renames the existing per-team grants; they are owned by the
+`kubernetes-gateways-artifacts` Argo application with automated prune, so Argo replaces them and
+nothing references them by name. Renaming the hardcoded platform grant instead is the smaller edit
+but leaves the trap in place for the next collision.
+
+Two caveats worth knowing before starting:
+
+- `values/*.gotmpl` is baked into the **operator image**, not read from the git values repo, so this
+  cannot be applied to a running cluster by committing it. It lands at the next `task setup`; doing
+  it live means rebuilding the operator image, loading it into the kind node and restarting
+  `apl-operator`, and SETUP.md's "Changing values after install" warns that restarting the operator
+  can re-run bootstrap.
+- The file is upstream (every commit touching it is an upstream PR: #3543, #3325, #3068), so fixing
+  it here is new fork divergence in a file a merge may touch — and it is worth reporting upstream,
+  since it is a genuine bug for anyone who names a team `platform`.
+
+**Verification** that a fix worked: the grant `team-platform-oauth2-proxy-apps` exists carrying
+`from: team-platform`, the team's HTTPRoutes report `ResolvedRefs=True`, and the Argo application
+turns Healthy.
+
 ## 5. Record the new sync point
 
 Once the merge lands on `main`, move `reference/base` to the new merge commit (or create a new

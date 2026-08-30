@@ -420,6 +420,17 @@ its Harbor project public if other teams must pull from it.
 **A half-installed platform is not salvageable.** `helm uninstall apl` removes the operator only;
 every release the *operator* created survives. Delete the cluster instead.
 
+**A team named `platform` collides with a platform-level object, and the symptom is a Degraded Argo
+app with nothing visibly wrong under it.** `values/kubernetes-gateways/kubernetes-gateways-raw.gotmpl`
+emits `<teamId>-oauth2-proxy-apps` per team and then a hardcoded `platform-oauth2-proxy-apps`; for a
+team called `platform` those are one object, the hardcoded one is emitted last and wins, and the
+team's ReferenceGrant silently does not exist. Its auth-backed HTTPRoutes then report
+`ResolvedRefs=False (RefNotPermitted)` while every resource shows `Synced`. Same shape as the
+`team-admin` collision below. **Not fixed** as of 2026-08-31 — deliberately recorded rather than
+repaired, with the full account and the one-line fix in `UPSTREAM-SYNC.md` §4c. This is the known
+cost of the "create a normal team named `platform`" advice above; it is still the right advice for
+everything else, and `team-platform/agent-base` works exactly as documented.
+
 **`team-admin` means two different things.** It is a Keycloak group and realm role carried by every
 user with `isTeamAdmin` (`apl-tasks` `src/operators/keycloak/keycloak.ts`:
 `if (decoded.isTeamAdmin === 'true') groups.push('team-admin')`). It is *also* how the platform's
