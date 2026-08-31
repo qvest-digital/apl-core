@@ -44,6 +44,24 @@ def strip_html(s):
     return re.sub("<[^>]+>", "", s or "").strip()
 
 
+# Static, pipeline-injected footer appended to every comment the coach posts, so
+# the reader can tell the AI-generated content (above the line) from this system
+# note (below it) and always sees the available commands.
+FOOTER = (
+    '<hr>'
+    '<blockquote>'
+    '<p>🤖 <strong>Ticket Coach</strong> &mdash; everything <em>above this line</em> is '
+    'AI-generated; this note is added automatically.</p>'
+    '<p><strong>Commands:</strong> reply <code>/accept</code> to save the proposed '
+    'description onto this ticket.</p>'
+    '</blockquote>'
+)
+
+
+def with_footer(html):
+    return html + FOOTER
+
+
 # 1. Fetch the ticket + its comment thread for full context.
 task = vik("GET", f"/tasks/{TASK_ID}")
 title = task.get("title", "")
@@ -121,9 +139,10 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
     # One comment: it starts as the live watch-link and is EDITED into the answer
     # when the turn finishes. Capture its id so we can update it in place.
     _wc = vik("PUT", f"/tasks/{TASK_ID}/comments",
-              {"comment": f'<p>🤖 Coaching this ticket &mdash; '
-                          f'<a href="{watch_url}">watch the agent live in Turnstone</a>. '
-                          f'The proposed description &amp; acceptance criteria will appear here shortly.</p>'})
+              {"comment": with_footer(
+                  f'<p>🤖 Coaching this ticket &mdash; '
+                  f'<a href="{watch_url}">watch the agent live in Turnstone</a>. '
+                  f'The proposed description &amp; acceptance criteria will appear here shortly.</p>')})
     comment_id = (_wc or {}).get("id")
     print(f"posted watch link (comment {comment_id}) for ws {ws.ws_id}")
     # Fire the message and POLL for completion. We do NOT use send_and_wait: it
@@ -178,10 +197,11 @@ body = (reply.split(SENTINEL)[-1] if SENTINEL in reply else reply).strip()
 
 
 def update_comment(html):
+    payload = {"comment": with_footer(html)}
     if comment_id:
-        vik("POST", f"/tasks/{TASK_ID}/comments/{comment_id}", {"comment": html})
+        vik("POST", f"/tasks/{TASK_ID}/comments/{comment_id}", payload)
     else:  # fallback: the watch comment id was somehow lost
-        vik("PUT", f"/tasks/{TASK_ID}/comments", {"comment": html})
+        vik("PUT", f"/tasks/{TASK_ID}/comments", payload)
 
 
 if not body:
