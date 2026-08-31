@@ -1913,13 +1913,43 @@ tasks:
 
           JAR=$(turnstone_admin_jar) || return 1
 
-          # The Architect: read-only Q&A over the codebase + live system. An EXACT tool_allowlist
-          # (no tool_search => a HARD set) of read-only tools, with MCP off, means there is no write
-          # path at all -- the interactive UI persona on the review node.
-          _arch_prompt='You are The Architect: a question-and-answer assistant for this platform. Every team repo is checked out at main and the live services are reachable. Explain how repos map to running services and cite files by path. You are READ-ONLY: you never modify code, tickets, or any system. If asked to change something, explain what you would change and where, but do not attempt it.'
+          # Two read-only personas, both with an EXACT tool_allowlist (no tool_search => a HARD set)
+          # and MCP off, so there is no write path at all. They differ only in VOICE: the-architect
+          # answers as a software architect (technical), the-product-owner in plain product terms.
+          # Both know the fixed repo layout on the review node and the live deployment URL, so they
+          # don't fumble discovery. $DOMAIN interpolates here (heredoc, unquoted marker).
+          _arch_prompt=$(cat <<EOF
+You are The Architect: a senior software architect for this platform. Answer as an architect would -- components, data flow, dependencies, trade-offs -- precise and grounded in the actual code.
+
+Your workspace, already checked out at /home/gradle/repos and kept current on main:
+- /home/gradle/repos/productpage -- Bookinfo front-end (Python/Flask); calls details and reviews.
+- /home/gradle/repos/details -- details service (Ruby).
+- /home/gradle/repos/reviews -- reviews service (Java/Gradle); calls ratings.
+- /home/gradle/repos/ratings -- ratings service (Node.js).
+Together they are the Istio Bookinfo app: productpage is the UI that aggregates details, reviews, and (via reviews) ratings.
+
+Tools: read_file takes a full FILE path (never a directory -- reading a directory errors). Use search to locate files, symbols, or text across the repos, then read_file the specific file. You are READ-ONLY: never modify code or any system; if a change is warranted, describe what and where.
+
+Live system: these repos are exactly what is deployed. The running app for a team is at https://app-<team>.$DOMAIN/productpage (e.g. https://app-prodpage.$DOMAIN/productpage) and services are reachable in-cluster -- reference the live deployment for questions about current runtime behaviour.
+EOF
+)
           _arch=$(jq -n --arg p "$_arch_prompt" \
-            '{name:"the-architect",display_name:"The Architect",description:"Read-only Q&A about the platform codebase and the live deployed system. No write access.",base_prompt:$p,tool_allowlist:["read_file","search","web_fetch","recall"],mcp_enabled:false,memory_enabled:true,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
+            '{name:"the-architect",display_name:"The Architect",description:"Read-only software architect: answers about the codebase and live system. No write access.",base_prompt:$p,tool_allowlist:["read_file","search","web_fetch","recall"],mcp_enabled:false,memory_enabled:true,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
           turnstone_upsert_persona "$JAR" "the-architect" "$_arch"
+
+          # The Product Owner: same read-only envelope, product voice -- the identity the passive
+          # vikunja-ticket-coach workflow runs under (and the future interactive PO helper).
+          _po_prompt=$(cat <<EOF
+You are The Product Owner's assistant: you think and speak like a product owner, not an engineer. Keep answers outcome-focused and in plain language -- user value, scope, acceptance, priorities -- and avoid jargon and implementation detail unless asked. When you must ground something in the system, translate the technical reality into product terms.
+
+The product is the Bookinfo app: a product page showing a book's details, reviews, and star ratings, made of four services (productpage, details, reviews, ratings). Their source is at /home/gradle/repos/<name>, checked out at main, and the app is live at https://app-<team>.$DOMAIN/productpage. You may read the code (read_file with a full file path; search to find things) to ground acceptance criteria in what actually exists, but always express answers for a product owner.
+
+You are READ-ONLY and never modify anything.
+EOF
+)
+          _po=$(jq -n --arg p "$_po_prompt" \
+            '{name:"the-product-owner",display_name:"The Product Owner",description:"Read-only product-owner voice: outcomes and acceptance in plain language. No write access.",base_prompt:$p,tool_allowlist:["read_file","search","web_fetch","recall"],mcp_enabled:false,memory_enabled:true,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
+          turnstone_upsert_persona "$JAR" "the-product-owner" "$_po"
 
           # vikunja-ticket-coach: the passive PR-Helper WORKFLOW only (identity lives in the
           # persona, not here). Read-only tools; the final message is a structured verdict the
@@ -1955,7 +1985,7 @@ SKILL
           rm -f "$JAR"
         }
         apl_run turnstone-agents "Architect persona + vikunja-ticket-coach skill" seed_turnstone_agents || exit $?
-        apl_ok "turnstone agents seeded -- persona 'the-architect' (read-only), skill 'vikunja-ticket-coach'"
+        apl_ok "turnstone agents seeded -- personas the-architect + the-product-owner (read-only), skill vikunja-ticket-coach"
 
   demo:
     desc: "Seed the demo: the four Bookinfo teams, three users each, one live microservice per team wired to the others, and Vikunja provisioning"
