@@ -1,0 +1,11 @@
+# Zero-config for the standard (seed) setup:
+#   * team         is taken from the namespace this deploys into (team-<id>)
+#   * review node  is <team>-review-agent in the turnstone namespace
+#   * project      to watch is the team's "<team>-example" Vikunja project (auto-resolved)
+#
+# Optional overrides:
+#   team: other-team           # act as another team's agent identity
+#   projectId: "5"             # watch a specific Vikunja project id instead of auto-resolving
+#   reviewNode: host:port      # point at a specific review node service
+domain: __DOMAIN__
+vikunjaUrl: https://vikunja.__DOMAIN__

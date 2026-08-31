@@ -1,0 +1,48 @@
+{{- $team := .Values.team | default (trimPrefix "team-" .Release.Namespace) -}}
+# Registers the Vikunja project webhook (task.created + task.comment.created) pointing at this
+# chart's EventListener. Runs in-mesh and reaches Vikunja via the public gateway URL (the internal
+# service is firewalled from team namespaces), same shape as the pr-agent gitea hook.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-register-hook
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: register
+          image: curlimages/curl:8.10.1
+          env:
+            - name: VIK_TOKEN
+              valueFrom: {secretKeyRef: {name: agent-creds, key: vikunja-token}}
+            - name: PROJECT_OVERRIDE
+              value: "{{ .Values.projectId | default "" }}"
+          command: ["sh","-c"]
+          args:
+            - |
+              set -eu
+              trap 'curl -sf -m 3 -XPOST http://127.0.0.1:15020/quitquitquit >/dev/null 2>&1 || true' EXIT
+              API="{{ .Values.vikunjaUrl }}/api/v1"
+              SINK="http://el-{{ .Release.Name }}.{{ .Release.Namespace }}.svc.cluster.local:8080"
+              PID="$PROJECT_OVERRIDE"
+              if [ -z "$PID" ]; then
+                # Resolve the team's "<team>-example" project by title.
+                PID=$(curl -sk -H "Authorization: Bearer $VIK_TOKEN" "$API/projects" \
+                  | tr '{' '\n' | grep -F '"title":"{{ $team }}-example"' | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2 || true)
+              fi
+              [ -n "$PID" ] || { echo "cannot resolve Vikunja project '{{ $team }}-example' -- set projectId in values"; exit 1; }
+              echo "ensuring webhook on project $PID -> $SINK"
+              EXISTING=$(curl -sk -H "Authorization: Bearer $VIK_TOKEN" "$API/projects/$PID/webhooks" | grep -c "$SINK" || true)
+              if [ "$EXISTING" != "0" ]; then echo "webhook already present"; exit 0; fi
+              BODY=$(printf '{"target_url":"%s","events":["task.created","task.comment.created"]}' "$SINK")
+              CODE=$(curl -sk -o /tmp/o -w '%{http_code}' -H "Authorization: Bearer $VIK_TOKEN" \
+                -X PUT -H 'Content-Type: application/json' -d "$BODY" "$API/projects/$PID/webhooks")
+              echo "create webhook -> $CODE"; cat /tmp/o; echo
+              case "$CODE" in 2*) echo "WEBHOOK REGISTERED on project $PID";; *) exit 1;; esac

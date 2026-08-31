@@ -1,0 +1,7 @@
+apiVersion: v2
+name: vikunja-ticket-coach
+description: When the PO opens or comments on a Vikunja ticket, the team's review agent drafts a description + acceptance criteria and the pipeline posts it back.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+icon: data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzBlYTVlOSI+PHBhdGggZD0iTTQgM2gxNmEyIDIgMCAwMTIgMnYxMGEyIDIgMCAwMS0yIDJIOGwtNCA0VjVhMiAyIDAgMDEyLTJ6Ii8+PC9zdmc+

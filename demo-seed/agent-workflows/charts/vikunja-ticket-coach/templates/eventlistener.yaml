@@ -1,0 +1,99 @@
+{{- $team := .Values.team | default (trimPrefix "team-" .Release.Namespace) -}}
+{{- $domain := .Values.domain -}}
+{{- $dashed := .Values.domain | replace "." "-" -}}
+{{- $img := printf "harbor.%s/team-%s/ci-runner:main" $domain $team -}}
+{{- $node := printf "http://%s-review-agent.turnstone.svc.cluster.local:8080" $team -}}
+# Two bindings because Vikunja nests the task id differently per event: on
+# task.created the payload's data IS the task (data.id); on task.comment.created
+# it is data.task.id. (Verified against a live delivery; see the review-agent notes.)
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: {{ .Release.Name }}-created
+spec:
+  params:
+    - {name: taskId, value: $(body.data.id)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: {{ .Release.Name }}-commented
+spec:
+  params:
+    - {name: taskId, value: $(body.data.task.id)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: {{ .Release.Name }}-run
+spec:
+  params: [{name: taskId}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: {{ .Release.Name }}-$(tt.params.taskId)-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        pipelineRef: {name: {{ .Release.Name }}-pipeline}
+        params:
+          - {name: taskId, value: $(tt.params.taskId)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  serviceAccountName: tekton-triggers-{{ .Release.Namespace }}
+  triggers:
+    - name: ticket-created
+      interceptors:
+        - ref: {name: cel}
+          params:
+            - {name: filter, value: "body.event_name == 'task.created'"}
+      bindings: [{ref: {{ .Release.Name }}-created}]
+      template: {ref: {{ .Release.Name }}-run}
+    - name: ticket-commented
+      interceptors:
+        - ref: {name: cel}
+          params:
+            - {name: filter, value: "body.event_name == 'task.comment.created'"}
+      bindings: [{ref: {{ .Release.Name }}-commented}]
+      template: {ref: {{ .Release.Name }}-run}
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: {{ .Release.Name }}-pipeline
+  namespace: {{ .Release.Namespace }}
+spec:
+  params: [{name: taskId}]
+  tasks:
+    - name: coach
+      params:
+        - {name: taskId, value: $(params.taskId)}
+      taskSpec:
+        params: [{name: taskId}]
+        steps:
+          - name: coach
+            image: {{ $img }}
+            env:
+              - {name: DOMAIN, value: "{{ $domain }}"}
+              - {name: TEAM, value: "{{ $team }}"}
+              - {name: TASK_ID, value: "$(params.taskId)"}
+              - {name: NODE_URL, value: "{{ $node }}"}
+              - {name: AGENT_USER, value: "agent-{{ $team }}-{{ $dashed }}"}
+              - {name: HOME, value: "/home/gradle"}
+            script: |
+              #!/bin/sh
+              set -eu
+              python3 /scripts/coach.py
+            volumeMounts:
+              - {name: creds, mountPath: /creds, readOnly: true}
+              - {name: scripts, mountPath: /scripts, readOnly: true}
+        volumes:
+          - name: creds
+            secret: {secretName: agent-creds}
+          - name: scripts
+            configMap: {name: {{ .Release.Name }}-script}
