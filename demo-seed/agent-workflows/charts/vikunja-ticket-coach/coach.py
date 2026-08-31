@@ -114,7 +114,10 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
         persona="the-product-owner", skill="vikunja-ticket-coach",
         name=f"ticket-{TASK_ID}", project_id=PROJECT_ID,
     )
-    watch_url = f"https://turnstone.{DOMAIN}/?ws_id={ws.ws_id}"
+    # Deep-link is /node/<node_id>/?ws_id=<id> -- the console-home /?ws_id= form
+    # only lands on the dashboard. The review node is given a stable node id
+    # (<team>-review-agent via TURNSTONE_NODE_ID) so this is deterministic.
+    watch_url = f"https://turnstone.{DOMAIN}/node/{TEAM}-review-agent/?ws_id={ws.ws_id}"
     vik("PUT", f"/tasks/{TASK_ID}/comments",
         {"comment": f'<p>🤖 Coaching this ticket &mdash; '
                     f'<a href="{watch_url}">watch the agent live in Turnstone</a>. '
