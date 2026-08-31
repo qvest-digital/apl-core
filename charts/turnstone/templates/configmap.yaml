@@ -33,6 +33,20 @@ data:
     values/turnstone/turnstone.gotmpl for why that broke the install.
   */}}
   TURNSTONE_TOOLS_SEARCH: "off"
+  {{- /*
+    Seed tools.allow_private_network on first boot. web_fetch / open_preview refuse
+    private-network addresses by default; on this lab every service an agent must reach
+    (Gitea, Vikunja, a team's own app) IS a private-network address, so the default makes
+    those tools useless here. Same first-boot-only mechanism as TURNSTONE_TOOLS_SEARCH above:
+    _seed_config_from_env (turnstone/console/server.py) maps TURNSTONE_{SECTION}_{KEY} to the
+    settings-registry key (here tools.allow_private_network) and writes it ONLY if the setting
+    is not already stored in the DB -- so this has no effect on an already-running instance, and
+    a later change in the Console's Settings -> Tools wins over it. A public site that redirects
+    INTO the private network is still refused; cloud-metadata, link-local, multicast and reserved
+    addresses stay refused even with this on. This is the [tools] setting, distinct from the
+    already-set [oidc] TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK, which only governs a private IdP.
+  */}}
+  TURNSTONE_TOOLS_ALLOW_PRIVATE_NETWORK: "true"
   {{- if .Values.llm.baseUrl }}
   TURNSTONE_LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}
   {{- end }}

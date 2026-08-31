@@ -179,6 +179,54 @@ Two caveats worth knowing before starting:
 `from: team-platform`, the team's HTTPRoutes report `ResolvedRefs=True`, and the Argo application
 turns Healthy.
 
+## 4e. Known upstream bug, not fixed here: `isTeamAdmin` gives every team admin the platform admin team
+
+Found live 2026-08-31, and it is a real privilege escalation, not a cosmetic label — but it lives
+entirely in upstream code, so it is written down and left alone per this fork's policy on upstream
+faults. It is **not** caused by the seed: the seed creates a team's dev user with the documented
+apl-api call `POST /v1/users` `{"isTeamAdmin": true, "teams": ["<team>"]}`, which is the only way to
+make someone an admin of their own team — there is no per-team admin flag to use instead.
+
+**What happens.** `apl-tasks` (`src/operators/keycloak/keycloak.ts`) turns the flag into a Keycloak
+group whose name is the bare string `team-admin`:
+
+```ts
+if (decoded.isTeamAdmin === 'true') groups.push('team-admin')
+```
+
+That group is **global** — it carries no team scope. The platform's built-in **admin team** also
+renders as `team-<id>` → `team-admin`. Same string, two meanings — the collision CLAUDE.md already
+documents. The part that makes it an escalation rather than a display glitch is that **apl-api
+authorizes on the group name**, so every team admin is treated as a member of the admin team.
+
+**Verified live 2026-08-31**, as `dev-reviews` (a plain team admin, groups `[team-reviews,
+team-admin]`):
+
+```
+GET  /api/v2/teams/admin/workloads      -> 200
+GET  /api/v2/teams/admin/sealedsecrets  -> 200
+POST /api/v2/teams/admin/sealedsecrets  -> 200   (wrote a secret into the admin team, then deleted it)
+```
+
+The Console shows the same thing from the user's side: a team dev logs in and sees themselves as a
+member of the admin team. Whether the escalation reaches an *unrestricted* admin workload (one with
+`namespace:` set, which runs under Argo project `default` with `clusterResourceWhitelist: ['*']` — see
+§4c and `AGENT-WORKFLOW-CATALOG.md` §4) was deliberately **not** tested, because a positive result
+would mean any team admin can grant themselves cluster-wide. Treat it as plausible until disproven.
+
+**Why this matters here specifically.** `AGENT-WORKFLOW-CATALOG.md`'s node-broker design rests on
+"only the admin team can deploy into `turnstone`." If a team admin already *is* the admin team, that
+boundary is weaker than the design assumes. The design is not invalidated — the broker still
+centralises the privileged action — but the assumption that a team credential cannot reach it needs
+re-checking against this bug before anything relies on it.
+
+**The fix is upstream, not here.** It is in apl-tasks' group naming (and apl-api's authz keying on
+it), both sibling repos. Reporting it upstream is the right move; do not patch the seed to route
+around it, because the seed is already doing the correct, documented thing. If a future merge brings
+a fix, this section can go.
+
+---
+
 ## 4d. Known upstream inconsistency: the `k8s-deployment-otel` catalog chart is orphaned
 
 Found live 2026-08-31, recorded rather than worked around. Nothing in this fork is broken by it; the
