@@ -85,7 +85,7 @@ spec:
               set -eu
               TEAM="$(params.team)"; PR="$(params.pr)"; BRANCH="$(params.branch)"; REPO="https://gitea.{{ .Values.domain }}/$(params.repoFullName).git"
               DOMAIN="{{ .Values.domain }}"
-              NODE="turnstone-node-${TEAM}-pr${PR}"
+              NODE="${TEAM}-pr${PR}-agent"
               if [ -n "$(params.nodeImage)" ]; then IMG="$(params.nodeImage)"; else IMG="harbor.${DOMAIN}/team-${TEAM}/ci-runner:main"; fi
               CREDS="agent-${TEAM}-creds"
               echo "provisioning ${NODE} from ${IMG}, branch ${BRANCH}"
@@ -158,7 +158,7 @@ spec:
             script: |
               #!/bin/sh
               set -eu
-              NODE="turnstone-node-$(params.team)-pr$(params.pr)"
+              NODE="$(params.team)-pr$(params.pr)-agent"
               echo "tearing down ${NODE}"
               kubectl delete deploy,svc -n turnstone \
                 -l app.kubernetes.io/instance=${NODE} --ignore-not-found
