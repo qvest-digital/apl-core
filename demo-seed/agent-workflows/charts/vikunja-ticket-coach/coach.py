@@ -88,9 +88,10 @@ Current description: {desc or '(empty)'}
 Comment thread (your latest proposed draft is in here):
 {thread or '(none)'}
 
-Output ONLY the final ticket description in clean markdown -- the context/why
-plus the agreed acceptance criteria, ready to save as the ticket body. No
-preamble, no questions, no commentary, no code fences around the whole thing."""
+After the line ===TICKET COMMENT=== output ONLY the final ticket description as
+clean HTML (<p>, <ul>/<li>, <strong>, <code>) -- the context/why plus the agreed
+acceptance criteria, ready to save as the ticket body. Vikunja renders HTML, not
+markdown. No preamble, no questions, no commentary."""
 else:
     prompt = f"""Coach this Vikunja ticket.
 Ticket #{TASK_ID} (team {TEAM})
@@ -118,7 +119,9 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
         pass
 
 # 3. Actuate (the pipeline is the sole writer -- the agent has no vikunja tool).
-body = (reply or "").strip()
+# Take only what follows the sentinel, dropping the agent's exploration narration.
+SENTINEL = "===TICKET COMMENT==="
+body = (reply.split(SENTINEL)[-1] if SENTINEL in reply else reply).strip()
 if not body:
     print("empty reply -- nothing to do")
     raise SystemExit(0)
