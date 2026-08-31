@@ -102,21 +102,27 @@ Comment thread:
 
 Coach it now."""
 
-# 2. Run the coach on the team's review node (persona = product-owner voice,
-#    skill = the ticket-coaching workflow). send_and_wait drives one turn to
-#    completion; the skill's auto_approve lets its read tools run unattended.
+# 2. Open the workstream on the team's review node, tell the ticket where to
+#    watch it live, then run it. We do NOT close it -- it stays watchable, and
+#    Turnstone auto-closes idle workstreams later. project_id (optional) scopes
+#    visibility to a Turnstone project so non-admin members can watch too.
 from turnstone.sdk import TurnstoneServer  # noqa: E402
 
+PROJECT_ID = os.environ.get("PROJECT_ID", "")
 with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
     ws = c.create_workstream(
-        persona="the-product-owner", skill="vikunja-ticket-coach", name=f"ticket-{TASK_ID}"
+        persona="the-product-owner", skill="vikunja-ticket-coach",
+        name=f"ticket-{TASK_ID}", project_id=PROJECT_ID,
     )
+    watch_url = f"https://turnstone.{DOMAIN}/?ws_id={ws.ws_id}"
+    vik("PUT", f"/tasks/{TASK_ID}/comments",
+        {"comment": f'<p>🤖 Coaching this ticket &mdash; '
+                    f'<a href="{watch_url}">watch the agent live in Turnstone</a>. '
+                    f'The proposed description &amp; acceptance criteria will follow here shortly.</p>'})
+    print(f"posted watch link for ws {ws.ws_id}")
     result = c.send_and_wait(prompt, ws.ws_id, timeout=280)
     reply = result.content
-    try:
-        c.close_workstream(ws.ws_id)
-    except Exception:
-        pass
+    # deliberately not closed -- leave it watchable
 
 # 3. Actuate (the pipeline is the sole writer -- the agent has no vikunja tool).
 # Take only what follows the sentinel, dropping the agent's exploration narration.
