@@ -80,7 +80,8 @@ spec:
             script: |
               #!/bin/sh
               set -eu
-              python3 /scripts/coach.py
+              # turnstone (and its SDK) lives in the image's venv, not system python.
+              /opt/platform/python/bin/python3 /scripts/coach.py
             volumeMounts:
               - {name: creds, mountPath: /creds, readOnly: true}
               - {name: scripts, mountPath: /scripts, readOnly: true}
