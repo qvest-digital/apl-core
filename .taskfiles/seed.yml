@@ -1848,10 +1848,12 @@ tasks:
           _team=$1
           _agent_login="agent-${_team}-${DOMAIN_DASH}"
           _pw=$(cat {{.STATE_DIR}}/seed_pw_${_team}_agent.txt)
-          # gitea PAT (tea/git can't OIDC): write:repository for push, read:user so `tea` can register the login
+          # gitea PAT (tea/git can't OIDC): write:repository for push, write:issue so the agent can
+          # comment on / manage PRs (Gitea models PRs as issues, so `tea comment` needs write:issue,
+          # not write:repository), read:user so `tea` can register the login.
           _gt=$(kubectl --context "$KIND_CTX" --request-timeout=30s exec -n gitea deploy/gitea -c gitea -- \
             gitea admin user generate-access-token -u "$_agent_login" -t "agent-node-$(date +%s)" \
-            --scopes write:repository,read:user --raw 2>/dev/null | tr -d '\r\n ')
+            --scopes write:repository,write:issue,read:user --raw 2>/dev/null | tr -d '\r\n ')
           [ -n "$_gt" ] || { echo "could not mint gitea token for $_agent_login" >&2; return 1; }
           # vikunja long-lived API token (vikunja-cli can't OIDC) -- the "bot" token, not a JWT
           _vt=$(vikunja_mint_api_token "agent-${_team}@$DOMAIN" "$_pw" "agent-${_team}") || return 1
