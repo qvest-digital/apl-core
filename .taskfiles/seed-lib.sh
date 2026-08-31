@@ -302,7 +302,8 @@ turnstone_upsert_persona() {
 # if <name> is absent, else replace it (PUT /v1/api/admin/skills/<id>). Idempotent.
 turnstone_upsert_skill() {
   _tus_jar=$1; _tus_name=$2; _tus_body=$3
-  _tus_id=$(curl -sk --max-time 15 -b "$_tus_jar" "https://turnstone.$DOMAIN/v1/api/skills" \
+  # NB: the admin endpoint, not /v1/api/skills -- the public one omits template_id (returns null).
+  _tus_id=$(curl -sk --max-time 15 -b "$_tus_jar" "https://turnstone.$DOMAIN/v1/api/admin/skills" \
     | jq -r --arg n "$_tus_name" '((.skills // .)[]? | select(.name==$n) | .template_id)' 2>/dev/null | head -1)
   if [ -z "$_tus_id" ]; then
     _tus_h=$(curl -sk --max-time 15 -b "$_tus_jar" -o /dev/null -w '%{http_code}' -X POST \
