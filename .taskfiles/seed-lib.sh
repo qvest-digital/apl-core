@@ -318,6 +318,23 @@ turnstone_upsert_skill() {
   fi
 }
 
+# turnstone_upsert_policy <jar> <tool_pattern> <action> -- create a tool policy (POST
+# /v1/api/admin/policies) if one named allow-<pattern> is absent. Lets the named tool auto-fire via
+# the POLICY path (AutoApproveReason.POLICY) so a headless agent's SAFE tools run unattended while
+# every other tool still hits the approval/judge gate -- the scoped alternative to auto_approve=true
+# (which skips permissions for ALL tools). Idempotent.
+turnstone_upsert_policy() {
+  _tpp_jar=$1; _tpp_pat=$2; _tpp_act=${3:-allow}; _tpp_name="${_tpp_act}-${_tpp_pat}"
+  _tpp_have=$(curl -sk --max-time 15 -b "$_tpp_jar" "https://turnstone.$DOMAIN/v1/api/admin/policies" \
+    | jq -r --arg n "$_tpp_name" '((.policies // .)[]? | select(.name==$n) | .name)' 2>/dev/null | head -1)
+  if [ -n "$_tpp_have" ]; then echo "policy $_tpp_name exists" >&2; return 0; fi
+  _tpp_h=$(curl -sk --max-time 15 -b "$_tpp_jar" -o /dev/null -w '%{http_code}' -X POST \
+    "https://turnstone.$DOMAIN/v1/api/admin/policies" -H "Content-Type: application/json" \
+    -d "{\"name\":\"$_tpp_name\",\"tool_pattern\":\"$_tpp_pat\",\"action\":\"$_tpp_act\",\"priority\":10,\"enabled\":true}")
+  [ "${_tpp_h:-0}" -lt 300 ] || { echo "error: create policy $_tpp_name -> HTTP $_tpp_h" >&2; return 1; }
+  echo "policy $_tpp_name created" >&2
+}
+
 # gitea_refire_push_hook <org> <repo> <pat> -- re-send a push delivery for every push webhook on
 # the repo, via Gitea's own hook test endpoint (it delivers a real payload for the default branch's
 # latest commit, not a synthetic one).

@@ -1934,8 +1934,14 @@ tasks:
           # final message is a structured verdict the review pipeline actuates -- never writes itself.
           _coach_content=$(sed "s/__DOMAIN__/$DOMAIN/g" "$_agw/skills/vikunja-ticket-coach.md")
           _coach=$(jq -n --arg c "$_coach_content" \
-            '{name:"vikunja-ticket-coach",content:$c,category:"support",description:"Coaches the PO to write good Vikunja tickets with acceptance criteria; emits a structured verdict for the pipeline.",activation:"named",is_default:false,auto_approve:true}')
+            '{name:"vikunja-ticket-coach",content:$c,category:"support",description:"Coaches the PO to write good Vikunja tickets with acceptance criteria; reply posted verbatim; scoped tools via policy, capped turns.",activation:"named",is_default:false,auto_approve:false,agent_max_turns:8}')
           turnstone_upsert_skill "$JAR" "vikunja-ticket-coach" "$_coach"
+
+          # Scoped auto-approval: the coach's SAFE read tools auto-fire via POLICY so the headless
+          # run doesn't stall, while every other tool still hits the approval/judge gate. This is
+          # why the skill sets auto_approve:false (no blanket skip-permissions).
+          turnstone_upsert_policy "$JAR" "read_file" "allow"
+          turnstone_upsert_policy "$JAR" "search" "allow"
 
           rm -f "$JAR"
         }
