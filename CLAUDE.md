@@ -554,6 +554,26 @@ ships the dashboard that consumes them
 (`charts/grafana-dashboards/istio-admin/workload-dashboard.json`). The hook to fix it exists and is
 empty: `additionalPodMonitors` in `values/prometheus-operator/pod-monitors.gotmpl`.
 
+**`act` runs the real Gitea Actions workflow on a node in host mode — it does NOT need Docker, and
+this is already solved.** `act` normally runs each job in a container, and a Turnstone/agent node
+pod has no Docker daemon — so the reflex "act needs Docker, therefore dind or a build.sh" is wrong
+here and keeps getting re-derived. The whole reason the team toolchain (gradle/jdk/checkstyle,
+ruby, node, python — whichever the team pins) is baked into the `ci-runner` image (`AGENT-ENVIRONMENTS.md`
+§18) is so the workflow can run as plain processes with no container per step. Map the workflow's
+`runs-on` label to `-self-hosted`:
+
+```
+act -P ubuntu-latest=-self-hosted -W .gitea/workflows/ci.yml
+```
+
+and `act` executes every step directly on the node using the baked-in tools. This is the **same
+host mode the cluster runner uses** (`ci.yml`'s own comment: "registered in host mode: no Docker, no
+per-step containers"), the **same engine** (`gitea-runner` vendors nektos/act), and the **same
+workflow file** — so a green run on the node means the merge gate is green. Do not reach for a Docker
+socket, dind, or a `build.sh`; running the actual `.gitea/workflows/ci.yml` through `act` in host
+mode is the point. (`demo-seed/ci-local.sh` is the *host* equivalent and uses containers only because
+a laptop is not the runner image; the node already is.)
+
 **Never run `docker system prune -a`.** It will destroy unrelated containers, images and volumes
 belonging to other projects on this machine. If you need disk, `docker builder prune` is safe.
 
