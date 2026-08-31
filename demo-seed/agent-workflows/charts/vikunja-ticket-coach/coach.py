@@ -96,24 +96,13 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
     except Exception:
         pass
 
-# 3. Extract the structured verdict. The model narrates before the JSON, so take
-#    the last ```json fence, else the last balanced {...}.
-fences = re.findall(r"```json\s*(\{.*?\})\s*```", reply, re.S)
-if not fences:
-    fences = re.findall(r"(\{(?:[^{}]|\{[^{}]*\})*\})", reply, re.S)
-try:
-    verdict = json.loads(fences[-1]) if fences else {}
-except Exception:
-    verdict = {}
-action = verdict.get("action", "none")
-comment = (verdict.get("comment") or "").strip()
-print(f"verdict action={action}")
-
-# 4. Actuate (the pipeline is the only writer).
+# 3. Post the agent's answer verbatim as the comment. The pipeline is the sole
+#    actuator (the agent has no vikunja write tool), so it always comments; we do
+#    not ask the agent for structured JSON -- its coaching reply IS the comment.
+comment = (reply or "").strip()
 if comment:
     vik("PUT", f"/tasks/{TASK_ID}/comments", {"comment": comment})
-    print(f"posted comment to task {TASK_ID}")
-if action == "apply" and (verdict.get("description") or "").strip():
-    vik("POST", f"/tasks/{TASK_ID}", {"description": verdict["description"]})
-    print(f"applied description to task {TASK_ID}")
+    print(f"posted comment to task {TASK_ID} ({len(comment)} chars)")
+else:
+    print("empty reply -- nothing to post")
 print("done")
