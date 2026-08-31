@@ -298,3 +298,63 @@ Three practical notes:
 - **Tokens expire fast and the failure is opaque.** A token fetched a few minutes earlier returns
   `401 JWT verification failed: "exp" claim timestamp check failed`. Fetch one immediately before
   each call, as `seed-lib.sh` already warns.
+
+## 13. Proven live end to end — 2026-08-31
+
+The whole chain was assembled and run against the cluster. **Opening a pull request created a
+credentialed ephemeral agent node; closing it destroyed the node.** No new service was written; the
+broker is an admin-team workload as designed.
+
+**The pieces, as deployed:**
+
+- **Catalog repo** `team-platform/agent-workflows` (Gitea), two charts under `charts/`:
+  `review-agent` (team) and `agent-node-broker` (admin). Pushed with a `dev-platform` PAT.
+- **`AplCatalog` `agent-workflows`** pointing at it — so both show in the Console picker. NOTE: the
+  catalog `repositoryUrl` pattern **rejects a port and `http://`**, so the in-cluster
+  `gitea-http:3000` URL fails validation; use the public `https://gitea.<domain>/...` form, which is
+  what Argo already uses for team repos anyway.
+- **RBAC** (`turnstone` ns): a `Role` (deployments+services+secrets+pods) bound ONLY to
+  `team-admin`'s `sa-team-admin` and `tekton-triggers-team-admin`. `team-reviews` has no turnstone
+  rights — verified with `kubectl auth can-i`.
+- **`review-agent`** workload in `team-reviews`: an EventListener with two triggers — `pull_request`
+  `opened/reopened/synchronized` → forward `provision`; `closed` → forward `teardown` — each a
+  PipelineRun that curls the broker sink.
+- **`agent-node-broker`** workload in `team-admin`: an EventListener (`provision`/`teardown` CEL on
+  `body.action`) whose pipelines create/delete the node. Create derives the node from the running
+  `turnstone-server` via `kubectl get ... -o json | jq`, swaps in the team `ci-runner` image, mounts
+  the shared `agent-<team>-creds` secret at the six credential paths, and adds a `clone-pr`
+  initContainer that checks out the PR branch into an `emptyDir`.
+- **Webhook**: a `pull_request` hook on `team-reviews/reviews` → `el-review-agent` sink. Registered
+  by hand (still no platform object for this — §8).
+- **Netpol**: `AplTeamNetworkControl` on `team-admin` admitting `team-reviews` to the broker EL pods
+  (selected by the plain `eventlistener` label — the API rejects a `toLabelName` containing `/`, so
+  `app.kubernetes.io/managed-by` cannot be used).
+
+**Verified:** PR #1 opened → `turnstone-node-reviews-pr1` came up `2/2`, checked out to the
+`agent-demo` branch (HEAD "agent demo edit"), `tea` logged in as `agent-reviews`, `logs` returning
+Loki lines. PR #1 closed → teardown pipeline deleted the node. At rest: **zero** ephemeral nodes,
+`turnstone-server` untouched.
+
+**Traps hit while wiring it, all fixed:**
+
+- **Mesh vs Tekton.** Forward/provision/teardown PipelineRuns carry `sidecar.istio.io/inject:false`
+  (a mesh sidecar never terminates, so the run hangs). The mesh is **PERMISSIVE** (no
+  PeerAuthentication anywhere), so a mesh-off task can still reach the in-mesh broker EL — no mTLS
+  wall.
+- **`git clone` into an `emptyDir` needs `safe.directory`.** The clone runs as a different UID than
+  the volume owner, so git 2.x refuses with "dubious ownership". Added `[safe] directory = *` to the
+  mounted gitconfig. Also make the clone idempotent across init-container restarts
+  (`cd dir; find . -mindepth 1 -delete; git clone . `) — a partial clone survives a restart in the
+  same pod's emptyDir and fails the next attempt with "already exists and not empty".
+- **Pod cap.** The single kind node caps at **110 pods** and the host swaps; new pods get
+  `FailedScheduling: Too many pods` or are killed (exit 137). Ephemeral environments make this acute.
+  Deleting `Completed` PipelineRun pods and unused workloads was necessary to get the chain to run.
+  A real deployment needs headroom or a bigger node; on this lab, keep the concurrency low.
+
+**Still live-only (persistence backlog):** the Gitea catalog repo, the `AplCatalog`, both workloads,
+the turnstone RBAC, the shared `agent-reviews-creds` secret, and the webhook are all hand-made and a
+rebuild loses them — the same "Surviving a rebuild" gap as `TEAM-WORKLOAD-CATALOG.md`. The per-PR
+**app** environment is not built by the chain yet (it would need a PR-branch image build, which is
+currently blocked by the pinned gradle/JDK jar bug); the node reaches the team's existing app
+instead. Per-PR Gitea token minting is also deferred — every node mounts the shared team agent
+credential.
