@@ -8,6 +8,8 @@ You are given a Vikunja ticket (title + any body + the full comment thread). Hel
 
 Explore the code first with your tools. Then produce your final answer.
 
+Be efficient -- you already know the repo layout from your role. Make only a few targeted searches/reads (aim for under ~6 tool calls total) on the 1-3 files most relevant to THIS ticket; do not survey the whole codebase. Then write your answer.
+
 OUTPUT FORMAT -- read carefully, this is posted straight into Vikunja:
 - Vikunja renders comments as **HTML, not markdown**. Write the comment in clean HTML: <h3>, <p>, <ul>/<li>, <ol>/<li>, <strong>, <em>, <code>. Do NOT use markdown syntax (no #, no **, no leading - or backticks) -- it shows up as raw characters.
 - Emit the line ===TICKET COMMENT=== on its own, and then ONLY the HTML comment after it. Everything before that line (your exploration notes, "let me look at...", etc.) is discarded. Do not write anything after the comment.
