@@ -501,9 +501,32 @@ For a new team, before its PR can spin up a working node, these must exist (the 
   reads the jars fine with the same JDK 8u442, and `openjdk-21-jre-headless` (checkstyle) installs
   there too. Only reviews is gradle-based; the other teams' toolchains are unaffected.
 
-## 15. Seed persistence checklist (the next step)
+## 15. Seed persistence — DONE (`seed:agents`)
 
-None of the above survives a rebuild yet — it's all live-only, the same gap as
+**Implemented 2026-08-31** as the `seed:agents` task (`.taskfiles/seed.yml`; `demo` now depends on
+`agents`, which depends on `vikunja`). A rebuild recreates the whole chain. What it does, in order:
+
+1. **Catalog repo** — pushes the vendored charts (`demo-seed/agent-workflows/charts/{pull-request-agent,agent-node-broker}`)
+   to `team-platform/agent-workflows` in Gitea, substituting a `__DOMAIN__` placeholder at push time
+   (never a baked domain). Force-push; the seed is the source of truth.
+2. **`AplCatalog`** — `agent-workflows`, public `https://gitea.<domain>/...` URL.
+3. **Broker** — applies the cross-namespace RBAC (`demo-seed/agent-workflows/rbac/broker-rbac.yaml`:
+   `turnstone` Deployment/Service/Secret + `monitoring` `reverse-proxy-auth-config` read, bound to
+   `team-admin`'s SAs), deploys `agent-node-broker` as an **admin-team workload** (into `team-admin`),
+   and adds the cross-team broker netpol.
+4. **Per demo team** — mints the **gitea PAT** (`gitea admin generate-access-token`) and the
+   **vikunja API token** (`vikunja_mint_api_token` in `seed-lib.sh` → long-lived `tk_`, all
+   permissions from the route inventory; NOT a JWT), writes the `agent-creds` AplTeamSecret
+   (`agent-username`/`agent-password` + both tokens), and deploys the `pr-agent` workload (zero-config;
+   its PostSync hook registers the `pull_request` webhook itself).
+
+The per-team `ci-runner` image + public Harbor project are already handled by `seed:apps`
+(`harbor_make_project_public`). The gradle base is pinned to `-focal` in the reviews Dockerfiles so
+`gradle build` works (§14g).
+
+The historical checklist (what it took to get here):
+
+None of it survived a rebuild before — it's all live-only, the same gap as
 `TEAM-WORKLOAD-CATALOG.md`. To persist, the seed must:
 
 1. **Catalog repo + entry** — create `team-platform/agent-workflows` (both charts), push, and add
