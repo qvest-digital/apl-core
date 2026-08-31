@@ -96,9 +96,10 @@ spec:
                   | .spec.replicas = 1
                   | .spec.selector.matchLabels = {"app.kubernetes.io/instance":$node}
                   | .spec.template.metadata = {labels:{"app.kubernetes.io/instance":$node,"app.kubernetes.io/name":"turnstone","turnstone-node":"tsnode"}}
-                  | .spec.template.spec.containers[0].env += [{name:"HOME",value:"/home/gradle"}]
+                  | .spec.template.spec.containers[0].env += [{name:"HOME",value:"/home/gradle"},{name:"PR_WORKSPACE",value:"/home/gradle/pr"}]
                   | .spec.template.spec.containers[0].image = $img
                   | .spec.template.spec.containers[0].imagePullPolicy = "Always"
+                  | .spec.template.spec.containers[0].workingDir = "/home/gradle/pr"
                   | .spec.template.spec.volumes += [
                       {name:"node-creds", secret:{secretName:$creds, defaultMode:256}},
                       {name:"agent-workspace", emptyDir:{}} ]
