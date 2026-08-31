@@ -123,8 +123,43 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
                     f'<a href="{watch_url}">watch the agent live in Turnstone</a>. '
                     f'The proposed description &amp; acceptance criteria will follow here shortly.</p>'})
     print(f"posted watch link for ws {ws.ws_id}")
-    result = c.send_and_wait(prompt, ws.ws_id, timeout=280)
-    reply = result.content
+    # Fire the message and POLL for completion. We do NOT use send_and_wait: it
+    # blocks on a ws_state="idle" SSE event, which does not reliably reach this
+    # non-mesh pipeline pod, so it would hang until timeout even though the turn
+    # finishes in seconds. Poll list_workstreams for state and read the answer
+    # from history once idle -- state is the shared-DB truth, no SSE needed.
+    import time  # noqa: E402
+
+    def _assistant_text(hist):
+        for m in reversed(getattr(hist, "messages", None) or []):
+            if (m.get("role") or m.get("type") or "") != "assistant":
+                continue
+            c2 = m.get("content")
+            if isinstance(c2, str) and c2.strip():
+                return c2.strip()
+            if isinstance(c2, list):
+                t = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c2).strip()
+                if t:
+                    return t
+            if (m.get("text") or "").strip():
+                return m["text"].strip()
+        return ""
+
+    c.send(prompt, ws.ws_id)
+    reply = ""
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            infos = c.list_workstreams()
+            st = next((w.state for w in getattr(infos, "workstreams", []) if w.ws_id == ws.ws_id), "")
+        except Exception:
+            st = ""
+        if (st or "").lower() in ("idle", "attention", "error"):
+            reply = _assistant_text(c.get_history(ws.ws_id))
+            if reply or (st or "").lower() == "error":
+                break
+    print(f"turn done, state={st}, reply {len(reply)} chars")
     # deliberately not closed -- leave it watchable
 
 # 3. Actuate (the pipeline is the sole writer -- the agent has no vikunja tool).
