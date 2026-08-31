@@ -1927,7 +1927,7 @@ tasks:
 
           _po_prompt=$(sed "s/__DOMAIN__/$DOMAIN/g" "$_agw/personas/the-product-owner.md")
           _po=$(jq -n --arg p "$_po_prompt" \
-            '{name:"the-product-owner",display_name:"The Product Owner",description:"Read-only product-owner voice: outcomes and acceptance in plain language. No write access.",base_prompt:$p,tool_allowlist:["read_file","search","web_fetch","recall"],mcp_enabled:false,memory_enabled:true,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
+            '{name:"the-product-owner",display_name:"The Product Owner",description:"Read-only product-owner voice: outcomes and acceptance in plain language. No write access.",base_prompt:$p,tool_allowlist:["read_file","search","web_fetch","recall"],mcp_enabled:false,memory_enabled:false,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
           turnstone_upsert_persona "$JAR" "the-product-owner" "$_po"
 
           # vikunja-ticket-coach: the passive workflow only (identity lives in the persona). The
