@@ -1,0 +1,14 @@
+# No configuration needed for the standard (seed) setup:
+#   * team       is taken from the namespace this deploys into (team-<id>)
+#   * repo       to watch is auto-detected (the team's single Gitea repo)
+#   * node image is the team's own ci-runner (harbor/<team>/ci-runner:main)
+#
+# Optional overrides (uncomment only to change a default):
+#   team: other-team          # point at another team's ServiceAccount + credentials
+#   repo: some-repo           # watch a specific repo if the org has more than one
+#   nodeImage: harbor/.../x   # pin a specific agent node image
+brokerSink: http://el-node-broker.team-admin.svc.cluster.local:8080
+# giteaUrl: public Gitea endpoint the webhook-registration hook uses (the in-cluster service is
+# firewalled off from team namespaces; the mesh reaches gitea via the gateway). The seed
+# substitutes the domain when this catalog is persisted.
+giteaUrl: https://gitea.__DOMAIN__

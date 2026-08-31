@@ -1769,9 +1769,116 @@ tasks:
         done
         apl_ok "vikunja provisioned for: {{.SEED_TEAMS}}"
 
+  agents:
+    desc: "Agent-workflow catalog: node broker, per-team agent credentials, and the pull-request-agent workload"
+    # After vikunja: the agent credential includes a Vikunja API token, which needs Vikunja up and
+    # the agent user provisioned (vikunja does that). Also after apps (via vikunja's chain), which
+    # makes each team's ci-runner image + Harbor project public -- the node pulls it anonymously.
+    deps: [vikunja]
+    # Polling/progress and (repo push) prompts -- interactive for the same reason every other task
+    # in this file is; see fix-first-login and CLAUDE.md's note on `output: group`.
+    interactive: true
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        apl_header "Agent workflows"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        API="https://console.$DOMAIN/api"
+        ROOT="{{.ROOT_DIR}}"
+        DOMAIN_DASH=$(printf '%s' "$DOMAIN" | tr '.' '-')
+
+        # ---- 1. catalog repo: team-platform/agent-workflows, push the vendored charts ----
+        # The charts carry a __DOMAIN__ placeholder (never a baked domain -- CLAUDE.md rule 5);
+        # substitute it at push time. Force-push: the seed is the source of truth for this repo.
+        setup_catalog_repo() {
+          set -eu
+          _plat_login=$(kubectl --context "$KIND_CTX" --request-timeout=20s exec -n gitea deploy/gitea -c gitea -- \
+            gitea admin user list 2>/dev/null | awk '/dev-platform-/{print $2; exit}')
+          [ -n "$_plat_login" ] || { echo "no dev-platform gitea user -- did seed:agent-base run?" >&2; return 1; }
+          _pat=$(kubectl --context "$KIND_CTX" --request-timeout=30s exec -n gitea deploy/gitea -c gitea -- \
+            gitea admin user generate-access-token -u "$_plat_login" -t "catalog-$(date +%s)" \
+            --scopes write:repository,write:organization --raw 2>/dev/null | tr -d '\r\n ')
+          [ -n "$_pat" ] || { echo "could not mint dev-platform PAT" >&2; return 1; }
+          kubectl --context "$KIND_CTX" --request-timeout=20s exec -n gitea deploy/gitea -c gitea -- sh -c \
+            "curl -s -o /dev/null -X POST -H 'Authorization: token $_pat' -H 'Content-Type: application/json' \
+             -d '{\"name\":\"agent-workflows\",\"private\":false,\"auto_init\":false}' \
+             http://localhost:3000/api/v1/orgs/team-platform/repos" 2>/dev/null || true
+          _stage=$(mktemp -d)
+          cp -a "$ROOT/demo-seed/agent-workflows/charts" "$_stage/"
+          [ -f "$ROOT/demo-seed/agent-workflows/README.md" ] && cp "$ROOT/demo-seed/agent-workflows/README.md" "$_stage/"
+          find "$_stage" -type f -exec sed -i "s/__DOMAIN__/$DOMAIN/g" {} +
+          ( cd "$_stage"
+            git init -q -b main
+            git -c user.email="dev-platform@$DOMAIN" -c user.name=dev-platform add -A
+            git -c user.email="dev-platform@$DOMAIN" -c user.name=dev-platform commit -qm "agent-workflows catalog (seeded)"
+            git -c http.sslVerify=false push -qf "https://$_plat_login:$_pat@gitea.$DOMAIN/team-platform/agent-workflows.git" main )
+          rm -rf "$_stage"
+        }
+        apl_run "seed-agents-repo" "Pushing agent-workflows catalog to Gitea" setup_catalog_repo || exit $?
+
+        # ---- 2. AplCatalog entry (public gitea URL -- apl-api's pattern rejects a port/http://) ----
+        TOKEN=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+        apl_create_if_missing "$API/v2/catalogs/agent-workflows" "$API/v2/catalogs" "$TOKEN" \
+          "$(jq -n --arg url "https://gitea.$DOMAIN/team-platform/agent-workflows" \
+            '{kind:"AplCatalog",metadata:{name:"agent-workflows"},spec:{name:"agent-workflows",repositoryUrl:$url,branch:"main",chartsPath:"charts",enabled:true}}')" \
+          "catalog agent-workflows" || exit $?
+
+        # ---- 3. node broker: cross-namespace RBAC + admin-team workload ----
+        kubectl --context "$KIND_CTX" --request-timeout=30s apply -f "$ROOT/demo-seed/agent-workflows/rbac/broker-rbac.yaml"
+        TOKEN=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+        apl_create_if_missing "$API/v2/teams/admin/workloads/agent-node-broker" "$API/v2/teams/admin/workloads" "$TOKEN" \
+          "$(jq -n --arg url "https://gitea.$DOMAIN/team-platform/agent-workflows" --arg v "domain: $DOMAIN" \
+            '{kind:"AplTeamWorkload",metadata:{name:"agent-node-broker"},spec:{url:$url,chartProvider:"git",path:"charts/agent-node-broker",revision:"main",values:$v,imageUpdateStrategy:{type:"disabled"}}}')" \
+          "workload agent-node-broker (admin)" || exit $?
+
+        # broker netpol: admit each team namespace to the broker EventListener (plain 'eventlistener'
+        # label -- the API rejects a toLabelName containing '/', so app.kubernetes.io/managed-by is out).
+        _allow=$(for S in {{.SEED_BOOKINFO_SERVICES}}; do t=$(printf '%s' "$S" | cut -d: -f2); printf '{"fromNamespace":"team-%s"},' "$t"; done)
+        _allow="[${_allow%,}]"
+        apl_create_if_missing "$API/v2/teams/admin/netpols/allow-team-broker" "$API/v2/teams/admin/netpols" "$TOKEN" \
+          "$(jq -n --argjson allow "$_allow" \
+            '{kind:"AplTeamNetworkControl",metadata:{name:"allow-team-broker"},spec:{ruleType:{type:"ingress",ingress:{toLabelName:"eventlistener",toLabelValue:"node-broker",mode:"AllowOnly",allow:$allow}}}}')" \
+          "netpol allow-team-broker (admin)" || exit $?
+
+        # ---- 4. per team: agent-creds secret (identity + tokens) + pull-request-agent workload ----
+        setup_team_agent() {
+          set -eu
+          _team=$1
+          _agent_login="agent-${_team}-${DOMAIN_DASH}"
+          _pw=$(cat {{.STATE_DIR}}/seed_pw_${_team}_agent.txt)
+          # gitea PAT (tea/git can't OIDC): write:repository for push, read:user so `tea` can register the login
+          _gt=$(kubectl --context "$KIND_CTX" --request-timeout=30s exec -n gitea deploy/gitea -c gitea -- \
+            gitea admin user generate-access-token -u "$_agent_login" -t "agent-node-$(date +%s)" \
+            --scopes write:repository,read:user --raw 2>/dev/null | tr -d '\r\n ')
+          [ -n "$_gt" ] || { echo "could not mint gitea token for $_agent_login" >&2; return 1; }
+          # vikunja long-lived API token (vikunja-cli can't OIDC) -- the "bot" token, not a JWT
+          _vt=$(vikunja_mint_api_token "agent-${_team}@$DOMAIN" "$_pw" "agent-${_team}") || return 1
+          [ -n "$_vt" ] || { echo "could not mint vikunja token for agent-${_team}" >&2; return 1; }
+          # agent-creds: identity + the two tokens, each once (apl-api seals plaintext). Loki tenant
+          # password is NOT here -- the broker reads it from monitoring at provision.
+          _tok=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
+          apl_create_if_missing "$API/v2/teams/$_team/sealedsecrets/agent-creds" "$API/v2/teams/$_team/sealedsecrets" "$_tok" \
+            "$(jq -n --arg u "agent-${_team}@$DOMAIN" --arg p "$_pw" --arg gt "$_gt" --arg vt "$_vt" \
+              '{kind:"SealedSecret",metadata:{name:"agent-creds"},spec:{type:"kubernetes.io/opaque",encryptedData:{"agent-username":$u,"agent-password":$p,"gitea-token":$gt,"vikunja-token":$vt}}}')" \
+            "secret agent-creds ($_team)" || return 1
+          # deploy the workflow (zero-config: team from namespace, repo auto-detected). giteaUrl for
+          # the webhook-registration hook; PostSync hook registers the pull_request webhook itself.
+          apl_create_if_missing "$API/v2/teams/$_team/workloads/pr-agent" "$API/v2/teams/$_team/workloads" "$_tok" \
+            "$(jq -n --arg url "https://gitea.$DOMAIN/team-platform/agent-workflows" --arg v "giteaUrl: https://gitea.$DOMAIN" \
+              '{kind:"AplTeamWorkload",metadata:{name:"pr-agent"},spec:{url:$url,chartProvider:"git",path:"charts/pull-request-agent",revision:"main",values:$v,imageUpdateStrategy:{type:"disabled"}}}')" \
+            "workload pr-agent ($_team)" || return 1
+        }
+        for S in {{.SEED_BOOKINFO_SERVICES}}; do
+          TEAM=$(printf '%s' "$S" | cut -d: -f2)
+          apl_run "seed-agent-$TEAM" "Agent creds + pr-agent workload for '$TEAM'" setup_team_agent "$TEAM" || exit $?
+        done
+        apl_ok "agent workflows seeded -- pick 'pull-request-agent' in the Console, or open a PR on a team repo"
+
   demo:
     desc: "Seed the demo: the four Bookinfo teams, three users each, one live microservice per team wired to the others, and Vikunja provisioning"
-    deps: [vikunja]
+    deps: [agents]
     # See fix-first-login for why every task in this file is interactive: true.
     interactive: true
     cmds:

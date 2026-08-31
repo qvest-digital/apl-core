@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-register-hook
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: register
+          image: curlimages/curl:8.10.1
+          env:
+            - name: GITEA_USER
+              valueFrom: {secretKeyRef: {name: gitea-credentials, key: username}}
+            - name: GITEA_PASS
+              valueFrom: {secretKeyRef: {name: gitea-credentials, key: password}}
+            - name: REPO_OVERRIDE
+              value: "{{ .Values.repo | default "" }}"
+          command: ["sh","-c"]
+          args:
+            - |
+              set -eu
+              # In the mesh (no inject:false): the internal gitea service is firewalled from team
+              # namespaces, so reach gitea via the public gateway URL, like the agent nodes do.
+              # A native istio sidecar terminates when this container exits; quitquitquit is a
+              # belt-and-suspenders for a classic sidecar so the Job never hangs.
+              trap 'curl -sf -m 3 -XPOST http://127.0.0.1:15020/quitquitquit >/dev/null 2>&1 || true' EXIT
+              ORG="{{ .Release.Namespace }}"
+              API="{{ .Values.giteaUrl }}/api/v1"
+              SINK="http://el-pr-agent.{{ .Release.Namespace }}.svc.cluster.local:8080"
+              REPO="$REPO_OVERRIDE"
+              if [ -z "$REPO" ]; then
+                FULLS=$(curl -sk -u "$GITEA_USER:$GITEA_PASS" "$API/orgs/$ORG/repos" \
+                  | grep -o '"full_name":"[^"]*"' | sed 's/"full_name":"//;s/"$//' | grep "^$ORG/" || true)
+                N=$(printf '%s\n' "$FULLS" | grep -c . || true)
+                if [ "$N" = "1" ]; then REPO=$(printf '%s' "$FULLS" | sed "s#^$ORG/##")
+                else echo "cannot auto-detect repo (found $N in $ORG): $FULLS -- set 'repo:' in values"; exit 1; fi
+              fi
+              echo "ensuring pull_request webhook on ${ORG}/${REPO} -> ${SINK}"
+              EXISTING=$(curl -sk -u "$GITEA_USER:$GITEA_PASS" "$API/repos/$ORG/$REPO/hooks" | grep -c "$SINK" || true)
+              if [ "$EXISTING" != "0" ]; then echo "webhook already present"; exit 0; fi
+              BODY=$(printf '{"type":"gitea","active":true,"events":["pull_request"],"config":{"url":"%s","content_type":"json"}}' "$SINK")
+              CODE=$(curl -sk -o /tmp/o -w '%{http_code}' -u "$GITEA_USER:$GITEA_PASS" \
+                -X POST -H 'Content-Type: application/json' -d "$BODY" "$API/repos/$ORG/$REPO/hooks")
+              echo "create hook -> $CODE"; cat /tmp/o; echo
+              [ "$CODE" = "201" ] || exit 1
+              echo "WEBHOOK REGISTERED on ${ORG}/${REPO}"

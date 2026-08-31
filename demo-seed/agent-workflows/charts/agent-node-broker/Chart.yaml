@@ -1,0 +1,7 @@
+apiVersion: v2
+name: agent-node-broker
+description: Admin-only. Creates ephemeral Turnstone agent nodes in the turnstone namespace on request.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+icon: data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzA4OTFiMiI+PHBhdGggZD0iTTQgNGgxNnYxNkg0eiIvPjwvc3ZnPg==

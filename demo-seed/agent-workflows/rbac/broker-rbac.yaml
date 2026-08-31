@@ -1,0 +1,34 @@
+# Cross-namespace grants for the admin node-broker (sa-team-admin / tekton-triggers-team-admin).
+# The team-side grant (read the team's own agent-creds) is created by the pull-request-agent chart;
+# these two are the platform-namespace grants the seed applies directly, since a single workload
+# Application only deploys into one namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: agent-node-broker, namespace: turnstone}
+rules:
+  - {apiGroups: ["apps"], resources: ["deployments"], verbs: ["create","get","list","watch","delete","patch"]}
+  - {apiGroups: [""], resources: ["services","secrets"], verbs: ["create","get","list","watch","delete","update","patch"]}
+  - {apiGroups: [""], resources: ["pods"], verbs: ["get","list","watch"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: agent-node-broker-admin, namespace: turnstone}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: agent-node-broker}
+subjects:
+  - {kind: ServiceAccount, name: sa-team-admin, namespace: team-admin}
+  - {kind: ServiceAccount, name: tekton-triggers-team-admin, namespace: team-admin}
+---
+# Read only the Loki tenant-password secret in monitoring (the logs credential the broker injects).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: broker-read-loki-auth, namespace: monitoring}
+rules:
+  - {apiGroups: [""], resources: ["secrets"], resourceNames: ["reverse-proxy-auth-config"], verbs: ["get"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: broker-read-loki-auth, namespace: monitoring}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: broker-read-loki-auth}
+subjects:
+  - {kind: ServiceAccount, name: sa-team-admin, namespace: team-admin}
+  - {kind: ServiceAccount, name: tekton-triggers-team-admin, namespace: team-admin}

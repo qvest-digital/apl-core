@@ -1,0 +1,4 @@
+# Admin broker. domain is needed to form the team ci-runner image reference.
+domain: __DOMAIN__
+# The image with kubectl+jq the create-node task runs as.
+toolImage: alpine/k8s:1.30.0

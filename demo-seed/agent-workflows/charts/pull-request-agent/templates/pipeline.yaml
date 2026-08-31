@@ -1,0 +1,28 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: review-agent-forward
+spec:
+  params: [{name: action}, {name: pr}, {name: branch}, {name: sha}, {name: repoFullName}, {name: nodeImage}]
+  tasks:
+    - name: forward-to-broker
+      params:
+        - {name: action,  value: $(params.action)}
+        - {name: pr,      value: $(params.pr)}
+        - {name: branch,  value: $(params.branch)}
+        - {name: sha,     value: $(params.sha)}
+        - {name: repoFullName, value: $(params.repoFullName)}
+        - {name: nodeImage, value: $(params.nodeImage)}
+      taskSpec:
+        params: [{name: action}, {name: pr}, {name: branch}, {name: sha}, {name: repoFullName}, {name: nodeImage}]
+        steps:
+          - name: forward
+            image: curlimages/curl:8.10.1
+            script: |
+              #!/bin/sh
+              set -eu
+              BODY=$(printf '{"action":"%s","team":"%s","pr":"%s","branch":"%s","sha":"%s","repoFullName":"%s","nodeImage":"%s"}' \
+                "$(params.action)" "{{ .Values.team | default (trimPrefix "team-" .Release.Namespace) }}" "$(params.pr)" "$(params.branch)" "$(params.sha)" "$(params.repoFullName)" "$(params.nodeImage)")
+              echo "forwarding: $BODY"
+              curl -sf -X POST -H 'Content-Type: application/json' -d "$BODY" "{{ .Values.brokerSink }}"
+              echo "forwarded $(params.action) for PR #$(params.pr)"

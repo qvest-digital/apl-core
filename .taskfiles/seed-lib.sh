@@ -1682,3 +1682,27 @@ gitea_head_sha() {
   curl -sk --max-time 20 "https://gitea.$DOMAIN/api/v1/repos/$_hs_org/$_hs_repo/branches/$_hs_branch" \
     -H "Authorization: token $_hs_pat" | jq -r '.commit.id // empty'
 }
+
+# vikunja_mint_api_token <email> <password> [title] -- mint a LONG-LIVED Vikunja API token (tk_...)
+# for the agent and print it. This is the Vikunja equivalent of a Gitea PAT (a "bot" token), NOT an
+# OIDC JWT: JWTs are short-lived and expire mid-session, so vikunja-cli must be given a real API
+# token. Authenticates once via the OIDC flow to get a JWT, reads the route inventory (Vikunja
+# validates token permissions against it), grants every listed action, and sets a far expiry.
+# See AGENT-WORKFLOW-CATALOG.md 14d.
+vikunja_mint_api_token() {
+  _vt_email=$1
+  _vt_pass=$2
+  _vt_title=${3:-agent}
+  _vt_jwt=$(vikunja_oidc_login "$_vt_email" "$_vt_pass") || return 1
+  [ -n "$_vt_jwt" ] || { echo "vikunja_mint_api_token: no JWT for $_vt_email" >&2; return 1; }
+  # Build permissions {resource: [actions...]} from the live route inventory -- grant all.
+  _vt_perms=$(curl -sk --max-time 20 "https://vikunja.$DOMAIN/api/v1/routes" \
+    -H "Authorization: Bearer $_vt_jwt" \
+    | jq -c 'to_entries | map(select(.value|type=="object")) | map({(.key): (.value|keys)}) | add')
+  [ -n "$_vt_perms" ] && [ "$_vt_perms" != "null" ] || { echo "vikunja_mint_api_token: could not read routes" >&2; return 1; }
+  _vt_body=$(jq -n --arg t "$_vt_title" --argjson p "$_vt_perms" \
+    '{title:$t, permissions:$p, expires_at:"2035-01-01T00:00:00Z"}')
+  curl -sk --max-time 20 -X PUT "https://vikunja.$DOMAIN/api/v1/tokens" \
+    -H "Authorization: Bearer $_vt_jwt" -H 'Content-Type: application/json' -d "$_vt_body" \
+    | jq -r '.token // empty'
+}

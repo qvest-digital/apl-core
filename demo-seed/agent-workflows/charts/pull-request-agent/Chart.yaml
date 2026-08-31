@@ -1,0 +1,7 @@
+apiVersion: v2
+name: pull-request-agent
+description: On a pull request, spin up an ephemeral agent node (this team's own toolchain node) wired to the PR.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+icon: data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzRmNDZlNSI+PHBhdGggZD0iTTEyIDJhMTAgMTAgMCAxMDAgMjAgMTAgMTAgMCAwMDAtMjB6bTAgNGEzIDMgMCAxMTAgNiAzIDMgMCAwMTAtNnptMCAxNGE4IDggMCAwMS02LjMtMy4xYzAtMiA0LjItMy4xIDYuMy0zLjFzNi4zIDEuMSA2LjMgMy4xQTggOCAwIDAxMTIgMjB6Ii8+PC9zdmc+

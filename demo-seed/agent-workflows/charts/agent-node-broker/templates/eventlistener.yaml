@@ -1,0 +1,74 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: node-broker
+spec:
+  params:
+    - {name: team,    value: $(body.team)}
+    - {name: pr,      value: $(body.pr)}
+    - {name: branch,  value: $(body.branch)}
+    - {name: sha,     value: $(body.sha)}
+    - {name: repoFullName, value: $(body.repoFullName)}
+    - {name: nodeImage, value: $(body.nodeImage)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: node-broker-provision
+spec:
+  params: [{name: team}, {name: pr}, {name: branch}, {name: sha}, {name: repoFullName}, {name: nodeImage}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: provision-node-$(tt.params.team)-pr$(tt.params.pr)-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        serviceAccountName: sa-team-admin
+        pipelineRef: {name: provision-agent-node}
+        params:
+          - {name: team,    value: $(tt.params.team)}
+          - {name: pr,      value: $(tt.params.pr)}
+          - {name: branch,  value: $(tt.params.branch)}
+          - {name: sha,     value: $(tt.params.sha)}
+          - {name: repoFullName, value: $(tt.params.repoFullName)}
+          - {name: nodeImage, value: $(tt.params.nodeImage)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: node-broker-teardown
+spec:
+  params: [{name: team}, {name: pr}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: teardown-node-$(tt.params.team)-pr$(tt.params.pr)-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        serviceAccountName: sa-team-admin
+        pipelineRef: {name: teardown-agent-node}
+        params:
+          - {name: team, value: $(tt.params.team)}
+          - {name: pr,   value: $(tt.params.pr)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: node-broker
+spec:
+  serviceAccountName: tekton-triggers-team-admin
+  triggers:
+    - name: provision
+      interceptors:
+        - ref: {name: cel}
+          params: [{name: filter, value: "body.action == 'provision'"}]
+      bindings: [{ref: node-broker}]
+      template: {ref: node-broker-provision}
+    - name: teardown
+      interceptors:
+        - ref: {name: cel}
+          params: [{name: filter, value: "body.action == 'teardown'"}]
+      bindings: [{ref: node-broker}]
+      template: {ref: node-broker-teardown}

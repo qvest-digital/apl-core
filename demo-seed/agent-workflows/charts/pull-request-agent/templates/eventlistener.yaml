@@ -1,0 +1,81 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: review-agent-pr
+spec:
+  params:
+    - {name: pr,      value: $(body.number)}
+    - {name: branch,  value: $(body.pull_request.head.ref)}
+    - {name: sha,     value: $(body.pull_request.head.sha)}
+    - {name: repoFullName, value: $(body.repository.full_name)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: review-agent-provision
+spec:
+  params: [{name: pr}, {name: branch}, {name: sha}, {name: repoFullName}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: review-agent-provision-$(tt.params.pr)-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        pipelineRef: {name: review-agent-forward}
+        params:
+          - {name: action,  value: provision}
+          - {name: pr,      value: $(tt.params.pr)}
+          - {name: branch,  value: $(tt.params.branch)}
+          - {name: sha,     value: $(tt.params.sha)}
+          - {name: repoFullName, value: $(tt.params.repoFullName)}
+          - {name: nodeImage, value: "{{ .Values.nodeImage | default "" }}"}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: review-agent-teardown
+spec:
+  params: [{name: pr}, {name: branch}, {name: sha}, {name: repoFullName}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: review-agent-teardown-$(tt.params.pr)-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        pipelineRef: {name: review-agent-forward}
+        params:
+          - {name: action,  value: teardown}
+          - {name: pr,      value: $(tt.params.pr)}
+          - {name: branch,  value: $(tt.params.branch)}
+          - {name: sha,     value: $(tt.params.sha)}
+          - {name: repoFullName, value: $(tt.params.repoFullName)}
+          - {name: nodeImage, value: "{{ .Values.nodeImage | default "" }}"}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: pr-agent
+spec:
+  serviceAccountName: tekton-triggers-{{ .Release.Namespace }}
+  triggers:
+    - name: pr-opened
+      interceptors:
+        - ref: {name: cel}
+          params:
+            - name: filter
+              value: >-
+                header.match('X-Gitea-Event','pull_request') &&
+                (body.action == 'opened' || body.action == 'reopened')
+      bindings: [{ref: review-agent-pr}]
+      template: {ref: review-agent-provision}
+    - name: pr-closed
+      interceptors:
+        - ref: {name: cel}
+          params:
+            - name: filter
+              value: >-
+                header.match('X-Gitea-Event','pull_request') && body.action == 'closed'
+      bindings: [{ref: review-agent-pr}]
+      template: {ref: review-agent-teardown}
