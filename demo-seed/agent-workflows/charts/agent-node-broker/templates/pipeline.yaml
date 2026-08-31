@@ -9,6 +9,8 @@ spec:
     - name: branch
     - name: sha
     - name: repoFullName
+    - name: nodeImage
+      default: ""
   tasks:
     - name: copy-creds
       params:
