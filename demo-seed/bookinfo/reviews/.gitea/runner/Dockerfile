@@ -7,7 +7,10 @@
 # The `gitea-runner` binary is NOT committed to apl-core: the seed downloads it on the host,
 # verifies it against a pinned sha256, and drops it into this directory immediately before pushing.
 # See .taskfiles/seed.yml's runner task.
-FROM gradle:8.13.0-jdk8
+# Pinned to the -focal variant by digest: the default (jammy) gradle:8.13.0-jdk8 fails gradle build
+# with 'invalid CEN header' reading Gradle's own jars; focal reads them fine (same JDK 8u442), and
+# openjdk-21 (checkstyle) installs on focal too -- verified. See AGENT-WORKFLOW-CATALOG.md.
+FROM gradle:8.13.0-jdk8-focal@sha256:f67da5c2b61d407402562abcb8117c70efc956405c4f482108e74f9066c72c16
 USER root
 
 # TWO JDKs on purpose, and they must not be collapsed into one:

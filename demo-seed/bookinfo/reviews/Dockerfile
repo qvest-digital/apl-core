@@ -12,7 +12,11 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-FROM gradle:8.13.0-jdk8 AS builder
+# Pinned to the -focal (Ubuntu 20.04) variant by digest: the default (jammy) gradle:8.13.0-jdk8
+# fails `gradle build` with 'invalid CEN header (bad header size)' reading Gradle's own jars
+# (the zlib on jammy trips JDK-8302483's ZIP64 validation; the JVM property does NOT fix it).
+# focal reads them fine with the same JDK 8u442. See AGENT-WORKFLOW-CATALOG.md.
+FROM gradle:8.13.0-jdk8-focal@sha256:f67da5c2b61d407402562abcb8117c70efc956405c4f482108e74f9066c72c16 AS builder
 
 # Not sure why but we need root to build. Ignore lint error, this is for a multistage builder so it doesn't matter.
 # hadolint ignore=DL3002
