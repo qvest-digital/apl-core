@@ -243,6 +243,59 @@ turnstone_oidc_login() {
   printf '%s' "$_tol_jar"
 }
 
+# turnstone_admin_jar -- OIDC-login as platform-admin and print the cookie-jar path holding a
+# turnstone_auth_console session with full admin (persona.create, admin.skills, admin.policies).
+# The OIDC login itself provisions the platform-admin Turnstone user on first call. Caller rm's it.
+turnstone_admin_jar() {
+  _taj_u=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  _taj_p=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+  [ -n "$_taj_u" ] && [ -n "$_taj_p" ] || { echo "error: platform-admin-initial-credentials came back empty" >&2; return 1; }
+  turnstone_oidc_login "$_taj_u" "$_taj_p"
+}
+
+# turnstone_upsert_persona <jar> <name> <create-json> -- create the persona (POST
+# /v1/api/admin/personas) if <name> is absent, else PATCH its mutable levers
+# (/v1/api/admin/personas/<id>). <create-json> is a full CreatePersonaRequest; on PATCH,
+# `name` and `applies_to_kinds` are immutable and dropped. Idempotent -- safe to re-run.
+turnstone_upsert_persona() {
+  _tup_jar=$1; _tup_name=$2; _tup_body=$3
+  _tup_id=$(curl -sk --max-time 15 -b "$_tup_jar" "https://turnstone.$DOMAIN/v1/api/personas" \
+    | jq -r --arg n "$_tup_name" '.personas[]? | select(.name==$n) | .persona_id' 2>/dev/null | head -1)
+  if [ -z "$_tup_id" ]; then
+    _tup_h=$(curl -sk --max-time 15 -b "$_tup_jar" -o /dev/null -w '%{http_code}' -X POST \
+      "https://turnstone.$DOMAIN/v1/api/admin/personas" -H "Content-Type: application/json" -d "$_tup_body")
+    [ "${_tup_h:-0}" -lt 300 ] || { echo "error: create persona $_tup_name -> HTTP $_tup_h" >&2; return 1; }
+    echo "persona $_tup_name created" >&2
+  else
+    _tup_patch=$(printf '%s' "$_tup_body" | jq 'del(.name, .applies_to_kinds, .enabled)')
+    _tup_h=$(curl -sk --max-time 15 -b "$_tup_jar" -o /dev/null -w '%{http_code}' -X PATCH \
+      "https://turnstone.$DOMAIN/v1/api/admin/personas/$_tup_id" -H "Content-Type: application/json" -d "$_tup_patch")
+    [ "${_tup_h:-0}" -lt 300 ] || { echo "error: update persona $_tup_name -> HTTP $_tup_h" >&2; return 1; }
+    echo "persona $_tup_name updated" >&2
+  fi
+}
+
+# turnstone_upsert_skill <jar> <name> <create-json> -- create the skill (POST /v1/api/admin/skills)
+# if <name> is absent, else replace it (PUT /v1/api/admin/skills/<id>). Idempotent.
+turnstone_upsert_skill() {
+  _tus_jar=$1; _tus_name=$2; _tus_body=$3
+  _tus_id=$(curl -sk --max-time 15 -b "$_tus_jar" "https://turnstone.$DOMAIN/v1/api/skills" \
+    | jq -r --arg n "$_tus_name" '((.skills // .)[]? | select(.name==$n) | .template_id)' 2>/dev/null | head -1)
+  if [ -z "$_tus_id" ]; then
+    _tus_h=$(curl -sk --max-time 15 -b "$_tus_jar" -o /dev/null -w '%{http_code}' -X POST \
+      "https://turnstone.$DOMAIN/v1/api/admin/skills" -H "Content-Type: application/json" -d "$_tus_body")
+    [ "${_tus_h:-0}" -lt 300 ] || { echo "error: create skill $_tus_name -> HTTP $_tus_h" >&2; return 1; }
+    echo "skill $_tus_name created" >&2
+  else
+    _tus_h=$(curl -sk --max-time 15 -b "$_tus_jar" -o /dev/null -w '%{http_code}' -X PUT \
+      "https://turnstone.$DOMAIN/v1/api/admin/skills/$_tus_id" -H "Content-Type: application/json" -d "$_tus_body")
+    [ "${_tus_h:-0}" -lt 300 ] || { echo "error: update skill $_tus_name -> HTTP $_tus_h" >&2; return 1; }
+    echo "skill $_tus_name updated" >&2
+  fi
+}
+
 # gitea_refire_push_hook <org> <repo> <pat> -- re-send a push delivery for every push webhook on
 # the repo, via Gitea's own hook test endpoint (it delivers a real payload for the default branch's
 # latest commit, not a synthetic one).

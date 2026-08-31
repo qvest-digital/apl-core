@@ -1878,9 +1878,81 @@ tasks:
         done
         apl_ok "agent workflows seeded -- pick 'pull-request-agent' in the Console, or open a PR on a team repo"
 
+  turnstone-agents:
+    desc: "Turnstone agent building blocks: the read-only Architect persona and the vikunja-ticket-coach skill, seeded globally by platform-admin"
+    # Personas and skills are GLOBAL, single-org objects only platform-admin (builtin-admin) may
+    # create -- persona.create / admin.skills (verified live on builtin-admin's permission string).
+    # Auth is the OIDC console flow (turnstone_admin_jar / turnstone_oidc_login); a raw Keycloak
+    # bearer is 401'd, same as a bogus one. This is the LAST seed step and is pure admin-API calls,
+    # so it is safe to re-run and to iterate on (edit the prose, re-run) without rebuilding anything
+    # -- the one caveat is that a persona/skill is resolved once at workstream creation and stamped,
+    # so an edit only affects workstreams opened after it. deps [agents] purely to run last.
+    deps: [agents]
+    # interactive: true for the same reason every task here is -- see fix-first-login + CLAUDE.md's
+    # note on `output: group` buffering.
+    interactive: true
+    cmds:
+      - |
+        . "{{.LIB}}"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN=$(cat {{.STATE_DIR}}/seed_domain.txt)
+        apl_header "Turnstone agents (personas + skills)"
+
+        seed_turnstone_agents() {
+          set -eu
+          kubectl --context "$KIND_CTX" --request-timeout=15s get deploy turnstone-server -n turnstone >/dev/null 2>&1 \
+            || { echo "turnstone-server not deployed -- skipping persona/skill seed (turnstone disabled)"; return 0; }
+
+          JAR=$(turnstone_admin_jar) || return 1
+
+          # The Architect: read-only Q&A over the codebase + live system. An EXACT tool_allowlist
+          # (no tool_search => a HARD set) of read-only tools, with MCP off, means there is no write
+          # path at all -- the interactive UI persona on the review node.
+          _arch_prompt='You are The Architect: a question-and-answer assistant for this platform. Every team repo is checked out at main and the live services are reachable. Explain how repos map to running services and cite files by path. You are READ-ONLY: you never modify code, tickets, or any system. If asked to change something, explain what you would change and where, but do not attempt it.'
+          _arch=$(jq -n --arg p "$_arch_prompt" \
+            '{name:"the-architect",display_name:"The Architect",description:"Read-only Q&A about the platform codebase and the live deployed system. No write access.",base_prompt:$p,tool_allowlist:["read_file","search","web_fetch","recall"],mcp_enabled:false,memory_enabled:true,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
+          turnstone_upsert_persona "$JAR" "the-architect" "$_arch"
+
+          # vikunja-ticket-coach: the passive PR-Helper WORKFLOW only (identity lives in the
+          # persona, not here). Read-only tools; the final message is a structured verdict the
+          # review pipeline actuates -- the agent never writes to Vikunja itself.
+          _coach_content=$(cat <<'SKILL'
+---
+name: vikunja-ticket-coach
+description: Coach the PO to write good Vikunja tickets with acceptance criteria.
+allowed-tools: [read_file, search]
+---
+# Workflow: Vikunja ticket coaching (passive)
+You are given a Vikunja ticket (title + any body + the full comment thread). Help the PO turn a thin, title-only ticket into a ready one, grounded in the actual code you can read.
+
+Produce:
+1. A clear description (context / why).
+2. Concrete, testable acceptance criteria as Given/When/Then, citing the real services/endpoints/files.
+3. Affected components (which repo/service).
+4. At most 2-3 clarifying questions, only where intent cannot be inferred.
+
+Definition of Ready: clear outcome, testable AC, components identified, no blocking ambiguity. If unmet, say what is missing.
+
+You never write to Vikunja. Your FINAL message MUST be one JSON object and nothing else:
+{"action":"revise"|"apply"|"none","comment":"<markdown for a ticket comment>","description":"<full ticket body, only when action=apply>"}
+- action=apply only when the PO clearly approved the latest draft (e.g. /accept or plain agreement); put the agreed body in "description".
+- action=revise otherwise; put your draft/questions in "comment".
+- action=none if no coaching is warranted.
+SKILL
+)
+          _coach=$(jq -n --arg c "$_coach_content" \
+            '{name:"vikunja-ticket-coach",content:$c,category:"support",description:"Coaches the PO to write good Vikunja tickets with acceptance criteria; emits a structured verdict for the pipeline.",activation:"named",is_default:false,auto_approve:true}')
+          turnstone_upsert_skill "$JAR" "vikunja-ticket-coach" "$_coach"
+
+          rm -f "$JAR"
+        }
+        apl_run turnstone-agents "Architect persona + vikunja-ticket-coach skill" seed_turnstone_agents || exit $?
+        apl_ok "turnstone agents seeded -- persona 'the-architect' (read-only), skill 'vikunja-ticket-coach'"
+
   demo:
     desc: "Seed the demo: the four Bookinfo teams, three users each, one live microservice per team wired to the others, and Vikunja provisioning"
-    deps: [agents]
+    deps: [turnstone-agents]
     # See fix-first-login for why every task in this file is interactive: true.
     interactive: true
     cmds:
