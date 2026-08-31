@@ -243,6 +243,27 @@ turnstone_oidc_login() {
   printf '%s' "$_tol_jar"
 }
 
+# turnstone_mint_agent_pat <email> <password> [name] -- mint a long-lived Turnstone API PAT bound
+# to the agent's user, the same shape as gitea_mint_pat / vikunja_mint_api_token. The Turnstone
+# user is OIDC-provisioned, so this first does the agent's OIDC login (which CREATES the user on a
+# cold cluster) to resolve its user_id, then mints an opaque `ts_` PAT with turnstone-admin (no
+# password needed for the mint; the PAT carries the agent user's own permissions). The SDK needs a
+# BEARER token -- the OIDC session cookie is NOT one (it hits the coordinator-gated console
+# surface), which is why the pipeline uses this PAT, not the cookie. Prints the ts_ token.
+turnstone_mint_agent_pat() {
+  _tma_email=$1; _tma_pw=$2; _tma_name=${3:-agent-node}
+  _tma_jar=$(turnstone_oidc_login "$_tma_email" "$_tma_pw") \
+    || { echo "error: turnstone OIDC login failed for $_tma_email (needed to provision the user)" >&2; return 1; }
+  _tma_uid=$(curl -sk --max-time 15 -b "$_tma_jar" "https://turnstone.$DOMAIN/v1/api/auth/whoami" | jq -r '.user_id // empty' 2>/dev/null)
+  rm -f "$_tma_jar"
+  [ -n "$_tma_uid" ] || { echo "error: could not resolve Turnstone user_id for $_tma_email" >&2; return 1; }
+  _tma_tok=$(kubectl --context "$KIND_CTX" --request-timeout=30s exec -n turnstone deploy/turnstone-server -c server -- \
+    turnstone-admin create-token --user "$_tma_uid" --name "${_tma_name}-$(date +%s)" --expires-days 3650 2>/dev/null \
+    | tr -d '\r' | grep -oE 'ts_[A-Za-z0-9._-]+' | head -1)
+  [ -n "$_tma_tok" ] || { echo "error: turnstone-admin create-token produced no token for $_tma_email" >&2; return 1; }
+  printf '%s' "$_tma_tok"
+}
+
 # turnstone_admin_jar -- OIDC-login as platform-admin and print the cookie-jar path holding a
 # turnstone_auth_console session with full admin (persona.create, admin.skills, admin.policies).
 # The OIDC login itself provisions the platform-admin Turnstone user on first call. Caller rm's it.

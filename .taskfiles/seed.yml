@@ -1858,12 +1858,19 @@ tasks:
           # vikunja long-lived API token (vikunja-cli can't OIDC) -- the "bot" token, not a JWT
           _vt=$(vikunja_mint_api_token "agent-${_team}@$DOMAIN" "$_pw" "agent-${_team}") || return 1
           [ -n "$_vt" ] || { echo "could not mint vikunja token for agent-${_team}" >&2; return 1; }
-          # agent-creds: identity + the two tokens, each once (apl-api seals plaintext). Loki tenant
+          # turnstone API PAT (bearer, bound to the agent's OIDC-provisioned Turnstone user) -- the
+          # SDK needs a bearer, not the OIDC session cookie (the cookie hits the coordinator-gated
+          # console surface). Same shape as the gitea/vikunja PATs above. Tolerate turnstone being
+          # off: store empty rather than failing the whole team -- the review pipeline needs
+          # turnstone anyway, so an empty token there is harmless when turnstone is disabled.
+          _tt=$(turnstone_mint_agent_pat "agent-${_team}@$DOMAIN" "$_pw" "agent-${_team}" 2>/dev/null || true)
+          [ -n "$_tt" ] || echo "note: no turnstone token for agent-${_team} (turnstone down/disabled?) -- agent-creds will omit it"
+          # agent-creds: identity + the three PATs, each once (apl-api seals plaintext). Loki tenant
           # password is NOT here -- the broker reads it from monitoring at provision.
           _tok=$(kc_platform_admin_token "{{.OAUTH2_PROXY_CLIENT_SECRET_NAME}}")
           apl_create_if_missing "$API/v2/teams/$_team/sealedsecrets/agent-creds" "$API/v2/teams/$_team/sealedsecrets" "$_tok" \
-            "$(jq -n --arg u "agent-${_team}@$DOMAIN" --arg p "$_pw" --arg gt "$_gt" --arg vt "$_vt" \
-              '{kind:"SealedSecret",metadata:{name:"agent-creds"},spec:{type:"kubernetes.io/opaque",encryptedData:{"agent-username":$u,"agent-password":$p,"gitea-token":$gt,"vikunja-token":$vt}}}')" \
+            "$(jq -n --arg u "agent-${_team}@$DOMAIN" --arg p "$_pw" --arg gt "$_gt" --arg vt "$_vt" --arg tt "$_tt" \
+              '{kind:"SealedSecret",metadata:{name:"agent-creds"},spec:{type:"kubernetes.io/opaque",encryptedData:{"agent-username":$u,"agent-password":$p,"gitea-token":$gt,"vikunja-token":$vt,"turnstone-token":$tt}}}')" \
             "secret agent-creds ($_team)" || return 1
           # deploy the workflow (zero-config: team from namespace, repo auto-detected). giteaUrl for
           # the webhook-registration hook; PostSync hook registers the pull_request webhook itself.
