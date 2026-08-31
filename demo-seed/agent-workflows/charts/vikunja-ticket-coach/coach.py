@@ -52,11 +52,17 @@ comments = vik("GET", f"/tasks/{TASK_ID}/comments") or []
 
 # Loop guard (payload-shape-independent): the coach posts a comment as the agent,
 # which itself fires task.comment.created. If the newest comment is the agent's
-# own, this is that echo -- do nothing. task.created (no comments yet) and a real
-# PO comment (newest author = a human) both proceed. We never subscribe to
-# task.updated, so applying a description does not re-trigger either.
-AGENT_USER = os.environ.get("AGENT_USER", "")
-if comments and (comments[-1].get("author") or {}).get("username") == AGENT_USER:
+# own, this is that echo -- do nothing. Match on the agent's OWN Vikunja user id
+# (asked from /user with our token) rather than a guessed username, because the
+# Vikunja username is the email form and differs from the gitea/keycloak login.
+# task.created (no comments yet) and a real PO comment (newest author = a human)
+# both proceed. We never subscribe to task.updated, so applying a description
+# does not re-trigger either.
+try:
+    my_id = (vik("GET", "/user") or {}).get("id")
+except Exception:
+    my_id = None
+if comments and my_id is not None and (comments[-1].get("author") or {}).get("id") == my_id:
     print("newest comment is the agent's own -- skipping (loop guard)")
     raise SystemExit(0)
 
