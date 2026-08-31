@@ -488,11 +488,18 @@ For a new team, before its PR can spin up a working node, these must exist (the 
   last workload referencing it goes away; recreate races the project update, the new app sits
   `InvalidSpecError: repo not permitted`, and its finalizer blocks the team-ns app. Break it by
   removing the stuck app's finalizer (`kubectl patch application … -p '{"metadata":{"finalizers":null}}'`).
-- **A PR fires `opened` AND `synchronized`**, so two provisions race on the same node; one wins,
-  the loser's PipelineRun errors on the rollout-wait. Cosmetic (create is idempotent) — de-dupe
-  later, e.g. only provision on `opened`/`reopened`.
+- **A PR fires `opened` AND `synchronized`**, so two provisions used to race on the same node.
+  **Fixed**: the provision trigger's CEL now matches only `opened`/`reopened`, so one PR open =
+  one node. Trade-off: pushing new commits to an open PR no longer refreshes the node's checkout
+  (the node reflects the PR at open time); revisit if per-push refresh is wanted.
 - **Pod cap** was raised 110→250 (`.taskfiles/kind/cluster-config.yaml`), and finished
   PipelineRun pods still need sweeping.
+- **Gradle 'invalid CEN header (bad header size)'** — the default `gradle:8.13.0-jdk8` (jammy)
+  fails `gradle build` reading Gradle's own jars (JDK-8302483 ZIP64 validation vs jammy's zlib).
+  The JVM property `-Djdk.util.zip.disableZip64ExtraFieldValidation` does **not** clear this check.
+  **Fixed** by pinning both reviews Dockerfiles to `gradle:8.13.0-jdk8-focal` **by digest** — focal
+  reads the jars fine with the same JDK 8u442, and `openjdk-21-jre-headless` (checkstyle) installs
+  there too. Only reviews is gradle-based; the other teams' toolchains are unaffected.
 
 ## 15. Seed persistence checklist (the next step)
 
