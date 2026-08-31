@@ -3,21 +3,13 @@
 {{- $dashed := .Values.domain | replace "." "-" -}}
 {{- $img := printf "harbor.%s/team-%s/ci-runner:main" $domain $team -}}
 {{- $node := printf "http://%s-review-agent.turnstone.svc.cluster.local:8080" $team -}}
-# Two bindings because Vikunja nests the task id differently per event: on
-# task.created the payload's data IS the task (data.id); on task.comment.created
-# it is data.task.id. (Verified against a live delivery; see the review-agent notes.)
+# Vikunja wraps every task event the same way: data = {task:{...}, doer:{...}}
+# (and for comments, also comment:{...}). So the task id is body.data.task.id for
+# BOTH task.created and task.comment.created -- verified against a live delivery.
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerBinding
 metadata:
-  name: {{ .Release.Name }}-created
-spec:
-  params:
-    - {name: taskId, value: $(body.data.id)}
----
-apiVersion: triggers.tekton.dev/v1beta1
-kind: TriggerBinding
-metadata:
-  name: {{ .Release.Name }}-commented
+  name: {{ .Release.Name }}-task
 spec:
   params:
     - {name: taskId, value: $(body.data.task.id)}
@@ -52,14 +44,14 @@ spec:
         - ref: {name: cel}
           params:
             - {name: filter, value: "body.event_name == 'task.created'"}
-      bindings: [{ref: {{ .Release.Name }}-created}]
+      bindings: [{ref: {{ .Release.Name }}-task}]
       template: {ref: {{ .Release.Name }}-run}
     - name: ticket-commented
       interceptors:
         - ref: {name: cel}
           params:
             - {name: filter, value: "body.event_name == 'task.comment.created'"}
-      bindings: [{ref: {{ .Release.Name }}-commented}]
+      bindings: [{ref: {{ .Release.Name }}-task}]
       template: {ref: {{ .Release.Name }}-run}
 ---
 apiVersion: tekton.dev/v1
