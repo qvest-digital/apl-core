@@ -346,10 +346,13 @@ Loki lines. PR #1 closed → teardown pipeline deleted the node. At rest: **zero
   mounted gitconfig. Also make the clone idempotent across init-container restarts
   (`cd dir; find . -mindepth 1 -delete; git clone . `) — a partial clone survives a restart in the
   same pod's emptyDir and fails the next attempt with "already exists and not empty".
-- **Pod cap.** The single kind node caps at **110 pods** and the host swaps; new pods get
-  `FailedScheduling: Too many pods` or are killed (exit 137). Ephemeral environments make this acute.
-  Deleting `Completed` PipelineRun pods and unused workloads was necessary to get the chain to run.
-  A real deployment needs headroom or a bigger node; on this lab, keep the concurrency low.
+- **Pod cap.** kind/kubeadm defaults the kubelet to **110 pods** per node; ephemeral environments
+  blow through it fast (a per-PR node plus its build/run pods on top of the platform + demo teams),
+  and over the cap new pods get `FailedScheduling: Too many pods` or are killed (exit 137). **Raised
+  to 250** on 2026-08-31 (the node's pod CIDR is a /24, ~254 usable, so that is the ceiling) and
+  persisted in `.taskfiles/kind/cluster-config.yaml`, wired into `cluster:up`. The host still swaps,
+  so keep concurrency sane and sweep `Completed` PipelineRun pods; but the hard scheduling wall is
+  gone.
 
 **Still live-only (persistence backlog):** the Gitea catalog repo, the `AplCatalog`, both workloads,
 the turnstone RBAC, the shared `agent-reviews-creds` secret, and the webhook are all hand-made and a

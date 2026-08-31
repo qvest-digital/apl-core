@@ -1,0 +1,14 @@
+# kind cluster config. Deliberately minimal: networking (MetalLB pool, domainSuffix) is still
+# derived from the live docker network after creation, never set here -- see CLAUDE.md rule 5.
+# The one thing this pins is the kubelet pod cap: kind/kubeadm default maxPods is 110, which the
+# ephemeral-agent-environment work blows through fast (a per-PR node plus its build/run pods, on
+# top of the platform + demo teams). The node's pod CIDR is a /24 (~254 usable), so 250 is the
+# safe ceiling. Raised live on 2026-08-31 and persisted here so a rebuild keeps it.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        maxPods: 250

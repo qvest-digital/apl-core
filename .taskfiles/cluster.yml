@@ -26,7 +26,7 @@ tasks:
         apl_run_sub cluster-delete "Removing any existing '{{.CLUSTER_NAME}}' cluster" del || exit $?
       - |
         . "{{.LIB}}"
-        create() { set -eu; kind create cluster --name {{.CLUSTER_NAME}}; }
+        create() { set -eu; kind create cluster --name {{.CLUSTER_NAME}} --config {{.ROOT_DIR}}/.taskfiles/kind/cluster-config.yaml; }
         apl_run_sub cluster-create "Creating kind cluster '{{.CLUSTER_NAME}}'" create || exit $?
       - |
         . "{{.LIB}}"
