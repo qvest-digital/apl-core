@@ -118,11 +118,14 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
     # only lands on the dashboard. The review node is given a stable node id
     # (<team>-review-agent via TURNSTONE_NODE_ID) so this is deterministic.
     watch_url = f"https://turnstone.{DOMAIN}/node/{TEAM}-review-agent/?ws_id={ws.ws_id}"
-    vik("PUT", f"/tasks/{TASK_ID}/comments",
-        {"comment": f'<p>🤖 Coaching this ticket &mdash; '
-                    f'<a href="{watch_url}">watch the agent live in Turnstone</a>. '
-                    f'The proposed description &amp; acceptance criteria will follow here shortly.</p>'})
-    print(f"posted watch link for ws {ws.ws_id}")
+    # One comment: it starts as the live watch-link and is EDITED into the answer
+    # when the turn finishes. Capture its id so we can update it in place.
+    _wc = vik("PUT", f"/tasks/{TASK_ID}/comments",
+              {"comment": f'<p>🤖 Coaching this ticket &mdash; '
+                          f'<a href="{watch_url}">watch the agent live in Turnstone</a>. '
+                          f'The proposed description &amp; acceptance criteria will appear here shortly.</p>'})
+    comment_id = (_wc or {}).get("id")
+    print(f"posted watch link (comment {comment_id}) for ws {ws.ws_id}")
     # Fire the message and POLL for completion. We do NOT use send_and_wait: it
     # blocks on a ws_state="idle" SSE event, which does not reliably reach this
     # non-mesh pipeline pod, so it would hang until timeout even though the turn
@@ -160,24 +163,39 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
             if reply or (st or "").lower() == "error":
                 break
     print(f"turn done, state={st}, reply {len(reply)} chars")
-    # deliberately not closed -- leave it watchable
+    # Close the workstream now that we have the answer -- the result lives on the
+    # ticket, so the ephemeral workstream is no longer needed.
+    try:
+        c.close_workstream(ws.ws_id)
+        print(f"closed ws {ws.ws_id}")
+    except Exception as e:
+        print(f"close failed (non-fatal): {e}")
 
-# 3. Actuate (the pipeline is the sole writer -- the agent has no vikunja tool).
+# 3. Actuate by EDITING the watch-link comment in place (no second comment).
 # Take only what follows the sentinel, dropping the agent's exploration narration.
 SENTINEL = "===TICKET COMMENT==="
 body = (reply.split(SENTINEL)[-1] if SENTINEL in reply else reply).strip()
+
+
+def update_comment(html):
+    if comment_id:
+        vik("POST", f"/tasks/{TASK_ID}/comments/{comment_id}", {"comment": html})
+    else:  # fallback: the watch comment id was somehow lost
+        vik("PUT", f"/tasks/{TASK_ID}/comments", {"comment": html})
+
+
 if not body:
-    print("empty reply -- nothing to do")
+    update_comment("<p>⚠️ The coach finished without producing an answer. Please try again.</p>")
+    print("empty reply -- posted a notice")
     raise SystemExit(0)
 if accept:
-    # PO approved: apply the agent's final body to the ticket description, then
-    # confirm in a comment.
+    # PO approved: apply the agent's final body to the ticket description, and turn
+    # the watch-link comment into a confirmation.
     vik("POST", f"/tasks/{TASK_ID}", {"description": body})
-    vik("PUT", f"/tasks/{TASK_ID}/comments",
-        {"comment": "✅ Applied the agreed description to this ticket."})
+    update_comment("<p>✅ Applied the agreed description to this ticket.</p>")
     print(f"applied description to task {TASK_ID} ({len(body)} chars) and confirmed")
 else:
-    # Normal coaching: the reply IS the comment, posted verbatim.
-    vik("PUT", f"/tasks/{TASK_ID}/comments", {"comment": body})
-    print(f"posted comment to task {TASK_ID} ({len(body)} chars)")
+    # Normal coaching: replace the watch-link comment with the answer.
+    update_comment(body)
+    print(f"updated comment {comment_id} on task {TASK_ID} ({len(body)} chars)")
 print("done")
