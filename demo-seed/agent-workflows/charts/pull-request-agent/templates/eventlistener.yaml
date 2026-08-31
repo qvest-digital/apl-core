@@ -1,7 +1,7 @@
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerBinding
 metadata:
-  name: review-agent-pr
+  name: pr-agent-pr
 spec:
   params:
     - {name: pr,      value: $(body.number)}
@@ -12,17 +12,17 @@ spec:
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
-  name: review-agent-provision
+  name: pr-agent-provision
 spec:
   params: [{name: pr}, {name: branch}, {name: sha}, {name: repoFullName}]
   resourcetemplates:
     - apiVersion: tekton.dev/v1
       kind: PipelineRun
       metadata:
-        generateName: review-agent-provision-$(tt.params.pr)-
+        generateName: pr-agent-provision-$(tt.params.pr)-
         labels: {sidecar.istio.io/inject: "false"}
       spec:
-        pipelineRef: {name: review-agent-forward}
+        pipelineRef: {name: pr-agent-forward}
         params:
           - {name: action,  value: provision}
           - {name: pr,      value: $(tt.params.pr)}
@@ -34,17 +34,17 @@ spec:
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
-  name: review-agent-teardown
+  name: pr-agent-teardown
 spec:
   params: [{name: pr}, {name: branch}, {name: sha}, {name: repoFullName}]
   resourcetemplates:
     - apiVersion: tekton.dev/v1
       kind: PipelineRun
       metadata:
-        generateName: review-agent-teardown-$(tt.params.pr)-
+        generateName: pr-agent-teardown-$(tt.params.pr)-
         labels: {sidecar.istio.io/inject: "false"}
       spec:
-        pipelineRef: {name: review-agent-forward}
+        pipelineRef: {name: pr-agent-forward}
         params:
           - {name: action,  value: teardown}
           - {name: pr,      value: $(tt.params.pr)}
@@ -68,8 +68,8 @@ spec:
               value: >-
                 header.match('X-Gitea-Event','pull_request') &&
                 (body.action == 'opened' || body.action == 'reopened')
-      bindings: [{ref: review-agent-pr}]
-      template: {ref: review-agent-provision}
+      bindings: [{ref: pr-agent-pr}]
+      template: {ref: pr-agent-provision}
     - name: pr-closed
       interceptors:
         - ref: {name: cel}
@@ -77,5 +77,5 @@ spec:
             - name: filter
               value: >-
                 header.match('X-Gitea-Event','pull_request') && body.action == 'closed'
-      bindings: [{ref: review-agent-pr}]
-      template: {ref: review-agent-teardown}
+      bindings: [{ref: pr-agent-pr}]
+      template: {ref: pr-agent-teardown}

@@ -1,7 +1,7 @@
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: review-agent-forward
+  name: pr-agent-forward
 spec:
   params: [{name: action}, {name: pr}, {name: branch}, {name: sha}, {name: repoFullName}, {name: nodeImage}]
   tasks:
