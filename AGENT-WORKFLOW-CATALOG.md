@@ -361,3 +361,156 @@ rebuild loses them — the same "Surviving a rebuild" gap as `TEAM-WORKLOAD-CATA
 currently blocked by the pinned gradle/JDK jar bug); the node reaches the team's existing app
 instead. Per-PR Gitea token minting is also deferred — every node mounts the shared team agent
 credential.
+
+## 14. Second team, self-service via the Console — proven, with the traps that cost the session
+
+On 2026-08-31 a **different** team (`prodpage`) self-served the workflow: a `prodpage` dev picked
+`pull-request-agent` from the catalog in the Console, deployed it, opened a PR on
+`team-prodpage/productpage`, and got a credentialed ephemeral agent node running **prodpage's own**
+toolchain. This section is everything learned making that work — most of it applies to any team.
+
+### 14a. The chart is zero-config now
+
+`review-agent` was renamed to **`pull-request-agent`** and made parameter-free for the standard
+(seed) layout:
+
+- **team** is derived from the namespace it deploys into (`{{ .Release.Namespace }}` → `team-prodpage`),
+  not a value. So the EventListener SA, the forwarded `team`, and the node image all follow the
+  namespace.
+- **repo to watch** is auto-detected at hook time: the webhook-registration Job lists the team's
+  Gitea org and picks its single repo (`team-prodpage/productpage`). Override with a `repo:` value
+  only if an org has more than one.
+- **node image** defaults to `harbor.<domain>/team-<team>/ci-runner:main` (the team's own runner =
+  agent node, §18 of `AGENT-ENVIRONMENTS.md`). `nodeImage` is an optional override, not shown.
+
+`values.yaml` therefore shows only `brokerSink` and `giteaUrl` (both real infra endpoints, no empty
+fields). **Console UX note:** the values box shows `values.yaml` verbatim, so never leave empty
+"fill me in" fields there — derive them or comment them. And the **workload name is capped at 16
+chars** — `pull-request-agent` (18) is rejected; name the workload `pr-agent`.
+
+### 14b. Webhook auto-registration: in-mesh Job + public URL (the mesh-off dead-end)
+
+The hook that registers the `pull_request` webhook is a Helm `post-install`/`post-upgrade` Job
+(Argo runs it as a PostSync hook). Getting it to reach Gitea was the single biggest time sink:
+
+- **gitea's internal Service is firewalled from team namespaces.** A pod in `team-prodpage` cannot
+  reach `gitea-http.gitea.svc:3000` — mesh-off gets `000`, and **even in-mesh it times out**. Gitea
+  only answers the mesh on its public gateway route.
+- **The path that works is the public URL through the gateway** — `https://gitea.<domain>` with
+  `-k` — exactly how the agent nodes reach Gitea. So the hook Job must run **in the mesh** and use
+  the public URL. It's given `giteaUrl` as a value for that.
+- **Do not set `sidecar.istio.io/inject:false` on the hook** (my first version did, and it failed
+  with `000`). Team namespaces inject a **native** istio sidecar (init container, `restartPolicy:
+  Always`), which **terminates when the Job's main container exits**, so the Job completes cleanly —
+  no hang, no `quitquitquit` needed (it's kept as a belt-and-suspenders for a classic sidecar).
+- The hook authenticates with the team's own `gitea-credentials` secret (org bot,
+  `organization-team-<id>`, verified repo-admin) via **basic auth over the public URL** — this is
+  the one place basic auth is used, and it's the org bot's local credential, not an OIDC identity.
+- One `pull_request` webhook covers **both** open (provision) and close (teardown); the
+  EventListener routes on `body.action`.
+
+Reliable webhook registration otherwise (by hand) is `kubectl exec` into the gitea pod against
+`localhost:3000` — that bypasses all netpols and is what the seed should keep for its own setup.
+
+### 14c. `HOME` must be set on the node or every mounted config is invisible
+
+The node runs as **UID 1000 with no `/etc/passwd` entry**, so `$HOME` defaults to `/`. Every tool
+then looks for its config in the wrong place — `git` reads `//.gitconfig` (fails, "dubious
+ownership" and no credential helper), `tea` reports `unable to get or create config file`,
+`vikunja-cli` can't find its `config.toml`. The mounts at `/home/gradle/...` are correct; the tools
+just never look there. **Fix: set `HOME=/home/gradle` in the node container env** (now in the broker's
+create-node). This one missing env var makes the whole toolset look broken. Symptom to recognise:
+`whoami: cannot find name for user ID 1000`.
+
+### 14d. The credential model (settled with the user)
+
+`agent-creds` — an **AplTeamSecret**, visible in the team's Console Secrets view, **seeded once per
+team**, holds the agent's identity plus the two CLI tokens, each exactly once:
+
+```
+agent-username    the agent's Keycloak login (agent-<team>@<domain>)
+agent-password    the agent's Keycloak password (persisted for OIDC contexts, even if unused now)
+gitea-token       a Gitea PAT  — tea/git cannot do OIDC, so this is persisted
+vikunja-token     a Vikunja API token (tk_...) — vikunja-cli cannot do OIDC, so this is persisted
+```
+
+Reasoning that took several wrong turns to land:
+
+- **The platform is OIDC-only; basic auth fails everywhere** except the gitea org-bot local
+  credential (§14b). So username+password is the agent's real identity.
+- **But the CLIs don't do the OIDC flow.** `tea` takes only a PAT; `vikunja-cli`'s `auth login` is
+  local-auth (fails for OIDC accounts) — its token is obtained by an OIDC round-trip done *outside*
+  the CLI. So the two tokens **must be persisted**; they can't be derived at runtime by the CLIs.
+- **Do not store a Vikunja OIDC JWT** — it's short-lived and expired mid-session. Mint a long-lived
+  **Vikunja API token** instead (`vikunja-cli tokens create --title … --expires-at 2030-… --permissions <all>`,
+  permissions built from `/api/v1/routes`; equivalently `POST /api/v1/tokens`). It's the
+  Vikunja equivalent of a Gitea PAT, prefixed `tk_`, and works in `config.toml`'s `token` field.
+- **Loki is NOT in `agent-creds`.** It's a per-*team* Loki **tenant** password (Loki is
+  multi-tenant; a reverse proxy in `monitoring` maps username→tenant, table in the
+  `reverse-proxy-auth-config` secret, plaintext). The broker reads it from `monitoring` at
+  provision and injects it — it's a team data-plane credential, not the agent's.
+
+### 14e. The broker GENERATES the node config; it does not copy pre-baked files
+
+Earlier I stored six ready-made config files in the secret, smearing the same token across
+`git-credentials` + `tea-config` + `gitconfig`. Now the secret holds only raw values, and the
+broker's provision pipeline **generates** the six node files at provision time
+(`gitconfig`, `git-credentials`, `tea-config.yml`, `vikunja-config.toml`, `loki-username`,
+`loki-password`) from: the team's `agent-creds` (gitea/vikunja tokens), the Loki tenant password
+read from `monitoring`, and derived values (gitea login slug =
+`agent-<team>-<domain-with-dots-as-dashes>`, urls from `domain`, loki-username = team). It writes
+`turnstone/agent-<team>-creds`, which the node mounts.
+
+Broker RBAC, all scoped:
+- `turnstone`: create/update Deployment, Service, **Secret** (the generated node creds).
+- team namespace: **get only `agent-creds`** — granted by the *team's own chart*
+  (`broker-read-agent-creds` Role), so deploying the workflow self-authorizes the broker.
+- `monitoring`: **get only `reverse-proxy-auth-config`** (the Loki tenant passwords).
+
+### 14f. Per-team prep that the catalog deploy does NOT do (today)
+
+For a new team, before its PR can spin up a working node, these must exist (the seed will own them):
+1. the team's `ci-runner` image in Harbor **and its Harbor project flipped public** (nodes in
+   `turnstone` pull anonymously). `prodpage`'s project was private and had to be flipped.
+2. `agent-creds` (the four keys above) in the team namespace.
+3. the broker netpol admitting the team (`AplTeamNetworkControl` on `team-admin` — `toLabelName`
+   can't contain `/`, so select the EL by the plain `eventlistener` label).
+
+### 14g. Operational traps seen this session
+
+- **Argo won't hot-reload an existing workload app to a new chart commit** — `syncedRev` stays
+  empty and it keeps rendering an old commit. A **fresh deploy** (delete + recreate the workload)
+  applies the current chart cleanly. Iterate by redeploying, not by pushing and waiting.
+- **Catalog listing is cached** — after changing a chart, click **REFRESH CHARTS** or the Console
+  hands you the stale tile, and a workload created from it points at the old chart path (Argo then
+  reports `app path does not exist`).
+- **Delete+recreate can deadlock** — the team AppProject drops a repo from `sourceRepos` when its
+  last workload referencing it goes away; recreate races the project update, the new app sits
+  `InvalidSpecError: repo not permitted`, and its finalizer blocks the team-ns app. Break it by
+  removing the stuck app's finalizer (`kubectl patch application … -p '{"metadata":{"finalizers":null}}'`).
+- **A PR fires `opened` AND `synchronized`**, so two provisions race on the same node; one wins,
+  the loser's PipelineRun errors on the rollout-wait. Cosmetic (create is idempotent) — de-dupe
+  later, e.g. only provision on `opened`/`reopened`.
+- **Pod cap** was raised 110→250 (`.taskfiles/kind/cluster-config.yaml`), and finished
+  PipelineRun pods still need sweeping.
+
+## 15. Seed persistence checklist (the next step)
+
+None of the above survives a rebuild yet — it's all live-only, the same gap as
+`TEAM-WORKLOAD-CATALOG.md`. To persist, the seed must:
+
+1. **Catalog repo + entry** — create `team-platform/agent-workflows` (both charts), push, and add
+   the `AplCatalog` (public `https://gitea.<domain>/...` URL — the API rejects a port/`http://`).
+2. **Broker** — deploy `agent-node-broker` as an admin-team workload; apply the `turnstone` Role
+   (Deployment/Service/Secret) and `monitoring` Role (`reverse-proxy-auth-config`) bound to
+   `team-admin`'s SAs; add the broker netpol per team.
+3. **Per team**: ensure the `ci-runner` image + **public** Harbor project; mint the **gitea PAT**
+   and **vikunja API token** (`tk_`) and the Keycloak identity, and write them as the `agent-creds`
+   AplTeamSecret (via apl-api, which seals plaintext). Do the gitea/vikunja token minting the
+   admin way (gitea `generate-access-token`; vikunja `POST /api/v1/tokens`).
+4. **Leave the pull-request-agent chart zero-config** — teams add it from the Console with no
+   parameters, and its PostSync hook registers the webhook itself.
+
+The demo teams could have the workflow pre-deployed by the seed, or left for a human to pick from
+the catalog (the point of the self-service model). Either way, everything in §14 must be in place
+first.
