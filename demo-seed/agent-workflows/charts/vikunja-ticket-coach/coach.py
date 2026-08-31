@@ -71,14 +71,35 @@ thread = "\n".join(
     for c in comments
 )
 
-prompt = f"""Coach this Vikunja ticket.
+# /accept is handled here in the pipeline, not by the agent: if the newest
+# non-agent (PO) comment is an /accept, we ask the agent for ONLY the final
+# ticket body and apply it to the ticket description. Otherwise we coach.
+newest_po = next(
+    (c for c in reversed(comments) if (c.get("author") or {}).get("id") != my_id), None
+)
+newest_po_text = strip_html((newest_po or {}).get("comment", "")).strip().lower()
+accept = newest_po_text.startswith("/accept") or newest_po_text == "accept"
+
+if accept:
+    prompt = f"""The product owner approved this ticket with /accept.
+Ticket #{TASK_ID} (team {TEAM})
+Title: {title}
+Current description: {desc or '(empty)'}
+Comment thread (your latest proposed draft is in here):
+{thread or '(none)'}
+
+Output ONLY the final ticket description in clean markdown -- the context/why
+plus the agreed acceptance criteria, ready to save as the ticket body. No
+preamble, no questions, no commentary, no code fences around the whole thing."""
+else:
+    prompt = f"""Coach this Vikunja ticket.
 Ticket #{TASK_ID} (team {TEAM})
 Title: {title}
 Description: {desc or '(empty)'}
 Comment thread:
 {thread or '(none)'}
 
-Coach it now and respond with the required JSON verdict."""
+Coach it now."""
 
 # 2. Run the coach on the team's review node (persona = product-owner voice,
 #    skill = the ticket-coaching workflow). send_and_wait drives one turn to
@@ -96,13 +117,20 @@ with TurnstoneServer(NODE_URL, token=TS_PAT) as c:
     except Exception:
         pass
 
-# 3. Post the agent's answer verbatim as the comment. The pipeline is the sole
-#    actuator (the agent has no vikunja write tool), so it always comments; we do
-#    not ask the agent for structured JSON -- its coaching reply IS the comment.
-comment = (reply or "").strip()
-if comment:
-    vik("PUT", f"/tasks/{TASK_ID}/comments", {"comment": comment})
-    print(f"posted comment to task {TASK_ID} ({len(comment)} chars)")
+# 3. Actuate (the pipeline is the sole writer -- the agent has no vikunja tool).
+body = (reply or "").strip()
+if not body:
+    print("empty reply -- nothing to do")
+    raise SystemExit(0)
+if accept:
+    # PO approved: apply the agent's final body to the ticket description, then
+    # confirm in a comment.
+    vik("POST", f"/tasks/{TASK_ID}", {"description": body})
+    vik("PUT", f"/tasks/{TASK_ID}/comments",
+        {"comment": "✅ Applied the agreed description to this ticket."})
+    print(f"applied description to task {TASK_ID} ({len(body)} chars) and confirmed")
 else:
-    print("empty reply -- nothing to post")
+    # Normal coaching: the reply IS the comment, posted verbatim.
+    vik("PUT", f"/tasks/{TASK_ID}/comments", {"comment": body})
+    print(f"posted comment to task {TASK_ID} ({len(body)} chars)")
 print("done")
