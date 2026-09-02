@@ -2,8 +2,8 @@
 {{- if $v.apps.tekton.enabled }}
 {{- $t := $v.teamApps.tekton }}
 # use nonroot linux/amd64 image
-# current tag: v0.112.0-nonroot
-{{- $imageDigest := "sha256:f666817cbac2bee23cc78a433b4e739456ce221438c0c8ac6bdeaf7bc1a73839" }}
+# current tag: v0.118.0-nonroot
+{{- $imageDigest := "sha256:58ab03590058b55a3815e90fc44d9475c7621629c366e7053ab941e3fcf9ec1b" }}
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
