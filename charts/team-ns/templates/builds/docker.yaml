@@ -224,6 +224,14 @@ spec:
   serviceAccountName: tekton-triggers-team-{{ $v.teamId }}
   triggers:
     - name: tekton-webhook-{{ .name }}
+      # Only rebuild when the push targets THIS build's own branch. The Gitea push webhook the
+      # operator registers has no branch_filter and every build's webhook fires on every push, so
+      # without this one push to any branch rebuilds EVERY image on the repo at once (a build "storm":
+      # both wastes work and intermittently fails under the concurrency). Matching body.ref to the
+      # build's revision scopes each build to its own branch.
+      interceptors:
+        - ref: {name: cel}
+              value: "body.ref == 'refs/heads/{{ .mode.docker.revision }}'"
       bindings:
         - kind: TriggerBinding
           ref: gitea-triggerbinding-{{ .name }}
