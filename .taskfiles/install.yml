@@ -91,6 +91,15 @@ tasks:
         ask VIKUNJA_ENABLED vikunja yes
         ask TURNSTONE_ENABLED turnstone yes
 
+        # Observability defaults ON: agents (and humans) rely on Loki for logs, otel ships those logs
+        # into Loki AND turns on Istio access logging (see CLAUDE.md -- "apps.otel is the observability
+        # plumbing, not tracing"), and Grafana is the UI that reads both. Prometheus/alertmanager stay
+        # optional below (metrics are not the point here). Answer e.g. LOKI_ENABLED=false to opt out.
+        apl_section "Observability stack (default: on -- logs + dashboards)"
+        ask GRAFANA_ENABLED grafana yes
+        ask LOKI_ENABLED loki yes
+        ask OTEL_ENABLED otel yes
+
         # Deliberately unconditional -- asked regardless of the TURNSTONE_ENABLED answer above,
         # and sealed into values.yaml either way (install:values). bootstrapSealedSecrets seals
         # every schema x-secret exactly once, at this initial `helm install`, with no dependency
@@ -133,9 +142,6 @@ tasks:
 
         apl_section "Optional platform apps (default: off, including prometheus)"
         ask ALERTMANAGER_ENABLED alertmanager no
-        ask GRAFANA_ENABLED grafana no
-        ask LOKI_ENABLED loki no
-        ask OTEL_ENABLED otel no
         ask PROMETHEUS_ENABLED prometheus no
         ask KNATIVE_ENABLED knative no
         ask KSERVE_ENABLED kserve no
@@ -315,6 +321,21 @@ tasks:
             enabled: ${VIKUNJA_ENABLED:-true}
           turnstone:
             enabled: ${TURNSTONE_ENABLED:-true}
+            # Lab policy, set here rather than in values-schema.yaml or defaults.yaml: both of
+            # those are UPSTREAM files this fork already patches for Vikunja/Turnstone entries,
+            # and UPSTREAM-SYNC.md flags both as conflict-prone on every merge. Changing a default
+            # there would turn a lab preference into schema divergence in the two files a sync
+            # fights over most. The chart default stays claude-sonnet-5.
+            #
+            # Haiku, because most traffic on this lab is trivial (smoke-testing a node, asking
+            # which host it is on, checking a tool is wired) and costs the same as real work when
+            # the only model on offer is the expensive one. Sonnet remains defined in
+            # values/turnstone/turnstone-raw.gotmpl and selectable per conversation in the console.
+            #
+            # This is one of the few values that CANNOT be changed on a running cluster from the
+            # console: turnstone-admin has no `model` subcommand (verified live 2026-08-30 against
+            # its --help), so [model] default exists only in the config.toml the operator renders.
+            defaultModel: claude-haiku-4-5
         EOF
         # Must be emitted here, immediately after turnstone's own `enabled:`, and before any
         # other app key -- appending it later (after alertmanager..trivy are already written)
@@ -337,7 +358,7 @@ tasks:
           alertmanager:
             enabled: ${ALERTMANAGER_ENABLED:-false}
           grafana:
-            enabled: ${GRAFANA_ENABLED:-false}
+            enabled: ${GRAFANA_ENABLED:-true}
           knative:
             enabled: ${KNATIVE_ENABLED:-false}
           kserve:
@@ -349,9 +370,9 @@ tasks:
           linode-cfw:
             enabled: ${LINODE_CFW_ENABLED:-false}
           loki:
-            enabled: ${LOKI_ENABLED:-false}
+            enabled: ${LOKI_ENABLED:-true}
           otel:
-            enabled: ${OTEL_ENABLED:-false}
+            enabled: ${OTEL_ENABLED:-true}
           policy-reporter:
             enabled: ${POLICY_REPORTER_ENABLED:-false}
           prometheus:

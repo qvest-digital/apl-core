@@ -186,6 +186,204 @@ gitea_oidc_login() {
   printf '%s' "$_existing" | awk '{print $2}'
 }
 
+# platform_admin_sso_ready -- 0 if platform-admin can actually complete an SSO login right now.
+#
+# On a FRESH install Keycloak stamps platform-admin with an UPDATE_PASSWORD required action, so the
+# authorization-code flow ends at .../login-actions/required-action?execution=UPDATE_PASSWORD
+# instead of at the app's callback -- the app sets no session cookie and the login helper fails
+# with something that reads like an app fault but is not one. Confirmed live on the 2026-08-30
+# rebuild. `go-task seed:fix-first-login` clears it (and the seed chain depends on that task), so
+# anything authenticating as platform-admin before the seed has run must say so rather than guess.
+platform_admin_sso_ready() {
+  _pasr_token=$(kc_master_token) || return 1
+  _pasr_user=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  [ -n "$_pasr_user" ] || return 1
+  _pasr_id=$(kc_user_id_by_email "$_pasr_token" "$_pasr_user") || return 1
+  [ -n "$_pasr_id" ] || return 1
+  _pasr_n=$(curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/admin/realms/otomi/users/$_pasr_id" \
+    -H "Authorization: Bearer $_pasr_token" | jq -r '(.requiredActions // []) | length' 2>/dev/null || echo 1)
+  [ "${_pasr_n:-1}" -eq 0 ]
+}
+
+# turnstone_oidc_login <email> <password> -- completes the same Keycloak SSO round trip
+# gitea_oidc_login does, against Turnstone's console, and prints the path to a cookie jar holding
+# the resulting `turnstone_auth_console` session. Caller uses `curl -b "$jar"` and rm's it after.
+#
+# This is the ONLY way in for a platform identity: Turnstone answers 401 to a raw Keycloak bearer
+# exactly as it does to a bogus one (verified live 2026-08-30 on /v1/api/admin/settings and
+# /v1/api/models), because it issues its own JWT after the flow rather than trusting Keycloak's.
+# What the session then carries is real admin: /v1/api/auth/whoami reports admin.settings,
+# admin.models, admin.nodes and the rest for platform-admin, and PUT
+# /v1/api/admin/settings/model.default_alias succeeds with it. See CLAUDE.md's OIDC rule.
+# Public entrypoint: retry the OIDC login, riding out turnstone's authorize rate limit.
+# turnstone's /oidc/authorize caps at 5 calls / 300s PER IP (hardcoded LoginRateLimiter), and the
+# seed legitimately bursts several logins (one per agent PAT mint + the platform-admin login for
+# personas/skills), which trips it -- the admin login then fails with "no ... cookie" / "no login
+# form". A BLOCKED authorize does NOT record against the window (the limiter records only after the
+# check passes), so simply retrying every 60s lets the window age out and then succeeds; we do NOT
+# poll /authorize to probe status because that WOULD record and keep the window full.
+turnstone_oidc_login() {
+  _tol_i=0
+  while :; do
+    if _tol_j=$(_turnstone_oidc_login_once "$1" "$2" 2>/dev/null) && [ -n "$_tol_j" ]; then
+      printf '%s' "$_tol_j"; return 0
+    fi
+    _tol_i=$((_tol_i + 1))
+    [ "$_tol_i" -ge 8 ] && { echo "error: turnstone OIDC login failed after 8 tries for $1 (rate limit not clearing?)" >&2; return 1; }
+    echo "turnstone login for $1 failed (likely the 5/300s authorize rate limit) -- waiting 60s, retry $_tol_i/8" >&2
+    sleep 60
+  done
+}
+
+_turnstone_oidc_login_once() {
+  _tol_email=$1
+  _tol_password=$2
+
+  _tol_jar=$(mktemp)
+  _tol_body=$(mktemp)
+  curl -sk --max-time 20 -c "$_tol_jar" -o "$_tol_body" -L --max-redirs 10 \
+    "https://turnstone.$DOMAIN/v1/api/auth/oidc/authorize"
+  _tol_action=$(grep -o 'action="[^"]*"' "$_tol_body" | head -1 | sed 's/action="//; s/"$//; s/&amp;/\&/g')
+  rm -f "$_tol_body"
+  [ -n "$_tol_action" ] || { echo "error: no Keycloak login form at Turnstone's oidc/authorize entrypoint" >&2; rm -f "$_tol_jar"; return 1; }
+
+  _tol_headers=$(mktemp)
+  curl -sk --max-time 20 -b "$_tol_jar" -c "$_tol_jar" -D "$_tol_headers" -o /dev/null \
+    --data-urlencode "username=$_tol_email" --data-urlencode "password=$_tol_password" --data-urlencode "credentialId=" \
+    -X POST "$_tol_action"
+  _tol_cb=$(grep -i '^location:' "$_tol_headers" | sed 's/^[Ll]ocation: //; s/\r$//')
+  rm -f "$_tol_headers"
+  [ -n "$_tol_cb" ] || { echo "error: Keycloak did not redirect for $_tol_email -- check the password" >&2; rm -f "$_tol_jar"; return 1; }
+
+  # Fresh GET rather than -L off the POST, same as gitea_oidc_login: curl would replay the POST
+  # body at the callback otherwise.
+  curl -sk --max-time 20 -b "$_tol_jar" -c "$_tol_jar" -o /dev/null -L --max-redirs 10 -X GET "$_tol_cb"
+  grep -q turnstone_auth_console "$_tol_jar" || { echo "error: no turnstone_auth_console cookie after the OIDC callback" >&2; rm -f "$_tol_jar"; return 1; }
+  printf '%s' "$_tol_jar"
+}
+
+# turnstone_mint_agent_pat <email> <password> [name] -- mint a long-lived Turnstone API PAT bound
+# to the agent's user, the same shape as gitea_mint_pat / vikunja_mint_api_token. The Turnstone
+# user is OIDC-provisioned, so this first does the agent's OIDC login (which CREATES the user on a
+# cold cluster) to resolve its user_id, then mints an opaque `ts_` PAT with turnstone-admin (no
+# password needed for the mint; the PAT carries the agent user's own permissions). The SDK needs a
+# BEARER token -- the OIDC session cookie is NOT one (it hits the coordinator-gated console
+# surface), which is why the pipeline uses this PAT, not the cookie. Prints the ts_ token.
+turnstone_mint_agent_pat() {
+  _tma_email=$1; _tma_pw=$2; _tma_name=${3:-agent-node}
+  _tma_jar=$(turnstone_oidc_login "$_tma_email" "$_tma_pw") \
+    || { echo "error: turnstone OIDC login failed for $_tma_email (needed to provision the user)" >&2; return 1; }
+  _tma_uid=$(curl -sk --max-time 15 -b "$_tma_jar" "https://turnstone.$DOMAIN/v1/api/auth/whoami" | jq -r '.user_id // empty' 2>/dev/null)
+  rm -f "$_tma_jar"
+  [ -n "$_tma_uid" ] || { echo "error: could not resolve Turnstone user_id for $_tma_email" >&2; return 1; }
+  _tma_tok=$(kubectl --context "$KIND_CTX" --request-timeout=30s exec -n turnstone deploy/turnstone-server -c server -- \
+    turnstone-admin create-token --user "$_tma_uid" --name "${_tma_name}-$(date +%s)" --expires-days 3650 2>/dev/null \
+    | tr -d '\r' | grep -oE 'ts_[A-Za-z0-9._-]+' | head -1)
+  [ -n "$_tma_tok" ] || { echo "error: turnstone-admin create-token produced no token for $_tma_email" >&2; return 1; }
+  printf '%s' "$_tma_tok"
+}
+
+# turnstone_admin_jar -- OIDC-login as platform-admin and print the cookie-jar path holding a
+# turnstone_auth_console session with full admin (persona.create, admin.skills, admin.policies).
+# The OIDC login itself provisions the platform-admin Turnstone user on first call. Caller rm's it.
+turnstone_admin_jar() {
+  _taj_u=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  _taj_p=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+  [ -n "$_taj_u" ] && [ -n "$_taj_p" ] || { echo "error: platform-admin-initial-credentials came back empty" >&2; return 1; }
+  turnstone_oidc_login "$_taj_u" "$_taj_p"
+}
+
+# turnstone_upsert_persona <jar> <name> <create-json> -- create the persona (POST
+# /v1/api/admin/personas) if <name> is absent, else PATCH its mutable levers
+# (/v1/api/admin/personas/<id>). <create-json> is a full CreatePersonaRequest; on PATCH,
+# `name` and `applies_to_kinds` are immutable and dropped. Idempotent -- safe to re-run.
+turnstone_upsert_persona() {
+  _tup_jar=$1; _tup_name=$2; _tup_body=$3
+  _tup_id=$(curl -sk --max-time 15 -b "$_tup_jar" "https://turnstone.$DOMAIN/v1/api/admin/personas" \
+    | jq -r --arg n "$_tup_name" '.personas[]? | select(.name==$n) | .persona_id' 2>/dev/null | head -1)
+  if [ -z "$_tup_id" ]; then
+    _tup_h=$(curl -sk --max-time 15 -b "$_tup_jar" -o /dev/null -w '%{http_code}' -X POST \
+      "https://turnstone.$DOMAIN/v1/api/admin/personas" -H "Content-Type: application/json" -d "$_tup_body")
+    [ "${_tup_h:-0}" -lt 300 ] || { echo "error: create persona $_tup_name -> HTTP $_tup_h" >&2; return 1; }
+    echo "persona $_tup_name created" >&2
+  else
+    _tup_patch=$(printf '%s' "$_tup_body" | jq 'del(.name, .applies_to_kinds, .enabled)')
+    _tup_h=$(curl -sk --max-time 15 -b "$_tup_jar" -o /dev/null -w '%{http_code}' -X PATCH \
+      "https://turnstone.$DOMAIN/v1/api/admin/personas/$_tup_id" -H "Content-Type: application/json" -d "$_tup_patch")
+    [ "${_tup_h:-0}" -lt 300 ] || { echo "error: update persona $_tup_name -> HTTP $_tup_h" >&2; return 1; }
+    echo "persona $_tup_name updated" >&2
+  fi
+}
+
+# turnstone_upsert_skill <jar> <name> <create-json> -- create the skill (POST /v1/api/admin/skills)
+# if <name> is absent, else replace it (PUT /v1/api/admin/skills/<id>). Idempotent.
+turnstone_upsert_skill() {
+  _tus_jar=$1; _tus_name=$2; _tus_body=$3
+  # NB: the admin endpoint, not /v1/api/skills -- the public one omits template_id (returns null).
+  _tus_id=$(curl -sk --max-time 15 -b "$_tus_jar" "https://turnstone.$DOMAIN/v1/api/admin/skills" \
+    | jq -r --arg n "$_tus_name" '((.skills // .)[]? | select(.name==$n) | .template_id)' 2>/dev/null | head -1)
+  if [ -z "$_tus_id" ]; then
+    _tus_h=$(curl -sk --max-time 15 -b "$_tus_jar" -o /dev/null -w '%{http_code}' -X POST \
+      "https://turnstone.$DOMAIN/v1/api/admin/skills" -H "Content-Type: application/json" -d "$_tus_body")
+    [ "${_tus_h:-0}" -lt 300 ] || { echo "error: create skill $_tus_name -> HTTP $_tus_h" >&2; return 1; }
+    echo "skill $_tus_name created" >&2
+  else
+    _tus_h=$(curl -sk --max-time 15 -b "$_tus_jar" -o /dev/null -w '%{http_code}' -X PUT \
+      "https://turnstone.$DOMAIN/v1/api/admin/skills/$_tus_id" -H "Content-Type: application/json" -d "$_tus_body")
+    [ "${_tus_h:-0}" -lt 300 ] || { echo "error: update skill $_tus_name -> HTTP $_tus_h" >&2; return 1; }
+    echo "skill $_tus_name updated" >&2
+  fi
+}
+
+# turnstone_upsert_policy <jar> <tool_pattern> <action> -- create a tool policy (POST
+# /v1/api/admin/policies) if one named allow-<pattern> is absent. Lets the named tool auto-fire via
+# the POLICY path (AutoApproveReason.POLICY) so a headless agent's SAFE tools run unattended while
+# every other tool still hits the approval/judge gate -- the scoped alternative to auto_approve=true
+# (which skips permissions for ALL tools). Idempotent.
+turnstone_upsert_policy() {
+  _tpp_jar=$1; _tpp_pat=$2; _tpp_act=${3:-allow}; _tpp_name="${_tpp_act}-${_tpp_pat}"
+  _tpp_have=$(curl -sk --max-time 15 -b "$_tpp_jar" "https://turnstone.$DOMAIN/v1/api/admin/policies" \
+    | jq -r --arg n "$_tpp_name" '((.policies // .)[]? | select(.name==$n) | .name)' 2>/dev/null | head -1)
+  if [ -n "$_tpp_have" ]; then echo "policy $_tpp_name exists" >&2; return 0; fi
+  _tpp_h=$(curl -sk --max-time 15 -b "$_tpp_jar" -o /dev/null -w '%{http_code}' -X POST \
+    "https://turnstone.$DOMAIN/v1/api/admin/policies" -H "Content-Type: application/json" \
+    -d "{\"name\":\"$_tpp_name\",\"tool_pattern\":\"$_tpp_pat\",\"action\":\"$_tpp_act\",\"priority\":10,\"enabled\":true}")
+  [ "${_tpp_h:-0}" -lt 300 ] || { echo "error: create policy $_tpp_name -> HTTP $_tpp_h" >&2; return 1; }
+  echo "policy $_tpp_name created" >&2
+}
+
+# gitea_refire_push_hook <org> <repo> <pat> -- re-send a push delivery for every push webhook on
+# the repo, via Gitea's own hook test endpoint (it delivers a real payload for the default branch's
+# latest commit, not a synthetic one).
+#
+# Gitea fires `push` EXACTLY ONCE and never retries. A delivery lost for any reason -- the
+# EventListener still starting, a NetworkPolicy mid-apply, Gitea restarting -- means the build is
+# never triggered, and the seed then fails minutes later in a completely different place: a Harbor
+# tag that never appears, or a PipelineRun that was never created. Confirmed live 2026-08-30, when
+# the agent-base build never started: the EventListener's log was EMPTY while a probe POST from the
+# Gitea pod reached it with HTTP 202, so connectivity was fine and the delivery simply never
+# happened. Re-firing this one endpoint fixed it in seconds.
+#
+# Same reasoning as runner_drain_queued, which recovers the equivalent loss for `workflow_job`.
+gitea_refire_push_hook() {
+  _grh_org=$1
+  _grh_repo=$2
+  _grh_pat=$3
+  _grh_ids=$(curl -sk --max-time 15 -H "Authorization: token $_grh_pat" \
+    "https://gitea.$DOMAIN/api/v1/repos/$_grh_org/$_grh_repo/hooks" \
+    | jq -r '.[]? | select((.events // []) | index("push")) | .id' 2>/dev/null || true)
+  [ -n "$_grh_ids" ] || { echo "  no push webhook on $_grh_org/$_grh_repo to re-fire" >&2; return 1; }
+  for _grh_id in $_grh_ids; do
+    _grh_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST \
+      -H "Authorization: token $_grh_pat" \
+      "https://gitea.$DOMAIN/api/v1/repos/$_grh_org/$_grh_repo/hooks/$_grh_id/tests" 2>/dev/null || true)
+    echo "  re-fired the push delivery for hook $_grh_id on $_grh_org/$_grh_repo (HTTP $_grh_code)"
+  done
+}
+
 # gitea_mint_pat <username> <scopes-csv> -- mints a fresh Personal Access Token for an existing
 # Gitea user via the CLI (no login needed once the account exists), and prints it. Token names
 # must be unique per user in Gitea and can't be reused once consumed, so this always mints a
@@ -356,31 +554,131 @@ gitea_ensure_team_credentials() {
 
 # --- Harbor -----------------------------------------------------------------------------------
 
-# harbor_ensure_project / harbor_mirror are NOT used by the Bookinfo seed below: Bookinfo's four
+# harbor_oidc_login <email> <password> -- completes Harbor's own Keycloak SSO round trip, the same
+# shape as gitea_oidc_login. Returns 0 on success; prints nothing on the happy path.
+#
+# Harbor needs this ONCE per identity before its API will treat that identity as anything at all.
+# A raw Keycloak bearer for a user Harbor has never seen is handled as ANONYMOUS: reads return only
+# public projects and writes fail with 401 (not 403 -- the 401/403 distinction is how you tell
+# "unknown identity" from "known identity, wrong role"). After one login the user row exists and
+# the same bearer is a full identity. Verified live 2026-08-30 on a fresh cluster.
+harbor_oidc_login() {
+  _hol_email=$1
+  _hol_password=$2
+
+  _hol_jar=$(mktemp)
+  _hol_body=$(mktemp)
+  curl -sk --max-time 20 -c "$_hol_jar" -o "$_hol_body" -L --max-redirs 10 "https://harbor.$DOMAIN/c/oidc/login"
+  _hol_action=$(grep -o 'action="[^"]*"' "$_hol_body" | head -1 | sed 's/action="//; s/"$//; s/&amp;/\&/g')
+  rm -f "$_hol_body"
+  [ -n "$_hol_action" ] || { echo "error: no Keycloak login form at Harbor's /c/oidc/login" >&2; rm -f "$_hol_jar"; return 1; }
+
+  _hol_headers=$(mktemp)
+  curl -sk --max-time 20 -b "$_hol_jar" -c "$_hol_jar" -D "$_hol_headers" -o /dev/null \
+    --data-urlencode "username=$_hol_email" --data-urlencode "password=$_hol_password" --data-urlencode "credentialId=" \
+    -X POST "$_hol_action"
+  _hol_cb=$(grep -i '^location:' "$_hol_headers" | sed 's/^[Ll]ocation: //; s/\r$//')
+  rm -f "$_hol_headers"
+  case "$_hol_cb" in
+    *required-action*)
+      echo "error: $_hol_email has a pending Keycloak required action -- run 'go-task seed:fix-first-login'" >&2
+      rm -f "$_hol_jar"; return 1 ;;
+    "")
+      echo "error: Keycloak did not redirect for $_hol_email -- check the password" >&2
+      rm -f "$_hol_jar"; return 1 ;;
+  esac
+
+  curl -sk --max-time 20 -b "$_hol_jar" -c "$_hol_jar" -o /dev/null -L --max-redirs 10 -X GET "$_hol_cb"
+  grep -qi 'sid' "$_hol_jar" || { echo "error: no Harbor session cookie after the OIDC callback" >&2; rm -f "$_hol_jar"; return 1; }
+  rm -f "$_hol_jar"
+}
+
+# harbor_ensure_platform_admin -- log platform-admin into Harbor once, so harbor_token's bearer is a
+# real identity. Call it ONCE in a task preamble, before any parallel work; it is deliberately NOT
+# called from harbor_token, because apl_run_parallel would then run one login per team subshell,
+# concurrently, for no benefit.
+#
+# platform-admin specifically, because it is the only identity that can do what the seed needs:
+# Harbor's oidc_admin_group is set to `platform-admin`, so that group's members act as Harbor
+# sysadmins. A TEAM ADMIN cannot -- apl-harbor-operator binds `team-<team>` as **developer** and
+# gives projectAdmin to `all-teams-admin`, which has no members, so a team admin gets 403 flipping
+# its own project's visibility even though the Console shows it as team admin. Verified live
+# 2026-08-30 for dev-ratings, and by hand in the Harbor web UI. Changing that would be an
+# apl-harbor-operator change in apl-tasks, not a seed change.
+_HARBOR_PLATFORM_ADMIN_READY=""
+harbor_ensure_platform_admin() {
+  [ -n "${_HARBOR_PLATFORM_ADMIN_READY:-}" ] && return 0
+  _hepa_user=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+  _hepa_pass=$(kubectl --context "$KIND_CTX" --request-timeout=15s get secret platform-admin-initial-credentials \
+    -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+  [ -n "$_hepa_user" ] && [ -n "$_hepa_pass" ] || { echo "error: platform-admin-initial-credentials came back empty" >&2; return 1; }
+  harbor_oidc_login "$_hepa_user" "$_hepa_pass" || return 1
+  _HARBOR_PLATFORM_ADMIN_READY=1
+  echo "platform-admin signed in to Harbor (its API bearer is now a real identity, with sysadmin via oidc_admin_group)"
+}
+
+# harbor_token -- a platform-admin OIDC access token, accepted by Harbor's API as a bearer
+# credential. Harbor runs in auth_mode oidc_auth against the same Keycloak realm as everything
+# else here, so the platform's own admin identity IS a Harbor admin identity -- no second
+# credential, no bootstrap password, nothing app-specific. Verified live 2026-08-30: GET /users
+# and GET /configurations (both admin-only, both 401 for anonymous AND for a bogus bearer) return
+# 200, and a PUT to /projects/{id} succeeds, all with this token.
+#
+# What does NOT work, and is the trap worth remembering: platform-admin's Keycloak PASSWORD as
+# HTTP basic auth. Harbor rejects it with 401, identically to anonymous -- OIDC-provisioned
+# accounts carry no local password the API accepts, exactly as MCP.md records for Gitea. The
+# credential is the token, not the password. (Beware measuring this against a PUBLIC project's
+# read endpoints: those answer 200 for anyone, including a bogus credential, so they cannot tell
+# you whether authentication happened. Use an admin-only endpoint.)
+#
+# Minted fresh on every call rather than cached: these helpers are called around multi-minute image
+# builds, and kc_platform_admin_token's own comment records tokens expiring across exactly such a
+# wait. Four kubectl gets and one curl is cheap next to what it sits between.
+harbor_token() {
+  kc_platform_admin_token "${OAUTH2_PROXY_CLIENT_SECRET_NAME:-oauth2-proxy-client-access}"
+}
+
+# harbor_ensure_project is NOT used by the Bookinfo seed below: Bookinfo's four
 # Dockerfiles keep their upstream public `FROM` lines (python/ruby/node/gradle/open-liberty) and
 # kaniko pulled every one of them straight from the public registry, confirmed live 2026-08-29 --
 # all four `docker-trigger-build-*` PipelineRuns Succeeded. Those same builds also install packages
 # over the network (pip/bundle/npm/gradle/featureUtility), so in-cluster builds on this lab reach
 # both public registries and public package indexes fine.
 #
-# These two are kept deliberately, unused, as the ready-made fallback if that ever stops being
-# true on some future cluster. The recipe, in full, so it does not depend on any other file:
+# harbor_ensure_project is kept, unused, as the ready-made fallback if that ever stops being true
+# on some future cluster. harbor_mirror, which used to sit beside it, was DELETED on 2026-08-30:
+# it was the last thing reaching for the Harbor bootstrap password, and since nothing sets that
+# variable any more it could not have run as written. The recipe it encoded is preserved here in
+# full, which is all it was ever worth -- three commands, no state, run from the HOST because that
+# is what has unrestricted egress:
 #
 #   1. harbor_ensure_project "<project>"                       # e.g. the team's own project
-#   2. harbor_mirror "python:3.13.3-slim" "<project>/python:3.13.3-slim"   # once per base image,
-#                                                              # run from the HOST, which has
-#                                                              # unrestricted egress
+#   2. docker run --rm --network host quay.io/skopeo/stable:latest \
+#        copy --dest-tls-verify=false --dest-creds "admin:<harbor bootstrap password>" \
+#        "docker://python:3.13.3-slim" \
+#        "docker://harbor.$DOMAIN/<project>/python:3.13.3-slim"          # once per base image
 #   3. sed -i "s|^FROM python:3.13.3-slim|FROM harbor.$DOMAIN/<project>/python:3.13.3-slim|" \
 #        <pushed Dockerfile>                                   # repoint FROM at the Harbor copy
 #
-# Do not delete them just because nothing calls them today: rediscovering this costs an afternoon,
-# and the seed deliberately does not rewrite `FROM` because the unmodified upstream source IS the
-# demo content -- rewriting it would make the demo a fork of Bookinfo rather than a copy of it.
+# `--dest-tls-verify=false` is required in step 2: the host's Docker daemon does not trust the
+# platform's self-signed CA any more than a pod does, which is also why a plain `docker push` fails
+# here (see CLAUDE.md's CA note). skopeo copy is idempotent -- it overwrites the same tag.
+#
+# Step 2 is the one place the bootstrap password is still the right credential and OIDC is not:
+# skopeo talks to the REGISTRY, not the API, and registry auth for an OIDC user is a per-user CLI
+# secret rather than a bearer token. Everything API-shaped moved to OIDC; this cannot.
+# `kubectl get secret harbor-admin-password -n harbor -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}'`
+# still yields it, base64-decoded.
+#
+# The seed deliberately does not rewrite `FROM`: the unmodified upstream source IS the demo
+# content, and rewriting it would make the demo a fork of Bookinfo rather than a copy of it.
 
 # harbor_ensure_project <project> -- creates a public Harbor project if it doesn't already exist.
 harbor_ensure_project() {
   _project=$1
-  _http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
+  _hep_tok=$(harbor_token) || return 1
+  _http=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_hep_tok" \
     -X POST "https://harbor.$DOMAIN/api/v2.0/projects" -H "Content-Type: application/json" \
     -d "{\"project_name\":\"$_project\",\"public\":true}")
   case "$_http" in
@@ -390,31 +688,105 @@ harbor_ensure_project() {
   esac
 }
 
-# harbor_mirror <source-image> <dest-repo:tag> -- mirrors a public image into Harbor from the
-# HOST's network, for the fallback described above. Idempotent: skopeo copy overwrites the same tag
-# either way. Note `--dest-tls-verify=false`: the host's Docker daemon does not trust the
-# platform's self-signed CA any more than a pod does, which is also why a plain `docker push` fails
-# here (see CLAUDE.md's CA note).
-harbor_mirror() {
-  _source=$1
-  _dest=$2
-  # Bounded (CLAUDE.md rule 1): this pulls from the public internet, and a stalled registry
-  # connection inside the container is exactly the kind of thing that hangs forever otherwise --
-  # skopeo has no default timeout of its own.
-  timeout 300 docker run --rm --network host quay.io/skopeo/stable:latest \
-    copy --dest-tls-verify=false --dest-creds "admin:$HARBOR_ADMIN_PASSWORD" \
-    "docker://$_source" "docker://harbor.$DOMAIN/$_dest"
-}
-
 # harbor_has_tag <project> <repo> <tag> -- 0 if that exact tag exists in Harbor. Needs
-# $HARBOR_ADMIN_PASSWORD in the environment (same as the two above). Used to answer "is there
+# a platform-admin OIDC token via harbor_token (same as the others). Used to answer "is there
 # already a built image for this repo?" without re-running a build -- the seed only rebuilds when
 # the pushed source actually changed, so on a rerun this is what proves the previous run's build
 # really produced something.
+# Retried, because an EMPTY %{http_code} is not an answer. Under real load from concurrent Tekton
+# builds curl returns no status at all (see the note on apl_create_if_missing below), and treating
+# that as "no tag" is a SILENT false negative: seed:runners rebuilds an image it already had, and
+# seed:apps takes the rebuild branch for source it already built. Confirmed live 2026-08-30 -- all
+# four teams got an empty status within the same second, which is why nothing skipped that run.
+# A persistent non-answer still returns 1 (callers use this in an `if`), but says so on stderr
+# rather than passing silently for "no".
 harbor_has_tag() {
-  _ht_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -u "admin:$HARBOR_ADMIN_PASSWORD" \
-    "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
-  [ "$_ht_code" = "200" ]
+  _ht_tok=$(harbor_token) || return 1
+  _ht_i=0
+  while [ "$_ht_i" -lt 3 ]; do
+    _ht_i=$((_ht_i + 1))
+    _ht_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_ht_tok" \
+      "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
+    case "$_ht_code" in
+      # Written out rather than `[ ... ]; return $?`: a bare failing test is fatal under errexit,
+      # and this function must stay safe to call outside an `if` condition.
+      #
+      # Only 200 (present) and 404 (definitively absent) are ANSWERS. Every other status -- a 401/403
+      # from a token that expired mid-loop, a 5xx or 502/503 from Harbor under the concurrent load of
+      # four teams building at once -- is a TRANSIENT, not "the tag is missing", so retry it like an
+      # empty status. Collapsing all non-200s to "absent" was the false-negative flake: a re-run's
+      # unchanged-source path (seed.yml) treats "absent" as a failed previous build and aborts the
+      # whole seed, and a build gate (wait_for_agent_base_image) would kick off a needless rebuild.
+      200) return 0 ;;
+      404) return 1 ;;
+      *) sleep 5 ;;
+    esac
+  done
+  echo "error: Harbor never returned a definitive status for $1/$2:$3 in 3 tries -- treating as absent, which may cause a needless rebuild or a re-run abort" >&2
+  return 1
+}
+
+# harbor_make_project_public <project> -- flip an EXISTING Harbor project to public. Authenticates
+# with a platform-admin OIDC token via harbor_token, like the others.
+#
+# Separate from harbor_ensure_project because the platform operator creates a team's project itself,
+# as PRIVATE -- so the create call 409s and the visibility never changes. A private project is fine
+# until something outside the team has to pull from it, which is exactly the platform agent layer's
+# job: every team's kaniko build does COPY --from against team-platform/agent-base.
+harbor_make_project_public() {
+  _hmp_project=$1
+  # Retried, like harbor_has_tag/harbor_delete_tag: this runs four teams at once in seed:apps, which
+  # is exactly when Harbor is least likely to answer -- a token fetch, project lookup or PUT can come
+  # back with an empty status or a transient non-200 under that concurrent load. Without the retry a
+  # single blip failed one (random) team's seed:apps outright, with the error on stderr (not the
+  # per-step stdout log), so the log just ended after "no rebuild needed" with no visible cause.
+  _hmp_i=0
+  _hmp_id=""; _hmp_code=""
+  while [ "$_hmp_i" -lt 5 ]; do
+    _hmp_i=$((_hmp_i + 1))
+    _hmp_tok=$(harbor_token 2>/dev/null || true)
+    if [ -n "$_hmp_tok" ]; then
+      _hmp_id=$(curl -sk --max-time 15 -H "Authorization: Bearer $_hmp_tok" \
+        "https://harbor.$DOMAIN/api/v2.0/projects?name=$_hmp_project" 2>/dev/null | jq -r '.[0].project_id // empty' 2>/dev/null || true)
+      if [ -n "$_hmp_id" ]; then
+        _hmp_code=$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_hmp_tok" \
+          -X PUT "https://harbor.$DOMAIN/api/v2.0/projects/$_hmp_id" -H "Content-Type: application/json" \
+          -d '{"metadata":{"public":"true"}}' 2>/dev/null || true)
+        if [ "$_hmp_code" = "200" ]; then echo "Harbor project '$_hmp_project' is public"; return 0; fi
+      fi
+    fi
+    echo "harbor_make_project_public('$_hmp_project') try $_hmp_i/5 not yet (token=${_hmp_tok:+ok} id=${_hmp_id:-?} code=${_hmp_code:-?}) -- retrying" >&2
+    sleep 3
+  done
+  echo "error: could not make Harbor project '$_hmp_project' public after 5 tries (last: id=${_hmp_id:-?} code=${_hmp_code:-?})" >&2
+  return 1
+}
+
+# harbor_delete_tag <project> <repo> <tag> -- delete one tag's artifact. Authenticates with a
+# platform-admin OIDC token via harbor_token, like the others.
+#
+# Used only by SEED_FORCE_RUNNER_BUILD. The runner build is trigger:false and seed:runners skips it
+# when the tag exists, so deleting the tag is what makes a changed .gitea/runner/Dockerfile
+# actually rebuild on a cluster that already has the image.
+harbor_delete_tag() {
+  # Same empty-status retry as harbor_has_tag, and for the same reason: this runs at the very start
+  # of seed:runners, four teams at once, which is exactly when Harbor is least likely to answer.
+  _hdt_tok=$(harbor_token) || return 1
+  _hdt_i=0
+  _hdt_code=""
+  while [ "$_hdt_i" -lt 3 ]; do
+    _hdt_i=$((_hdt_i + 1))
+    _hdt_code=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $_hdt_tok" \
+      -X DELETE "https://harbor.$DOMAIN/api/v2.0/projects/$1/repositories/$2/artifacts/$3" 2>/dev/null || true)
+    case "$_hdt_code" in
+      [0-9][0-9][0-9]) break ;;
+      *) sleep 5 ;;
+    esac
+  done
+  case "$_hdt_code" in
+    200|404) echo "harbor tag $1/$2:$3 removed (HTTP $_hdt_code)" ;;
+    *) echo "error: deleting harbor tag $1/$2:$3 returned HTTP $_hdt_code" >&2; return 1 ;;
+  esac
 }
 
 # --- apl-api: create-if-missing ---------------------------------------------------------------
@@ -558,6 +930,19 @@ stage_service_tree() {
     || { echo "error: $_sst_vendor has no .gitea/runner/Dockerfile" >&2; return 1; }
   cp "$_sst_bin" "$_sst_dir/.gitea/runner/gitea-runner"
   chmod +x "$_sst_dir/.gitea/runner/gitea-runner"
+
+  # The platform agent layer (AGENT-ENVIRONMENTS.md section 18) is pulled into every team's runner
+  # image with COPY --from, and its reference is domain-dependent -- so it is substituted here
+  # rather than hardcoded in the vendored Dockerfile. Same reasoning as the gitea-runner binary
+  # above: this build context is assembled by the seed, not committed ready-to-build.
+  _sst_agent_base="harbor.$DOMAIN/team-${SEED_PLATFORM_TEAM:-platform}/agent-base:main"
+  sed -i "s|__AGENT_BASE_IMAGE__|$_sst_agent_base|g" "$_sst_dir/.gitea/runner/Dockerfile"
+  # Fail loudly rather than shipping a Dockerfile kaniko will choke on with an opaque message:
+  # an unsubstituted placeholder is not a valid image reference.
+  if grep -q '__AGENT_BASE_IMAGE__' "$_sst_dir/.gitea/runner/Dockerfile"; then
+    echo "error: __AGENT_BASE_IMAGE__ left unsubstituted in $_sst_role's runner Dockerfile" >&2
+    return 1
+  fi
   printf '%s' "$_sst_dir"
 }
 
@@ -602,6 +987,25 @@ _runner_fetch_binary_locked() {
   chmod +x "$_rfb_bin"
   echo "downloaded and verified gitea-runner $SEED_RUNNER_VERSION" >&2
   printf '%s' "$_rfb_bin"
+}
+
+# stage_agent_base_tree -- assemble the platform agent-base build context and print its path.
+#
+# Same shape as stage_service_tree: the vendored tree plus the checksum-verified gitea-runner
+# binary, which is deliberately NOT committed to apl-core. The agent-base image owns the runner
+# binary and its config for ALL teams now, which is what removes the four-way download race that
+# GITEA-ACTIONS-CI.md trap 16 documents (four teams curling one shared path concurrently).
+stage_agent_base_tree() {
+  _sabt_vendor="${SEED_AGENT_BASE_DIR:-demo-seed/agent-base}"
+  [ -d "$_sabt_vendor" ] || { echo "error: vendored tree $_sabt_vendor does not exist" >&2; return 1; }
+  _sabt_bin=$(runner_fetch_binary) || return 1
+  _sabt_dir="${APL_STATE_DIR:-.taskfiles/state}/seed_tree_agent_base"
+  rm -rf "$_sabt_dir"
+  mkdir -p "$_sabt_dir"
+  cp -a "$_sabt_vendor/." "$_sabt_dir/"
+  cp "$_sabt_bin" "$_sabt_dir/gitea-runner"
+  chmod +x "$_sabt_dir/gitea-runner"
+  printf '%s' "$_sabt_dir"
 }
 
 # gitea_push_tree <org> <repo> <pat> <gitea-username> <srcdir> <message> -- force-pushes the whole
@@ -727,7 +1131,11 @@ keycloak_stamp_team_vikunja_group() {
   _group=$(curl -sk --max-time 15 -f "https://keycloak.$DOMAIN/admin/realms/otomi/groups/$_group_id" \
     -H "Authorization: Bearer $_token")
   _current=$(printf '%s' "$_group" | jq -r '.attributes.vikunja_groups[0] // empty')
-  _expected=$(jq -nc --arg name "$_display_name" --arg oidc "kc-team-$_team" '{name: $name, oidcID: $oidc}')
+  # isPublic:true -> Vikunja provisions each team PUBLIC (needs service.enablepublicteams, which is
+  # on in values/vikunja/vikunja.gotmpl). Public teams are discoverable when sharing, so ANY user
+  # can share a project (e.g. a team inbox) with EVERY team -- without which Vikunja only lets you
+  # share with teams you belong to. This is the OIDC-native way to make cross-team inboxes work.
+  _expected=$(jq -nc --arg name "$_display_name" --arg oidc "kc-team-$_team" '{name: $name, oidcID: $oidc, isPublic: true}')
   if [ "$_current" = "$_expected" ]; then
     echo "team-$_team's Keycloak group already stamped with the matching vikunja_groups attribute"
     return 0
@@ -1410,4 +1818,28 @@ gitea_head_sha() {
   # jq, not sed: the payload contains several "id" fields and a greedy pattern picks the wrong one.
   curl -sk --max-time 20 "https://gitea.$DOMAIN/api/v1/repos/$_hs_org/$_hs_repo/branches/$_hs_branch" \
     -H "Authorization: token $_hs_pat" | jq -r '.commit.id // empty'
+}
+
+# vikunja_mint_api_token <email> <password> [title] -- mint a LONG-LIVED Vikunja API token (tk_...)
+# for the agent and print it. This is the Vikunja equivalent of a Gitea PAT (a "bot" token), NOT an
+# OIDC JWT: JWTs are short-lived and expire mid-session, so vikunja-cli must be given a real API
+# token. Authenticates once via the OIDC flow to get a JWT, reads the route inventory (Vikunja
+# validates token permissions against it), grants every listed action, and sets a far expiry.
+# See AGENT-WORKFLOW-CATALOG.md 14d.
+vikunja_mint_api_token() {
+  _vt_email=$1
+  _vt_pass=$2
+  _vt_title=${3:-agent}
+  _vt_jwt=$(vikunja_oidc_login "$_vt_email" "$_vt_pass") || return 1
+  [ -n "$_vt_jwt" ] || { echo "vikunja_mint_api_token: no JWT for $_vt_email" >&2; return 1; }
+  # Build permissions {resource: [actions...]} from the live route inventory -- grant all.
+  _vt_perms=$(curl -sk --max-time 20 "https://vikunja.$DOMAIN/api/v1/routes" \
+    -H "Authorization: Bearer $_vt_jwt" \
+    | jq -c 'to_entries | map(select(.value|type=="object")) | map({(.key): (.value|keys)}) | add')
+  [ -n "$_vt_perms" ] && [ "$_vt_perms" != "null" ] || { echo "vikunja_mint_api_token: could not read routes" >&2; return 1; }
+  _vt_body=$(jq -n --arg t "$_vt_title" --argjson p "$_vt_perms" \
+    '{title:$t, permissions:$p, expires_at:"2035-01-01T00:00:00Z"}')
+  curl -sk --max-time 20 -X PUT "https://vikunja.$DOMAIN/api/v1/tokens" \
+    -H "Authorization: Bearer $_vt_jwt" -H 'Content-Type: application/json' -d "$_vt_body" \
+    | jq -r '.token // empty'
 }

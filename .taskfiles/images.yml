@@ -35,10 +35,9 @@ tasks:
         build() {
           set -euo pipefail
           # Build from a clean context, never the working directory: `docker build .` copies the
-          # whole tree, and npm run test:ci spellchecks every root *.md -- a stray local note
-          # fails the build on an error that has nothing to do with the code. .git/info/exclude
-          # does not apply to Docker, so exporting only git-tracked files is the only way to
-          # sidestep it.
+          # whole tree, and .git/info/exclude does not apply to Docker -- so the image would be
+          # built from whatever is lying around locally. Exporting only git-tracked files builds
+          # exactly what a fresh clone would.
           CTX=$(mktemp -d)
           git ls-files -z | tar --null -T - -c | tar -x -C "$CTX"
           APPS_REVISION=$(cat {{.STATE_DIR}}/apps_revision.txt)
@@ -216,7 +215,36 @@ tasks:
         rc=0
         for img in $IMAGES; do
           slug=$(printf '%s' "$img" | tr '/:.' '---')
-          load() { set -eu; kind load docker-image "$1" --name {{.CLUSTER_NAME}}; }
+          # kind load docker-image shells out to `docker save`, whose tar-split integrity check
+          # can reject a base-image layer INHERITED FROM THE REGISTRY -- observed on docker 29.7.x
+          # for the operator image's linode/apl-tools `sops` layer: "file integrity checksum failed
+          # for home/app/tools/sops". The image is NOT broken (a container reads the file cleanly and
+          # older docker loaded it 100x); only the stricter save rejects that layer's tar-split, and
+          # neither a rebuild nor a re-pull fixes it (the digest is reused). Flattening the image
+          # (export | import) collapses every layer into ONE new local layer whose tar-split THIS
+          # docker generates, which saves cleanly; we re-apply the image config via --change so the
+          # flattened image is runtime-identical. Only runs on the save failure -- the happy path is
+          # untouched. jq only (no python); POSIX `set --` argv build so config values with spaces
+          # survive; the flattened image reuses the same tag so everything downstream is unchanged.
+          load() {
+            set -eu
+            _img="$1"; _err=$(mktemp)
+            if kind load docker-image "$_img" --name {{.CLUSTER_NAME}} 2>"$_err"; then rm -f "$_err"; return 0; fi
+            if ! grep -q "file integrity checksum failed\|failed to save image" "$_err"; then
+              cat "$_err" >&2; rm -f "$_err"; return 1
+            fi
+            echo "  docker-save rejected an inherited layer's tar-split for $_img -- flattening to a save-able image (see .taskfiles/images.yml)"
+            rm -f "$_err"
+            _chg=$(mktemp)
+            docker inspect "$_img" | jq -r '.[0].Config as $c | ([ if (($c.WorkingDir//"")|length)>0 then "WORKDIR "+$c.WorkingDir else empty end ] + [ if (($c.User//"")|length)>0 then "USER "+$c.User else empty end ] + (($c.Env//[])|map("ENV "+.)) + [ if $c.Entrypoint!=null then "ENTRYPOINT "+($c.Entrypoint|tojson) else empty end ] + [ if $c.Cmd!=null then "CMD "+($c.Cmd|tojson) else empty end ] + (($c.ExposedPorts//{})|keys|map("EXPOSE "+(split("/")[0])))) | .[]' > "$_chg"
+            _cid=$(docker create "$_img")
+            set --
+            while IFS= read -r _l; do [ -n "$_l" ] && set -- "$@" --change "$_l"; done < "$_chg"
+            docker export "$_cid" | docker import "$@" - "$_img" >/dev/null
+            docker rm "$_cid" >/dev/null 2>&1 || true
+            rm -f "$_chg"
+            kind load docker-image "$_img" --name {{.CLUSTER_NAME}}
+          }
           apl_run "load-$slug" "Loading $img" load "$img" || rc=$?
           [ "$rc" -eq 0 ] || break
         done

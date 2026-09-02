@@ -9,6 +9,12 @@
 version: '3'
 silent: true
 
+# seed-lib.sh carries the OIDC login flows these checks authenticate with (gitea_oidc_login,
+# vikunja_oidc_login, turnstone_oidc_login). See CLAUDE.md's OIDC rule for why a check must not
+# reach for an app's bootstrap admin password instead: the platform identity is the credential.
+vars:
+  SEED_LIB: '{{.ROOT_DIR}}/.taskfiles/seed-lib.sh'
+
 tasks:
   platform:
     desc: "Platform-level health: pods, Argo CD sync, gateway, operator/image handover"
@@ -99,17 +105,29 @@ tasks:
           apl_warn "no OIDC providers advertised: $OIDC"
         fi
 
-        apl_section "admin credential actually authenticates"
-        apl_dim "a Job 'Complete' on a no-op rerun proves nothing -- this does a real login"
-        U=$(kubectl get secret vikunja-admin-credentials -n vikunja -o jsonpath='{.data.username}' | base64 -d)
-        P=$(kubectl get secret vikunja-admin-credentials -n vikunja -o jsonpath='{.data.password}' | base64 -d)
-        T=$(curl -sk -X POST "https://vikunja.$D/api/v1/login" -H 'Content-Type: application/json' \
-              -d "{\"username\":\"$U\",\"password\":\"$P\"}" | jq -r .token)
-        if [ -n "$T" ] && [ "$T" != null ]; then
-          apl_ok "admin login OK"
+        apl_section "platform-admin can actually authenticate, via SSO"
+        apl_dim "a Job 'Complete' on a no-op rerun proves nothing -- this completes a real OIDC round trip"
+        apl_dim "as platform-admin, which is what a human and every script here actually uses"
+        # NOT vikunja-admin-credentials. That local account exists only to bootstrap (an app with
+        # no users refuses SSO login), and proving IT works tells you nothing about whether the
+        # platform identity can reach Vikunja -- which is the thing everything else depends on.
+        # See CLAUDE.md's OIDC rule.
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN="$D"
+        PA_USER=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+        PA_PASS=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+        if ! platform_admin_sso_ready 2>/dev/null; then
+          apl_skip "platform-admin still has a pending Keycloak required action (UPDATE_PASSWORD on a"
+          apl_dim  "fresh install) -- run 'go-task seed:fix-first-login' first, then re-run this check."
         else
-          apl_fail "ADMIN LOGIN FAILED"
+        T=$(vikunja_oidc_login "$PA_USER" "$PA_PASS" 2>/dev/null || true)
+        if [ -n "$T" ]; then
+          apl_ok "platform-admin SSO login OK (Vikunja JWT issued)"
+        else
+          apl_fail "PLATFORM-ADMIN SSO LOGIN FAILED"
           exit 1
+        fi
         fi
 
         apl_section "not covered here (browser-only, SETUP.md step 10)"
@@ -167,6 +185,33 @@ tasks:
         apl_dim "a Job 'Complete' on a no-op rerun proves nothing -- this lists the real users"
         kubectl exec -n turnstone deploy/turnstone-console -- turnstone-admin list-users | sed 's/^/   /'
 
+        apl_section "platform-admin reaches Turnstone's API through SSO"
+        apl_dim "the CLI above runs INSIDE the pod and proves nothing about the platform identity;"
+        apl_dim "this completes the real OIDC flow and asks the API who it is"
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN="$D"
+        PA_USER=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+        PA_PASS=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+        if ! platform_admin_sso_ready 2>/dev/null; then
+          apl_skip "platform-admin still has a pending Keycloak required action (UPDATE_PASSWORD on a"
+          apl_dim  "fresh install) -- run 'go-task seed:fix-first-login' first, then re-run this check."
+        else
+        TS_JAR=$(turnstone_oidc_login "$PA_USER" "$PA_PASS" 2>/dev/null || true)
+        if [ -n "$TS_JAR" ]; then
+          TS_PERMS=$(curl -sk --max-time 15 -b "$TS_JAR" "https://turnstone.$D/v1/api/auth/whoami" \
+            | jq -r '(.permissions // "") | split(",") | map(select(startswith("admin."))) | length' 2>/dev/null || echo 0)
+          rm -f "$TS_JAR"
+          if [ "${TS_PERMS:-0}" -gt 0 ] 2>/dev/null; then
+            apl_ok "platform-admin SSO login OK ($TS_PERMS admin.* permissions)"
+          else
+            apl_fail "SSO login succeeded but the session carries no admin permissions"
+          fi
+        else
+          apl_fail "PLATFORM-ADMIN SSO LOGIN FAILED"
+        fi
+        fi
+
         apl_section "/metrics redirect (expect 302, not a Prometheus dump)"
         RC=$(curl -sk -o /dev/null -w '%{http_code}' "https://turnstone.$D/metrics")
         if [ "$RC" = "302" ]; then
@@ -189,8 +234,27 @@ tasks:
 
         D=$(kubectl get httproute gitea -n gitea -o jsonpath='{.spec.hostnames[0]}' 2>/dev/null | sed 's/^gitea\.//')
         [ -n "$D" ] || { apl_fail "could not derive domain from the gitea httproute"; exit 1; }
-        GU=$(kubectl get secret gitea-admin-secret -n gitea -o jsonpath='{.data.username}' | base64 -d)
-        GP=$(kubectl get secret gitea-admin-secret -n gitea -o jsonpath='{.data.password}' | base64 -d)
+        # platform-admin through the OIDC flow, NOT gitea-admin-secret's basic auth: the bootstrap
+        # admin is for bootstrapping, and every other Gitea call in this repo already authenticates
+        # as the platform identity. gitea_oidc_login provisions/re-syncs the account and returns its
+        # Gitea login name; gitea_mint_pat then mints an API token for it (the admin CLI needs no
+        # session). platform-admin is a Gitea site admin, so it reads every team's repo -- verified
+        # live 2026-08-30: is_admin true, and 200 on a team repo's hooks and branch_protections.
+        # See CLAUDE.md's OIDC rule.
+        . "{{.SEED_LIB}}"
+        KIND_CTX="{{.KIND_CONTEXT}}"
+        DOMAIN="$D"
+        PA_USER=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.username}' | base64 -d)
+        PA_PASS=$(kubectl get secret platform-admin-initial-credentials -n keycloak -o jsonpath='{.data.password}' | base64 -d)
+        if ! platform_admin_sso_ready 2>/dev/null; then
+          apl_skip "platform-admin still has a pending Keycloak required action (UPDATE_PASSWORD on a"
+          apl_dim  "fresh install) -- run 'go-task seed:fix-first-login' first. Nothing else to check:"
+          apl_dim  "this task verifies seeded repos, and the seed clears that action on its way past."
+          exit 0
+        fi
+        GITEA_LOGIN=$(gitea_oidc_login "$PA_USER" "$PA_PASS") || { apl_fail "platform-admin SSO login to Gitea failed"; exit 1; }
+        GPAT=$(gitea_mint_pat "$GITEA_LOGIN" "read:repository,read:organization,read:user") \
+          || { apl_fail "could not mint a PAT for $GITEA_LOGIN"; exit 1; }
         API="https://gitea.$D/api/v1"
         RC=0
 
@@ -215,7 +279,7 @@ tasks:
 
           # The webhook that feeds it. Present but pointing somewhere else is just as dead as
           # absent, so match the target URL rather than merely counting hooks.
-          HOOKS=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/hooks")
+          HOOKS=$(curl -sk --max-time 20 -H "Authorization: token $GPAT" "$API/repos/team-$TEAM/$REPO/hooks")
           if printf '%s' "$HOOKS" | jq -e --arg u "http://$EL.team-$TEAM.svc.cluster.local:8080/" \
                '[.[]? | select(.config.url==$u and .active==true and (.events|index("workflow_job")))] | length >= 1' >/dev/null 2>&1; then
             apl_ok "workflow_job webhook active and pointed at $EL"
@@ -236,13 +300,13 @@ tasks:
             apl_warn "$LEFT finished runner pod(s) still present -- within ttlSecondsAfterFinished, or TTL is not firing"
           fi
 
-          SHA=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/branches/main" | jq -r '.commit.id // empty')
+          SHA=$(curl -sk --max-time 20 -H "Authorization: token $GPAT" "$API/repos/team-$TEAM/$REPO/branches/main" | jq -r '.commit.id // empty')
           if [ -n "$SHA" ]; then
             # `.conclusion`, not `.status`: a finished run reports status "completed" and carries
             # its pass/fail in conclusion. Checking status would never match "success" and would
             # report every green repo as broken. Filtered by sha client-side rather than trusting
             # a head_sha query parameter.
-            STATUS=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/actions/runs?limit=20" \
+            STATUS=$(curl -sk --max-time 20 -H "Authorization: token $GPAT" "$API/repos/team-$TEAM/$REPO/actions/runs?limit=20" \
               | jq -r --arg s "$SHA" '[.workflow_runs[]? | select(.head_sha==$s)] | .[0] | (.conclusion // .status) // "none"' 2>/dev/null || echo none)
             case "$STATUS" in
               success) apl_ok "CI green on main ($(printf '%s' "$SHA" | cut -c1-7))" ;;
@@ -253,7 +317,7 @@ tasks:
             apl_fail "could not read main's HEAD sha"; RC=1
           fi
 
-          PROT=$(curl -sk --max-time 20 -u "$GU:$GP" "$API/repos/team-$TEAM/$REPO/branch_protections")
+          PROT=$(curl -sk --max-time 20 -H "Authorization: token $GPAT" "$API/repos/team-$TEAM/$REPO/branch_protections")
           CTX=$(printf '%s' "$PROT" | jq -r '.[0].status_check_contexts[0] // empty' 2>/dev/null || true)
           # NOT `// empty`: jq's alternative operator falls through on false as well as null, so a
           # correctly-disabled push would read as missing and this check would fail on a healthy repo.
