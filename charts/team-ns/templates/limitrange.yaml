@@ -5,7 +5,7 @@ metadata:
   labels: {{- include "team-ns.chart-labels" . | nindent 4 }}
 spec:
   limits:
-  - defaultRequest: # this section defines default requests
-      cpu: 100m
-      memory: 64Mi
+  - defaultRequest: # fork: near-zero default requests so pods that don't specify barely reserve
+      cpu: 1m       # anything and always schedule on the single-node lab (no default limits set,
+      memory: 4Mi   # so containers can burst freely up to node capacity).
     type: Container
