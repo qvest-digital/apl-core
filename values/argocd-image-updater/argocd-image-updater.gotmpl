@@ -10,4 +10,21 @@ image:
 resources: {{ $a.resources.imageUpdater | toYaml | nindent 2 }}
 
 config:
+  # Poll the registry every 30s (chart/upstream default is 2m). The dev bot's per-PR preview is
+  # repointed to the freshly built tk<n> image by this controller (imageUpdateStrategy.digest.tag),
+  # so the default 2m is exactly the "the preview took ages to update" lag. Write-back is the
+  # default `argocd` method (it patches the Application directly, no git round-trip), so once the
+  # digest is detected Argo rolls the preview within its own reconcile -- 30s makes that prompt
+  # without hammering Harbor (a lab has only a handful of watched apps). Becomes CM key `interval`
+  # -> env IMAGE_UPDATER_INTERVAL (charts/argocd-image-updater/templates/{configmap,deployment}.yaml).
+  interval: "30s"
   git.commit-message-template: "build: automatic update of {{`{{ .AppName }}`}} [ci skip]"
+  # Harbor's leaf certs chain to the platform's self-signed root CA, which this controller's Go
+  # trust store does not carry (see CLAUDE.md's CA note, and its Tekton CA-trust settings for the
+  # same class of failure against Harbor/Gitea) -- without this every poll
+  # fails with "certificate signed by unknown authority" and no digest update is ever detected.
+  registries:
+    - name: Harbor
+      api_url: https://{{ $v._derived.harborDomain }}
+      prefix: {{ $v._derived.harborDomain }}
+      insecure: yes
