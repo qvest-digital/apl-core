@@ -40,11 +40,18 @@ spec:
       type: array
       default: []
     - name: BUILDER_IMAGE
-      description: The image on which builds will run (default is v1.5.1)
+      # Bumped from v1.5.1 (released 2021-02-23, unbumped by upstream since this file was
+      # added in 2023) to v1.23.2 -- confirmed live 2026-08-29: v1.5.1 has no --ignore-path
+      # flag at all ("unknown flag: --ignore-path"), which is mandatory for any multi-stage
+      # Dockerfile on this kind cluster (see the EXTRA_ARGS comment above, and
+      # github.com/GoogleContainerTools/kaniko/issues/2164). v1.23.2 was verified end-to-end
+      # against a real multi-stage build (Istio Bookinfo's `reviews` service) on this exact
+      # cluster before this bump landed -- see CLAUDE.md and UPSTREAM-SYNC.md §4b.
+      description: The image on which builds will run (default is v1.23.2)
       {{- if $v.linodeLkeImageRepository }}
-      default: "{{- $v.linodeLkeImageRepository }}/gcr/kaniko-project/executor:v1.5.1@sha256:c6166717f7fe0b7da44908c986137ecfeab21f31ec3992f6e128fff8a94be8a5"
+      default: "{{- $v.linodeLkeImageRepository }}/gcr/kaniko-project/executor:v1.23.2@sha256:9e69fd4330ec887829c780f5126dd80edc663df6def362cd22e79bcdf00ac53f"
       {{- else }}
-      default: gcr.io/kaniko-project/executor:v1.5.1@sha256:c6166717f7fe0b7da44908c986137ecfeab21f31ec3992f6e128fff8a94be8a5
+      default: gcr.io/kaniko-project/executor:v1.23.2@sha256:9e69fd4330ec887829c780f5126dd80edc663df6def362cd22e79bcdf00ac53f
       {{- end }}
       type: string
   workspaces:
@@ -81,9 +88,9 @@ spec:
     - name: write-url
       computeResources: {}
       {{- if $v.linodeLkeImageRepository }}
-      image: "{{- $v.linodeLkeImageRepository }}/docker/bash:5.1.4@sha256:c523c636b722339f41b6a431b44588ab2f762c5de5ec3bd7964420ff982fb1d9"
+      image: "{{- $v.linodeLkeImageRepository }}/docker/bash:5.2@sha256:3bee76a96d86d5d2d5efc7c1c570e5a7c95db22348a26944e0e546fa174e3324"
       {{- else }}
-      image: docker.io/library/bash:5.1.4@sha256:c523c636b722339f41b6a431b44588ab2f762c5de5ec3bd7964420ff982fb1d9
+      image: docker.io/library/bash:5.2@sha256:3bee76a96d86d5d2d5efc7c1c570e5a7c95db22348a26944e0e546fa174e3324
       {{- end }}
       script: |
         set -e
