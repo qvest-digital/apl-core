@@ -36,6 +36,12 @@ spec:
       value: {{ .mode.docker.repoUrl }}
     - name: revision
       value: {{ .mode.docker.revision }}
+    # The platform's self-signed CA has no Authority Key Identifier (see CLAUDE.md), which every
+    # in-cluster client this side of Go chokes on. This lab's git-init and kaniko builds are TLS
+    # clients that fail against it too, so skip verification rather than trust it -- see
+    # CLAUDE.md's "Every Tekton Task on this lab needs two CA-trust settings".
+    - name: sslVerify
+      value: "false"
   {{- if .scanSource }}
   - name: grype-code-scan
     taskRef:
@@ -74,13 +80,24 @@ spec:
       value: {{ $context }}
     - name: IMAGE
       value: {{ $v.harborDomain }}/team-{{ $v.teamId }}/{{ .imageName }}:{{ .tag }}
-    {{- with (dig "mode" "docker" "envVars" nil . ) }}
+    # See the sslVerify note on fetch-source above: kaniko is a TLS client too, and needs the
+    # same skip against the platform's self-signed CA to reach Harbor and Gitea.
     - name: EXTRA_ARGS
       value:
+        - --skip-tls-verify
+        - --skip-tls-verify-pull
+        # kind bind-mounts /product_uuid from the host; kaniko's stage-cleanup tries to unlink it
+        # between stages of a multi-stage build and kind's mount refuses, failing with
+        # "unlinkat //product_uuid: device or resource busy" -- confirmed live on this cluster,
+        # same root cause as github.com/GoogleContainerTools/kaniko/issues/2164. Single-stage
+        # builds never hit this (nothing to clean up between stages), so it's silent until the
+        # first multi-stage Dockerfile.
+        - --ignore-path=/product_uuid
+        {{- with (dig "mode" "docker" "envVars" nil . ) }}
         {{- range . }}
         - --build-arg={{ .name }}={{ .value }}
         {{- end }}
-    {{- end }}
+        {{- end }}
 ---
 {{- if .trigger }}
 apiVersion: triggers.tekton.dev/v1alpha1
@@ -224,14 +241,19 @@ spec:
   serviceAccountName: tekton-triggers-team-{{ $v.teamId }}
   triggers:
     - name: tekton-webhook-{{ .name }}
+      {{- if .mode.docker.revision }}
       # Only rebuild when the push targets THIS build's own branch. The Gitea push webhook the
       # operator registers has no branch_filter and every build's webhook fires on every push, so
       # without this one push to any branch rebuilds EVERY image on the repo at once (a build "storm":
+      # the main app + every per-PR preview build kaniko-building concurrently on the kind node, which
       # both wastes work and intermittently fails under the concurrency). Matching body.ref to the
       # build's revision scopes each build to its own branch.
       interceptors:
         - ref: {name: cel}
+          params:
+            - name: filter
               value: "body.ref == 'refs/heads/{{ .mode.docker.revision }}'"
+      {{- end }}
       bindings:
         - kind: TriggerBinding
           ref: gitea-triggerbinding-{{ .name }}
