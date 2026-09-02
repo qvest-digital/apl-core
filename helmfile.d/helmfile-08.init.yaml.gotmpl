@@ -18,7 +18,11 @@ bases:
 
 releases:
   - name: prometheus-operator-artifacts
-    installed: {{ $a | get "prometheus.enabled" }}
+    # Not just prometheus: this release also creates Grafana's ExternalSecrets (admin / oidc /
+    # loki-datasource) and the alertmanager config + authpolicies. Gate on any of the three so that
+    # enabling Grafana on its own (observability default-on) still gets grafana-admin-secret --
+    # otherwise po-grafana wedges in CreateContainerConfigError and Argo never converges.
+    installed: {{ or ($a | get "prometheus.enabled") ($a | get "grafana.enabled") ($a | get "alertmanager.enabled") }}
     namespace: monitoring
     labels:
       pkg: prometheus-operator
