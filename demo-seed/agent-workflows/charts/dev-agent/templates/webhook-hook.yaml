@@ -1,0 +1,81 @@
+# Registers the two webhooks this bot listens on, idempotently, after install/upgrade:
+#  (1) a Vikunja project webhook (assignee + task updates) on the team's project, and
+#  (2) a Gitea issue_comment webhook on the team's repo (for /rework, /resolve).
+# Both point at this chart's EventListener sink. In-mesh (native sidecar self-terminates; the
+# quitquitquit trap is a belt-and-suspenders); reach Vikunja/Gitea via the public gateway (the
+# in-cluster services are firewalled from team namespaces).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-register-hooks
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: register
+          image: {{ .Values.toolImage }}
+          env:
+            - name: GITEA_USER
+              valueFrom: {secretKeyRef: {name: gitea-credentials, key: username}}
+            - name: GITEA_PASS
+              valueFrom: {secretKeyRef: {name: gitea-credentials, key: password}}
+            - name: VT
+              valueFrom: {secretKeyRef: {name: agent-creds, key: vikunja-token}}
+            - name: REPO_OVERRIDE
+              value: "{{ .Values.repo | default "" }}"
+            - name: PROJECT_OVERRIDE
+              value: "{{ .Values.project | default "" }}"
+          command: ["sh","-c"]
+          args:
+            - |
+              set -eu
+              trap 'curl -sf -m 3 -XPOST http://127.0.0.1:15020/quitquitquit >/dev/null 2>&1 || true' EXIT
+              ORG="{{ .Release.Namespace }}"
+              TEAM="{{ .Values.team | default (trimPrefix "team-" .Release.Namespace) }}"
+              GAPI="{{ .Values.giteaUrl }}/api/v1"
+              VAPI="{{ .Values.vikunjaUrl }}/api/v1"
+              SINK="http://el-dev-agent.{{ .Release.Namespace }}.svc.cluster.local:8080"
+
+              # (1) Vikunja project webhook -----------------------------------------------------
+              PROJ="$PROJECT_OVERRIDE"; [ -n "$PROJ" ] || PROJ="$TEAM"
+              PID=$(curl -sk --max-time 15 "$VAPI/projects" -H "Authorization: Bearer $VT" \
+                | jq -r --arg t "$PROJ" '[.[]?|select(.title==$t)][0].id // empty')
+              if [ -z "$PID" ]; then echo "cannot resolve Vikunja project '$PROJ' -- set 'project:' in values"; exit 1; fi
+              VEXIST=$(curl -sk --max-time 15 "$VAPI/projects/$PID/webhooks" -H "Authorization: Bearer $VT" | grep -c "$SINK" || true)
+              if [ "$VEXIST" = "0" ]; then
+                VBODY=$(printf '{"target_url":"%s","events":["task.assignee.created","task.updated","task.assignee.deleted"]}' "$SINK")
+                VC=$(curl -sk --max-time 20 -o /tmp/v -w '%{http_code}' -H "Authorization: Bearer $VT" \
+                  -X PUT -H 'Content-Type: application/json' -d "$VBODY" "$VAPI/projects/$PID/webhooks")
+                echo "vikunja hook on project $PID ($PROJ) -> $VC"; case "$VC" in 2*) : ;; *) cat /tmp/v; echo; exit 1;; esac
+              else echo "vikunja hook already present on project $PID"; fi
+
+              # (2) Gitea issue_comment webhook -------------------------------------------------
+              REPO="$REPO_OVERRIDE"
+              if [ -z "$REPO" ]; then
+                FULLS=$(curl -sk -u "$GITEA_USER:$GITEA_PASS" "$GAPI/orgs/$ORG/repos" \
+                  | jq -r '.[].full_name' | grep "^$ORG/" || true)
+                N=$(printf '%s\n' "$FULLS" | grep -c . || true)
+                if [ "$N" = "1" ]; then REPO=$(printf '%s' "$FULLS" | sed "s#^$ORG/##")
+                else echo "cannot auto-detect repo (found $N in $ORG) -- set 'repo:' in values"; exit 1; fi
+              fi
+              GEXIST=$(curl -sk -u "$GITEA_USER:$GITEA_PASS" "$GAPI/repos/$ORG/$REPO/hooks" | grep -c "$SINK" || true)
+              if [ "$GEXIST" = "0" ]; then
+                # BOTH events: this Gitea fires `pull_request_comment` (NOT issue_comment) for a comment
+                # ON A PR, so a hook subscribed to issue_comment alone never fires for /rework,/resolve
+                # (issues use issue_comment). The webhook still ARRIVES with the issue_comment header +
+                # payload shape either way, so the EL's CEL filter/binding need no change -- only the
+                # subscription. Verified live 2026-09-01: /rework on a PR reached the EL only after
+                # pull_request_comment was added.
+                GBODY=$(printf '{"type":"gitea","active":true,"events":["issue_comment","pull_request_comment","pull_request"],"config":{"url":"%s","content_type":"json"}}' "$SINK")
+                GC=$(curl -sk --max-time 20 -o /tmp/g -w '%{http_code}' -u "$GITEA_USER:$GITEA_PASS" \
+                  -X POST -H 'Content-Type: application/json' -d "$GBODY" "$GAPI/repos/$ORG/$REPO/hooks")
+                echo "gitea hook on $ORG/$REPO -> $GC"; [ "$GC" = "201" ] || { cat /tmp/g; echo; exit 1; }
+              else echo "gitea hook already present on $ORG/$REPO"; fi
+              echo "DEV-AGENT WEBHOOKS REGISTERED"

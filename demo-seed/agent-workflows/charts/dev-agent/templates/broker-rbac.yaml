@@ -1,0 +1,16 @@
+# Lets the admin node-broker read THIS team's agent credential (only 'agent-creds'), so it can
+# generate the node creds + mint the team apl-api token for the per-PR preview objects. Scoped by
+# resourceName. (Same grant the dev-agent chart created.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: broker-read-agent-creds, namespace: {{ .Release.Namespace }}}
+rules:
+  - {apiGroups: [""], resources: ["secrets"], resourceNames: ["agent-creds"], verbs: ["get"]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: broker-read-agent-creds, namespace: {{ .Release.Namespace }}}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: broker-read-agent-creds}
+subjects:
+  - {kind: ServiceAccount, name: sa-team-admin, namespace: team-admin}
+  - {kind: ServiceAccount, name: tekton-triggers-team-admin, namespace: team-admin}

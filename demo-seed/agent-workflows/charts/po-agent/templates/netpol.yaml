@@ -1,0 +1,21 @@
+# Vikunja delivers its webhook from its own namespace; team namespaces default-deny ingress, so
+# without this the delivery is silently dropped at the network layer (no log on either side -- the
+# hardest of the original four bugs to find, see VIKUNJA-TURNSTONE-PIPELINE.md). Mirror the
+# gitea EL's allow, matched to Vikunja.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-vikunja
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      eventlistener: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vikunja
+      ports:
+        - {protocol: TCP, port: 8080}

@@ -1,0 +1,20 @@
+# Let the broker's pipeline SA read the po-desk-persona ConfigMap in this (team-admin)
+# namespace -- the create-persona step reads it to build the per-team persona prompt.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: broker-read-persona-cm
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["po-desk-persona", "dev-persona"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: broker-read-persona-cm
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: broker-read-persona-cm}
+subjects:
+  - {kind: ServiceAccount, name: sa-team-admin, namespace: team-admin}
+  - {kind: ServiceAccount, name: tekton-triggers-team-admin, namespace: team-admin}

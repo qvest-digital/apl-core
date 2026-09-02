@@ -1,0 +1,23 @@
+# Vikunja delivers its webhook from its own namespace, and team namespaces default-deny ingress --
+# so without this the reconcile delivery is silently dropped at the network layer (no log on either
+# side; the hardest of the original four bugs, see VIKUNJA-TURNSTONE-PIPELINE.md and po-desk's
+# netpol). Gitea's webhooks (the /rework path) are already admitted by the platform's
+# default-from-gitea netpol (it matches every EventListener pod), so only Vikunja needs adding.
+# Targets the EventListener by its fixed name "dev-agent" (this chart names it that).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-vikunja
+  namespace: {{ .Release.Namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      eventlistener: dev-agent
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vikunja
+      ports:
+        - {protocol: TCP, port: 8080}

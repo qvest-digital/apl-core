@@ -1,0 +1,714 @@
+# The DEVELOPMENT BOT: ticket-driven ephemeral PR environments.
+#
+# provision-dev-env is fired by the team-side reconcile when a Vikunja ticket enters To-Do or Doing
+# (ANY ticket, regardless of assignee). It stands up the whole environment for that ticket; whether
+# the AGENT starts working is a separate lever (params.assignedToAgent -> kickoff vs standby seed,
+# plus the activate-agent task for a later assignment). It stands up:
+#   - a branch `ticket-<n>` carrying the ticket as ticket/ticket-<n>.md (also gives the PR a diff),
+#   - a DRAFT pull request,
+#   - the per-PR preview as first-class APL objects (AplTeamBuild/Workload/Service) so it shows in
+#     the Console under Container Images / Workloads / Services, at app-tk<n>-<team>.<domain>,
+#   - the agent node + a workstream (persona the-developer-<team>, skill dev), seeded with the
+#     ticket + the console deep link + the preview URL.
+# Everything is keyed by the ticket id (not the PR number), which is known up front -- so no value
+# has to flow back from the PR. Idempotent: if the node already exists the whole run no-ops (the
+# two Vikunja webhooks -- assignee + bucket -- can both fire "provision").
+#
+# apl-api auth: the broker mints a team apl-api JWT via the SAME OIDC password grant the seed's
+# dev_team_token uses, as agent-<team>, from agent-username/agent-password ALREADY in the team's
+# agent-creds secret (no new credential) + the oauth2-proxy client secret. Verified live: that
+# identity can create/delete AplTeamService/Workload/Build.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: provision-dev-env
+spec:
+  params:
+    - name: team
+    - name: ticket
+    - name: repoFullName        # team-<team>/<repo>
+    - name: nodeImage
+      default: ""
+    - name: assignedToAgent     # "true" -> start the agent now; else create the workstream idle (human drives)
+      default: "false"
+  tasks:
+    - name: dedupe
+      # Serialize the two webhook-racing provisions onto ONE run. The old check keyed on the node
+      # Deployment, which is not created until create-node (many tasks later) -- so both racing runs
+      # passed it and both announced, leaving TWO "On it" ticket comments (the observed bug). An
+      # atomic lease fixes it: kubectl create of a per-ticket ConfigMap fails with AlreadyExists for
+      # every run but the first, so exactly one proceeds. result exists=no means "we own it, provision";
+      # exists=yes means "already up, or a concurrent run holds the lease -- no-op".
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}]
+        results: [{name: exists}]
+        steps:
+          - name: check
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"
+              NODE="${TEAM}-tk${TICKET}-agent"
+              LEASE="dev-lease-${TEAM}-tk${TICKET}"
+              # Fast path: env already fully up from a PRIOR (non-concurrent) provision -> no-op.
+              if kubectl get deploy "$NODE" -n turnstone >/dev/null 2>&1; then
+                printf yes > "$(results.exists.path)"
+                echo "env for ticket ${TICKET} already exists (${NODE}) -- provision is a no-op"
+                exit 0
+              fi
+              # Concurrency guard: atomically acquire the lease. Only the first create succeeds; the
+              # rest get AlreadyExists (nonzero, consumed by the if -- safe under set -e). Label it with
+              # the node instance so teardown reaps it along with deploy/svc.
+              if kubectl create configmap "$LEASE" -n turnstone \
+                   --from-literal=node="$NODE" --from-literal=ticket="$TICKET" >/dev/null 2>&1; then
+                kubectl label configmap "$LEASE" -n turnstone \
+                  apl.io/ephemeral=true "app.kubernetes.io/instance=$NODE" --overwrite >/dev/null 2>&1 || true
+                printf no > "$(results.exists.path)"
+                echo "acquired dev lease ${LEASE} -- provisioning"
+              else
+                printf yes > "$(results.exists.path)"
+                echo "dev lease ${LEASE} held by a concurrent run -- provision is a no-op"
+              fi
+    - name: announce
+      # Post the single marked "Dev agent" comment IMMEDIATELY, before the slow node rollout/build,
+      # so the PO gets instant feedback. bootstrap-workstream later UPDATES this same comment to the
+      # ready state, and the agent's vik status/handback update it again -- one comment, evolving.
+      # Upsert (create; a racing second provision just updates it).
+      runAfter: [dedupe]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}]
+        steps:
+          - name: announce
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; DOMAIN="{{ .Values.domain }}"; NS="team-${TEAM}"
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              VAPI="https://vikunja.${DOMAIN}/api/v1"
+              BODY="<blockquote><p>🤖 <strong>Dev agent</strong></p><p>On it &mdash; setting up a branch, a draft PR and a live preview for this ticket. I&rsquo;ll update this comment when the environment is ready.</p></blockquote><!-- dev-agent -->"
+              ME=$(curl -sk --max-time 15 "$VAPI/user" -H "Authorization: Bearer $VT" | jq -r '.id // 0')
+              CID=$(curl -sk --max-time 15 "$VAPI/tasks/$TICKET/comments" -H "Authorization: Bearer $VT" | jq -r --argjson me "$ME" '[.[]?|select(.author.id==$me and (.comment|contains("<!-- dev-agent -->")))][0].id // empty')
+              if [ -n "$CID" ]; then
+                curl -sk --max-time 15 -o /dev/null -w "announce update -> %{http_code}\n" -X POST "$VAPI/tasks/$TICKET/comments/$CID" -H "Authorization: Bearer $VT" -H 'Content-Type: application/json' -d "$(jq -n --arg c "$BODY" '{comment:$c}')"
+              else
+                curl -sk --max-time 15 -o /dev/null -w "announce create -> %{http_code}\n" -X PUT "$VAPI/tasks/$TICKET/comments" -H "Authorization: Bearer $VT" -H 'Content-Type: application/json' -d "$(jq -n --arg c "$BODY" '{comment:$c}')"
+              fi
+              echo "announced on ticket #$TICKET"
+    - name: copy-creds
+      runAfter: [dedupe]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}]
+      taskSpec:
+        params: [{name: team}]
+        steps:
+          - name: generate
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; DOMAIN="{{ .Values.domain }}"; NS="team-${TEAM}"
+              GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              LP=$(kubectl get secret reverse-proxy-auth-config -n monitoring -o jsonpath='{.data.authn\.yaml}' \
+                   | base64 -d | grep -A1 "username: ${TEAM}$" | awk '/password:/{gsub(/'"'"'/,"",$2); print $2; exit}')
+              GUSER="agent-${TEAM}-$(echo "$DOMAIN" | tr '.' '-')"
+              mkdir -p /w
+              cat > /w/gitconfig <<GC
+              [credential]
+              	helper = "!f() { printf 'url=%s\n' \"\$(cat /etc/turnstone-git/credentials)\"; }; f"
+              [user]
+              	name = agent-${TEAM}
+              	email = agent-${TEAM}@${DOMAIN}
+              [http]
+              	sslVerify = false
+              [safe]
+              	directory = *
+              GC
+              printf 'https://%s:%s@gitea.%s' "$GUSER" "$GT" "$DOMAIN" > /w/git-credentials
+              cat > /w/tea-config.yml <<TC
+              logins:
+                  - name: ${TEAM}
+                    url: https://gitea.${DOMAIN}
+                    token: ${GT}
+                    default: true
+                    insecure: true
+                    user: ${GUSER}
+                    version_check: true
+              TC
+              printf 'url = "https://vikunja.%s"\ntoken = "%s"\n' "$DOMAIN" "$VT" > /w/vikunja-config.toml
+              printf '%s' "$TEAM" > /w/loki-username
+              printf '%s' "$LP" > /w/loki-password
+              kubectl create secret generic "agent-${TEAM}-creds" -n turnstone --from-file=/w \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "generated turnstone/agent-${TEAM}-creds"
+    - name: prepare-branch
+      runAfter: [copy-creds]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: repoFullName, value: $(params.repoFullName)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: repoFullName}]
+        steps:
+          - name: seed
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; RFN="$(params.repoFullName)"; DOMAIN="{{ .Values.domain }}"
+              NS="team-${TEAM}"; BRANCH="ticket-${TICKET}"
+              GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              GUSER="agent-${TEAM}-$(echo "$DOMAIN" | tr '.' '-')"
+              # Ticket content for the artifact file.
+              T=$(curl -sk --max-time 15 "https://vikunja.${DOMAIN}/api/v1/tasks/${TICKET}" -H "Authorization: Bearer $VT")
+              TITLE=$(printf '%s' "$T" | jq -r '.title // empty'); [ -n "$TITLE" ] || TITLE="ticket ${TICKET}"
+              DESC=$(printf '%s' "$T" | jq -r '.description // ""' | sed 's/<[^>]*>//g')
+              export GIT_SSL_NO_VERIFY=1
+              git config --global user.email "agent-${TEAM}@${DOMAIN}"
+              git config --global user.name "agent-${TEAM}"
+              git config --global http.sslVerify false
+              cd /tmp
+              rm -rf repo
+              git clone "https://${GUSER}:${GT}@gitea.${DOMAIN}/${RFN}.git" repo
+              cd repo
+              git switch -c "$BRANCH" 2>/dev/null || git switch "$BRANCH"
+              mkdir -p ticket
+              { printf '# Ticket #%s: %s\n\n' "$TICKET" "$TITLE"; printf '%s\n' "$DESC"; \
+                printf '\n---\nWorked by the %s dev agent. Vikunja: https://vikunja.%s/tasks/%s\n' "$TEAM" "$DOMAIN" "$TICKET"; } > "ticket/ticket-${TICKET}.md"
+              git add "ticket/ticket-${TICKET}.md"
+              git commit -m "chore: start ticket #${TICKET} (${TITLE})" || echo "nothing to commit (branch already seeded)"
+              git push -u "https://${GUSER}:${GT}@gitea.${DOMAIN}/${RFN}.git" "$BRANCH"
+              echo "seeded branch ${BRANCH} on ${RFN}"
+    - name: open-pr
+      runAfter: [prepare-branch]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: repoFullName, value: $(params.repoFullName)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: repoFullName}]
+        steps:
+          - name: pr
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; RFN="$(params.repoFullName)"; DOMAIN="{{ .Values.domain }}"
+              NS="team-${TEAM}"; BRANCH="ticket-${TICKET}"; NODE="${TEAM}-tk${TICKET}-agent"
+              GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              TITLE=$(curl -sk --max-time 15 "https://vikunja.${DOMAIN}/api/v1/tasks/${TICKET}" -H "Authorization: Bearer $VT" | jq -r '.title // empty'); [ -n "$TITLE" ] || TITLE="ticket ${TICKET}"
+              # Draft = "WIP:" title prefix (Gitea treats WIP-prefixed PRs as drafts). Machine tag
+              # lets rework/teardown map a PR back to its ticket/node without a callback.
+              BODY=$(jq -n --arg t "$TICKET" --arg team "$TEAM" --arg node "$NODE" --arg dom "$DOMAIN" --arg title "$TITLE" \
+                '{head:("ticket-"+$t), base:"main", title:("WIP: [ticket #"+$t+"] "+$title),
+                  body:("Auto-opened for ticket #"+$t+" ( https://vikunja."+$dom+"/tasks/"+$t+" ).\n\nDriven by the "+$team+" dev agent. Comment **/rework <feedback>** to have the agent revise this PR to your notes, or **/resolve** to have it merge the latest `main` and fix any conflicts.\n\n<!-- dev-agent team="+$team+" ticket="+$t+" node="+$node+" -->")}')
+              OUT=$(curl -sk --max-time 20 -X POST "https://gitea.${DOMAIN}/api/v1/repos/${RFN}/pulls" \
+                -H "Authorization: token $GT" -H 'Content-Type: application/json' -d "$BODY")
+              N=$(printf '%s' "$OUT" | jq -r '.number // empty')
+              if [ -n "$N" ]; then echo "opened draft PR #$N on ${RFN}"; else echo "PR create note: $(printf '%s' "$OUT" | head -c 300)"; fi
+    - name: create-objects
+      runAfter: [prepare-branch]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: repoFullName, value: $(params.repoFullName)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: repoFullName}]
+        steps:
+          - name: apl
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; RFN="$(params.repoFullName)"; DOMAIN="{{ .Values.domain }}"
+              NS="team-${TEAM}"; REPO="${RFN#*/}"; TAG="tk${TICKET}"; WL="app-tk${TICKET}"
+              API="https://console.${DOMAIN}/api"
+              # Mint an apl-api token as agent-<team> (OIDC password grant), creds already in agent-creds.
+              AU=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.agent-username}' | base64 -d)
+              AP=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.agent-password}' | base64 -d)
+              CID=$(kubectl get secret oauth2-proxy-client-access -n istio-system -o jsonpath='{.data.client-id}' | base64 -d)
+              CS=$(kubectl get secret oauth2-proxy-client-access -n istio-system -o jsonpath='{.data.client-secret}' | base64 -d)
+              TOK=$(curl -sk --max-time 15 "https://keycloak.${DOMAIN}/realms/otomi/protocol/openid-connect/token" \
+                --data-urlencode grant_type=password --data-urlencode client_id="$CID" --data-urlencode client_secret="$CS" \
+                --data-urlencode username="$AU" --data-urlencode password="$AP" --data-urlencode scope=openid | jq -r '.access_token // empty')
+              [ -n "$TOK" ] || { echo "could not mint apl-api token for $AU"; exit 1; }
+              AUTH="Authorization: Bearer $TOK"; JSON="Content-Type: application/json"
+              # BUILD: clone the main build's docker mode (repoUrl/path/envVars), build the ticket
+              # branch, tag by ticket. trigger:true so pushes to the branch rebuild it.
+              MB=$(curl -sk --max-time 15 "$API/v2/teams/$TEAM/builds/$REPO" -H "$AUTH")
+              BBODY=$(printf '%s' "$MB" | jq --arg name "$WL" --arg img "$REPO" --arg tag "$TAG" --arg br "ticket-${TICKET}" \
+                '{kind:"AplTeamBuild", metadata:{name:$name}, spec:{imageName:$img, tag:$tag, trigger:true, scanSource:false,
+                  mode:{type:"docker", docker:({repoUrl:.spec.mode.docker.repoUrl, path:.spec.mode.docker.path, revision:$br}
+                        + (if .spec.mode.docker.envVars then {envVars:.spec.mode.docker.envVars} else {} end))}}}')
+              curl -sk --max-time 20 -o /dev/null -w "build $WL -> HTTP %{http_code}\n" -X POST "$API/v2/teams/$TEAM/builds" -H "$AUTH" -H "$JSON" -d "$BBODY" || true
+              # WORKLOAD: clone the main app workload. CRITICAL: the initial image.tag stays "main"
+              # (which always exists) so the preview comes up IMMEDIATELY on production code -- the
+              # per-PR tk<n> image does not exist yet (the agent hasn't built it), and pinning the
+              # initial tag to tk<n> makes the pod ImagePullBackOff on a not-found tag forever. Argo
+              # Image Updater then WATCHES the tk<n> tag (imageUpdateStrategy.digest.tag) and repoints
+              # the preview to it the moment the agent's push produces that image. So: up on main now,
+              # switches to the PR build when it lands. Only replicaCount is forced; values keep tag:main.
+              MW=$(curl -sk --max-time 15 "$API/v2/teams/$TEAM/workloads/app" -H "$AUTH")
+              VALUES=$(printf '%s\nreplicaCount: 1\n' "$(printf '%s' "$MW" | jq -r '.spec.values')")
+              WBODY=$(printf '%s' "$MW" | jq --arg name "$WL" --arg values "$VALUES" --arg tag "$TAG" \
+                '{kind:"AplTeamWorkload", metadata:{name:$name}, spec:{url:.spec.url, chartProvider:.spec.chartProvider, path:.spec.path, revision:.spec.revision, values:$values, imageUpdateStrategy:(.spec.imageUpdateStrategy | .digest.tag = $tag)}}')
+              curl -sk --max-time 20 -o /dev/null -w "workload $WL -> HTTP %{http_code}\n" -X POST "$API/v2/teams/$TEAM/workloads" -H "$AUTH" -H "$JSON" -d "$WBODY" || true
+              # SERVICE: preview URL app-tk<n>-<team>.<domain> (default host).
+              SBODY=$(jq -n --arg name "$WL" --argjson port {{ .Values.servicePort | default 9080 }} \
+                '{kind:"AplTeamService", metadata:{name:$name}, spec:{port:$port, ingress:{type:"public", useDefaultHost:true}}}')
+              curl -sk --max-time 20 -o /dev/null -w "service $WL -> HTTP %{http_code}\n" -X POST "$API/v2/teams/$TEAM/services" -H "$AUTH" -H "$JSON" -d "$SBODY" || true
+              echo "preview objects requested: build/workload/service $WL (preview URL https://${WL}-${TEAM}.${DOMAIN})"
+    # Restore the workflow_job webhook the CI runner hangs on. Creating the per-PR AplTeamBuild
+    # above makes apl-gitea-operator reconcile THIS repo's webhooks, and that reconcile DELETES the
+    # repo-level `workflow_job` hook the seed added (it only knows about the build's push hook). With
+    # it gone, Gitea's `workflow_job: queued` event has nowhere to go, no runner Job is ever created,
+    # the run sits queued forever and the merge gate stays yellow -- the exact failure this fixes.
+    # The operator's clobber is ASYNC (it lands when the build's push hook appears), so we wait for
+    # that hook, THEN re-ensure ours -- being the last writer -- and verify it survives. One
+    # workflow_job hook serves the whole repo (all runs), so this also covers concurrent tickets.
+    - name: ensure-ci-webhook
+      runAfter: [create-objects]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: repoFullName, value: $(params.repoFullName)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: repoFullName}]
+        steps:
+          - name: ensure
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; RFN="$(params.repoFullName)"; DOMAIN="{{ .Values.domain }}"
+              NS="team-${TEAM}"
+              GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              WJURL="http://el-gitea-workflowjob-${TEAM}.team-${TEAM}.svc.cluster.local:8080/"
+              # The dev-agent EventListener sink -- receives the issue_comment webhook that carries
+              # /rework and /resolve PR comments (must match the dev-agent chart's webhook-hook.yaml SINK).
+              ICURL="http://el-dev-agent.team-${TEAM}.svc.cluster.local:8080"
+              PUSHMATCH="el-gitea-webhook-app-tk${TICKET}"          # the per-PR build's push hook
+              HOOKS="https://gitea.${DOMAIN}/api/v1/repos/${RFN}/hooks"
+              hooks_json() { curl -sk --max-time 15 "$HOOKS?limit=50" -H "Authorization: token $GT"; }
+              have_wj()   { hooks_json | grep -qF "$WJURL"; }
+              have_ic()   { hooks_json | grep -qF "$ICURL"; }
+              have_push() { hooks_json | grep -qF "$PUSHMATCH"; }
+              ensure_wj() {
+                have_wj && { echo "workflow_job hook present"; return 0; }
+                curl -sk --max-time 20 -o /dev/null -w "created workflow_job hook -> HTTP %{http_code}\n" -X POST "$HOOKS" \
+                  -H "Authorization: token $GT" -H "Content-Type: application/json" \
+                  -d "$(jq -n --arg url "$WJURL" '{type:"gitea",active:true,events:["workflow_job"],config:{url:$url,content_type:"json"}}')"
+              }
+              # The issue_comment hook (/rework, /resolve) is registered ONCE by the dev-agent chart's
+              # install Job, but the SAME operator webhook-reconcile that clobbers workflow_job also
+              # deletes it -- so re-ensure it here too, or PR comments reach nothing (the "/resolve
+              # didn't fire" bug: the hook was gone).
+              # BOTH events: this Gitea fires `pull_request_comment` (not issue_comment) for a comment
+              # on a PR, so a hook on issue_comment alone never fires for /rework,/resolve. The webhook
+              # still arrives with the issue_comment header/shape, so the EL needs no change.
+              ensure_ic() {
+                have_ic && { echo "issue_comment hook present"; return 0; }
+                curl -sk --max-time 20 -o /dev/null -w "created issue_comment hook -> HTTP %{http_code}\n" -X POST "$HOOKS" \
+                  -H "Authorization: token $GT" -H "Content-Type: application/json" \
+                  -d "$(jq -n --arg url "$ICURL" '{type:"gitea",active:true,events:["issue_comment","pull_request_comment","pull_request"],config:{url:$url,content_type:"json"}}')"
+              }
+              # 1. Wait (bounded) for the operator's push hook to appear = its clobber has run.
+              i=0; while [ "$i" -lt 18 ]; do have_push && break; i=$((i+1)); sleep 10; done
+              have_push && echo "operator push hook present (clobber done)" || echo "warning: push hook for tk${TICKET} not seen in 180s -- ensuring anyway"
+              sleep 5
+              # 2. Be the last writer for BOTH hooks; then verify they survive a couple more reconcile beats.
+              ensure_wj; ensure_ic
+              j=0; while [ "$j" -lt 3 ]; do sleep 10; have_wj || { echo "workflow_job clobbered again -- re-ensuring"; ensure_wj; }; have_ic || { echo "issue_comment clobbered again -- re-ensuring"; ensure_ic; }; j=$((j+1)); done
+              have_wj && echo "workflow_job hook stable on ${RFN} -> ${WJURL}" || echo "error: could not keep workflow_job hook on ${RFN}"
+              have_ic && echo "issue_comment hook stable on ${RFN} -> ${ICURL}" || echo "error: could not keep issue_comment hook on ${RFN}"
+    - name: create-node
+      runAfter: [prepare-branch]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: repoFullName, value: $(params.repoFullName)}, {name: nodeImage, value: $(params.nodeImage)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: repoFullName}, {name: nodeImage}]
+        steps:
+          - name: create
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; REPO="https://gitea.{{ .Values.domain }}/$(params.repoFullName).git"
+              DOMAIN="{{ .Values.domain }}"; BRANCH="ticket-${TICKET}"
+              NODE="${TEAM}-tk${TICKET}-agent"
+              if [ -n "$(params.nodeImage)" ]; then IMG="$(params.nodeImage)"; else IMG="harbor.${DOMAIN}/team-${TEAM}/ci-runner:main"; fi
+              CREDS="agent-${TEAM}-creds"
+              echo "provisioning dev node ${NODE} from ${IMG}, branch ${BRANCH}"
+              kubectl get deploy turnstone-server -n turnstone -o json | jq \
+                --arg node "$NODE" --arg img "$IMG" --arg branch "$BRANCH" --arg repo "$REPO" --arg creds "$CREDS" '
+                  .metadata = {name:$node, namespace:"turnstone", labels:{"app.kubernetes.io/instance":$node,"app.kubernetes.io/name":"turnstone","turnstone-node":"tsnode","apl.io/ephemeral":"true"}}
+                  | del(.status)
+                  | .spec.replicas = 1
+                  | .spec.selector.matchLabels = {"app.kubernetes.io/instance":$node}
+                  | .spec.template.metadata = {labels:{"app.kubernetes.io/instance":$node,"app.kubernetes.io/name":"turnstone","turnstone-node":"tsnode"}}
+                  | .spec.template.spec.containers[0].env = ([.spec.template.spec.containers[0].env[] | select(.name != "TURNSTONE_NODE_ID")] + [{name:"TURNSTONE_NODE_ID",value:$node},{name:"HOME",value:"/home/gradle"},{name:"PR_WORKSPACE",value:"/home/gradle/pr"},{name:"XDG_CACHE_HOME",value:"/home/gradle/.cache"}])
+                  | .spec.template.spec.containers[0].image = $img
+                  | .spec.template.spec.containers[0].imagePullPolicy = "Always"
+                  | .spec.template.spec.containers[0].workingDir = "/home/gradle/pr"
+                  | .spec.template.spec.volumes += [
+                      {name:"node-creds", secret:{secretName:$creds, defaultMode:256}},
+                      {name:"agent-workspace", emptyDir:{}},
+                      {name:"agent-cache", emptyDir:{}},
+                      {name:"agent-local", emptyDir:{}},
+                      {name:"dev-tools", configMap:{name:"dev-tools", defaultMode:493}} ]
+                  | .spec.template.spec.containers[0].volumeMounts += [
+                      {name:"node-creds", mountPath:"/home/gradle/.config/tea/config.yml", subPath:"tea-config.yml", readOnly:true},
+                      {name:"node-creds", mountPath:"/home/gradle/.config/vikunja-cli/config.toml", subPath:"vikunja-config.toml", readOnly:true},
+                      {name:"node-creds", mountPath:"/home/gradle/.gitconfig", subPath:"gitconfig", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-git/credentials", subPath:"git-credentials", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-loki/username", subPath:"loki-username", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-loki/password", subPath:"loki-password", readOnly:true},
+                      {name:"agent-workspace", mountPath:"/home/gradle/pr"},
+                      {name:"agent-cache", mountPath:"/home/gradle/.cache"},
+                      {name:"agent-local", mountPath:"/home/gradle/.local"},
+                      {name:"dev-tools", mountPath:"/usr/local/bin/vik", subPath:"vik", readOnly:true},
+                      {name:"dev-tools", mountPath:"/usr/local/bin/pr", subPath:"pr", readOnly:true},
+                      {name:"dev-tools", mountPath:"/usr/local/bin/citest", subPath:"citest", readOnly:true} ]
+                  | .spec.template.spec.initContainers += [{
+                      name:"clone-pr", image:$img, imagePullPolicy:"Always",
+                      command:["sh","-c"],
+                      args:["set -eu; export HOME=/home/gradle; cd /home/gradle/pr; find . -mindepth 1 -delete 2>/dev/null || true; git clone " + $repo + " . && git checkout " + $branch + " && echo cloned " + $repo + " on " + $branch],
+                      volumeMounts:[
+                        {name:"agent-workspace", mountPath:"/home/gradle/pr"},
+                        {name:"node-creds", mountPath:"/home/gradle/.gitconfig", subPath:"gitconfig", readOnly:true},
+                        {name:"node-creds", mountPath:"/etc/turnstone-git/credentials", subPath:"git-credentials", readOnly:true} ]
+                    }]
+                ' | kubectl apply -f -
+              cat <<SVC | kubectl apply -f -
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: ${NODE}
+                namespace: turnstone
+                labels:
+                  app.kubernetes.io/instance: ${NODE}
+                  apl.io/ephemeral: "true"
+              spec:
+                selector:
+                  app.kubernetes.io/instance: ${NODE}
+                ports:
+                  - {name: http, port: 8080, targetPort: 8080}
+              SVC
+              kubectl -n turnstone rollout status deploy/${NODE} --timeout=240s
+              echo "DEV NODE READY: ${NODE} (ticket #${TICKET}, ${BRANCH})"
+    - name: ensure-persona
+      runAfter: [dedupe]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}]
+      taskSpec:
+        params: [{name: team}]
+        steps:
+          - name: upsert
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              # Upsert this team's "The Developer (<team>)" persona (idempotent) so bootstrap can
+              # pin the workstream to it. Uses the broker-admin-pat as a bearer, same as the
+              # po-desk create-persona task. Non-fatal on a missing PAT.
+              set -eu
+              TEAM="$(params.team)"; DOMAIN="{{ .Values.domain }}"
+              PAT=$(kubectl get secret broker-admin-pat -n turnstone -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+              if [ -z "$PAT" ]; then echo "no broker-admin-pat -- skipping dev persona (bootstrap will fail without it)"; exit 0; fi
+              PROMPT=$(kubectl get configmap dev-persona -o jsonpath='{.data.prompt}' | sed "s/__TEAM__/${TEAM}/g")
+              [ -n "$PROMPT" ] || { echo "empty dev-persona prompt"; exit 1; }
+              NAME="the-developer-${TEAM}"; API="https://turnstone.${DOMAIN}/v1/api/admin"
+              BODY=$(jq -n --arg n "$NAME" --arg t "$TEAM" --arg p "$PROMPT" \
+                '{name:$n,display_name:("The Developer ("+$t+")"),description:("Autonomous dev agent for the "+$t+" team -- team-aware."),base_prompt:$p,tool_allowlist:["bash","read_file","search","skills"],mcp_enabled:false,memory_enabled:true,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
+              PID=$(curl -sk --max-time 15 -H "Authorization: Bearer $PAT" "$API/personas" | jq -r --arg n "$NAME" '(.personas // .)[]? | select(.name==$n) | .persona_id' 2>/dev/null | head -1)
+              if [ -z "$PID" ]; then
+                H=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' "$API/personas" -d "$BODY")
+                echo "created persona $NAME -> HTTP $H"
+              else
+                PATCHBODY=$(printf '%s' "$BODY" | jq 'del(.name, .applies_to_kinds, .enabled)')
+                H=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X PATCH -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' "$API/personas/$PID" -d "$PATCHBODY")
+                echo "updated persona $NAME ($PID) -> HTTP $H"
+              fi
+    - name: bootstrap-workstream
+      runAfter: [create-node, ensure-persona, open-pr]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["no"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: repoFullName, value: $(params.repoFullName)}, {name: assignedToAgent, value: $(params.assignedToAgent)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: repoFullName}, {name: assignedToAgent}]
+        steps:
+          - name: boot
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; DOMAIN="{{ .Values.domain }}"
+              NS="team-${TEAM}"; NODE="${TEAM}-tk${TICKET}-agent"; WL="app-tk${TICKET}"
+              # Target the node's OWN console-proxy path so the workstream is created ON this node
+              # (not a random node via rendezvous hashing -- AGENT-ENVIRONMENTS.md §6).
+              API="https://turnstone.${DOMAIN}/node/${NODE}/v1/api"
+              PAT=$(kubectl get secret broker-admin-pat -n turnstone -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+              [ -n "$PAT" ] || { echo "no broker-admin-pat -- cannot bootstrap workstream"; exit 1; }
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              T=$(curl -sk --max-time 15 "https://vikunja.${DOMAIN}/api/v1/tasks/${TICKET}" -H "Authorization: Bearer $VT")
+              TITLE=$(printf '%s' "$T" | jq -r '.title // ""')
+              DESC=$(printf '%s' "$T" | jq -r '.description // ""' | sed 's/<[^>]*>//g')
+              # The node pod is Ready (create-node waited on rollout), but its turnstone-server API /
+              # console-proxy route can lag pod-readiness by a few seconds. Creating the workstream then
+              # immediately sending its kickoff RACED that gap: create succeeded but `send` failed under
+              # set -eu, aborting before the message landed AND before the annotation -- leaving an empty
+              # idle workstream ("agent never starts"). Fix: poll the node API until it answers, create
+              # once (retry until we get a ws_id), annotate IMMEDIATELY (so /rework can find it even if
+              # send lags), then retry the send until it lands.
+              i=0
+              until [ "$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "$API/workstreams" -H "Authorization: Bearer $PAT" 2>/dev/null)" = "200" ]; do
+                i=$((i+1)); [ "$i" -ge 20 ] && { echo "warning: node API not 200 after ~120s -- proceeding anyway"; break; }; sleep 6
+              done
+              # Create the workstream pinned to this team's Developer persona + dev skill (retry to ride
+              # out any remaining readiness lag; only retry while we have NO ws_id, so never duplicated).
+              WS=""; j=0
+              while [ -z "$WS" ]; do
+                WS=$(curl -sk --max-time 30 -X POST "$API/workstreams/new" -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' \
+                  -d "$(jq -n --arg p "the-developer-${TEAM}" --arg n "ticket-${TICKET}" '{persona:$p, skill:"dev", name:$n}')" | jq -r '.ws_id // empty')
+                [ -n "$WS" ] && break
+                j=$((j+1)); [ "$j" -ge 6 ] && { echo "workstream create failed after retries"; exit 1; }; sleep 5
+              done
+              # Record the ws id on the deploy NOW, before the (retryable) send -- so /rework works even
+              # if the kickoff send takes a couple of tries.
+              kubectl annotate deploy "$NODE" -n turnstone "apl.io/dev-ws-id=$WS" --overwrite
+              LINK="https://turnstone.${DOMAIN}/node/${NODE}/?ws_id=${WS}"
+              PREVIEW="https://${WL}-${TEAM}.${DOMAIN}"
+              # The message depends on assignment: an agent-assigned ticket gets the KICKOFF (start
+              # working); anything else gets a STANDBY seed -- the workstream is AWARE of the ticket so a
+              # human can drive it from the Turnstone UI, but it must NOT start on its own. A later
+              # assignment is picked up by the activate-agent task, which sends the kickoff then.
+              AGT="$(params.assignedToAgent)"
+              if [ "$AGT" = "true" ]; then
+                MSG=$(jq -n --arg t "$TICKET" --arg title "$TITLE" --arg d "$DESC" --arg link "$LINK" --arg pv "$PREVIEW" \
+                  '{message:("You are working ticket #"+$t+": "+$title+"\n\n"+$d+"\n\nYour branch (ticket-"+$t+"), a draft PR, and a live preview at "+$pv+" already exist. Session link for humans: "+$link+"\n\nStart with the feasibility check, then implement, citest, and push.")}')
+              else
+                MSG=$(jq -n --arg t "$TICKET" --arg team "$TEAM" --arg title "$TITLE" --arg d "$DESC" --arg link "$LINK" --arg pv "$PREVIEW" \
+                  '{message:("Ticket #"+$t+": "+$title+"\n\n"+$d+"\n\nYour branch (ticket-"+$t+"), a draft PR, and a live preview at "+$pv+" already exist. Session link for humans: "+$link+"\n\nSTANDBY: this ticket is NOT assigned to you yet, so do NOT begin implementing. Take direction from the human in this session -- answer questions, discuss approach, make changes only when asked. When the ticket is assigned to agent-"+$team+" you will get an explicit go-ahead to work it end to end.")}')
+              fi
+              # Send the message -- retry until it actually lands (a failed send here is the exact bug
+              # that left the agent idle with no instructions).
+              k=0
+              while :; do
+                SC=$(curl -sk --max-time 30 -o /dev/null -w '%{http_code}' -X POST "$API/workstreams/${WS}/send" -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' -d "$MSG")
+                echo "message send -> HTTP ${SC:-000}"
+                [ "${SC:-0}" -ge 200 ] 2>/dev/null && [ "${SC:-0}" -lt 300 ] 2>/dev/null && break
+                k=$((k+1)); [ "$k" -ge 8 ] && { echo "warning: send never got 2xx (last ${SC:-000})"; break; }; sleep 5
+              done
+              # Record whether the agent has actually been started, so a later assignment (activate-agent)
+              # knows whether it still owes the kickoff. Only "true" once the agent has been told to work.
+              kubectl annotate deploy "$NODE" -n turnstone "apl.io/dev-kicked=$AGT" --overwrite
+              # UPDATE the single marked "Dev agent" comment (created by the announce task) to the
+              # ready state -- so it evolves in place (on-it -> ready+links -> the agent's own
+              # status/handback), never a second comment. Matched by author (agent) + hidden marker,
+              # the exact same convention `vik status` uses on the node.
+              VAPI="https://vikunja.${DOMAIN}/api/v1"
+              # Resolve the PR now so the ticket's own comment links it (the ticket<->PR cross-link).
+              RFN="$(params.repoFullName)"; GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              GAPI="https://gitea.${DOMAIN}/api/v1"
+              PRN=$(curl -sk --max-time 15 "$GAPI/repos/$RFN/pulls?state=open" -H "Authorization: token $GT" | jq -r --arg b "ticket-${TICKET}" '[.[]?|select(.head.ref==$b)][0].number // empty')
+              PRURL="https://gitea.${DOMAIN}/${RFN}/pulls/${PRN}"
+              _PRLINK=""; [ -n "$PRN" ] && _PRLINK=" &middot; <a href=\"${PRURL}\">PR #${PRN}</a>"
+              if [ "$AGT" = "true" ]; then _STATE="Environment ready &mdash; assessing the ticket now."
+              else _STATE="Environment ready. This ticket is not assigned to the agent, so it is on standby &mdash; assign it to <code>agent-${TEAM}</code> to have the agent work it, or steer it yourself from the session."; fi
+              READY=$(jq -rn --arg link "$LINK" --arg pv "$PREVIEW" --arg st "$_STATE" --arg pr "$_PRLINK" '"<blockquote><p>🤖 <strong>Dev agent</strong></p><p>"+$st+"</p><p><a href=\""+$link+"\">Watch / steer this session</a> &middot; <a href=\""+$pv+"\">Live preview</a>"+$pr+"</p></blockquote><!-- dev-agent -->"')
+              ME=$(curl -sk --max-time 15 "$VAPI/user" -H "Authorization: Bearer $VT" | jq -r '.id // 0')
+              CID=$(curl -sk --max-time 15 "$VAPI/tasks/$TICKET/comments" -H "Authorization: Bearer $VT" | jq -r --argjson me "$ME" '[.[]?|select(.author.id==$me and (.comment|contains("<!-- dev-agent -->")))][0].id // empty')
+              if [ -n "$CID" ]; then
+                curl -sk --max-time 15 -o /dev/null -w "ticket ready-comment update -> %{http_code}\n" -X POST "$VAPI/tasks/$TICKET/comments/$CID" -H "Authorization: Bearer $VT" -H 'Content-Type: application/json' -d "$(jq -n --arg c "$READY" '{comment:$c}')"
+              else
+                curl -sk --max-time 15 -o /dev/null -w "ticket ready-comment create -> %{http_code}\n" -X PUT "$VAPI/tasks/$TICKET/comments" -H "Authorization: Bearer $VT" -H 'Content-Type: application/json' -d "$(jq -n --arg c "$READY" '{comment:$c}')"
+              fi
+              # Add the live session + preview links to the PR description. open-pr ran before the
+              # workstream existed, so the PR body couldn't carry the ws link at creation -- append it
+              # here now that we have the ws_id. (PR body renders markdown.)
+              RFN="$(params.repoFullName)"; GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              GAPI="https://gitea.${DOMAIN}/api/v1"
+              PRN=$(curl -sk --max-time 15 "$GAPI/repos/$RFN/pulls?state=open" -H "Authorization: token $GT" | jq -r --arg b "ticket-${TICKET}" '[.[]?|select(.head.ref==$b)][0].number // empty')
+              if [ -n "$PRN" ]; then
+                OLDBODY=$(curl -sk --max-time 15 "$GAPI/repos/$RFN/pulls/$PRN" -H "Authorization: token $GT" | jq -r '.body // ""')
+                NEWBODY=$(printf '%s\n\n---\n🤖 **Live agent session:** [open](%s) &middot; **Live preview:** %s' "$OLDBODY" "$LINK" "$PREVIEW")
+                curl -sk --max-time 15 -o /dev/null -w "PR #$PRN session link -> %{http_code}\n" -X PATCH "$GAPI/repos/$RFN/pulls/$PRN" -H "Authorization: token $GT" -H 'Content-Type: application/json' -d "$(jq -n --arg b "$NEWBODY" '{body:$b}')"
+              fi
+              echo "BOOTSTRAPPED ws ${WS} on ${NODE}"
+    - name: activate-agent
+      # Re-provision path (env ALREADY exists): if the ticket has just been assigned to the agent while
+      # its env was created idle (standby), send the kickoff now and flip apl.io/dev-kicked. Guarded by
+      # that annotation so repeated reconciles never re-kick. A FRESH provision is handled by
+      # bootstrap-workstream above; this only runs when the env already exists (exists=yes).
+      runAfter: [dedupe]
+      when: [{input: "$(tasks.dedupe.results.exists)", operator: in, values: ["yes"]}]
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: assignedToAgent, value: $(params.assignedToAgent)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: assignedToAgent}]
+        steps:
+          - name: activate
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; AGT="$(params.assignedToAgent)"; DOMAIN="{{ .Values.domain }}"
+              NS="team-${TEAM}"; NODE="${TEAM}-tk${TICKET}-agent"; WL="app-tk${TICKET}"
+              [ "$AGT" = "true" ] || { echo "not assigned to agent -- workstream stays on standby"; exit 0; }
+              kubectl get deploy "$NODE" -n turnstone >/dev/null 2>&1 || { echo "no node ${NODE} -- nothing to activate"; exit 0; }
+              KICKED=$(kubectl get deploy "$NODE" -n turnstone -o jsonpath='{.metadata.annotations.apl\.io/dev-kicked}' 2>/dev/null || true)
+              [ "$KICKED" = "true" ] && { echo "agent already started on ${NODE} -- no re-kick"; exit 0; }
+              WS=$(kubectl get deploy "$NODE" -n turnstone -o jsonpath='{.metadata.annotations.apl\.io/dev-ws-id}' 2>/dev/null || true)
+              [ -n "$WS" ] || { echo "no ws_id on ${NODE} -- cannot activate yet"; exit 0; }
+              PAT=$(kubectl get secret broker-admin-pat -n turnstone -o jsonpath='{.data.token}' | base64 -d)
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              API="https://turnstone.${DOMAIN}/node/${NODE}/v1/api"
+              LINK="https://turnstone.${DOMAIN}/node/${NODE}/?ws_id=${WS}"; PREVIEW="https://${WL}-${TEAM}.${DOMAIN}"
+              T=$(curl -sk --max-time 15 "https://vikunja.${DOMAIN}/api/v1/tasks/${TICKET}" -H "Authorization: Bearer $VT")
+              TITLE=$(printf '%s' "$T" | jq -r '.title // ""'); DESC=$(printf '%s' "$T" | jq -r '.description // ""' | sed 's/<[^>]*>//g')
+              MSG=$(jq -n --arg t "$TICKET" --arg title "$TITLE" --arg d "$DESC" \
+                '{message:("You are now ASSIGNED ticket #"+$t+": "+$title+" -- go ahead and work it end to end.\n\n"+$d+"\n\nStart with the feasibility check, then implement, citest, and push.")}')
+              k=0; while :; do
+                SC=$(curl -sk --max-time 30 -o /dev/null -w '%{http_code}' -X POST "$API/workstreams/${WS}/send" -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' -d "$MSG")
+                echo "activation send -> HTTP ${SC:-000}"
+                [ "${SC:-0}" -ge 200 ] 2>/dev/null && [ "${SC:-0}" -lt 300 ] 2>/dev/null && break
+                k=$((k+1)); [ "$k" -ge 6 ] && { echo "warning: activation send never got 2xx"; break; }; sleep 5
+              done
+              kubectl annotate deploy "$NODE" -n turnstone "apl.io/dev-kicked=true" --overwrite
+              VAPI="https://vikunja.${DOMAIN}/api/v1"
+              WORKING=$(jq -rn --arg link "$LINK" --arg pv "$PREVIEW" '"<blockquote><p>🤖 <strong>Dev agent</strong></p><p>Assigned &mdash; the agent is now working this ticket.</p><p><a href=\""+$link+"\">Watch / steer</a> &middot; <a href=\""+$pv+"\">Live preview</a></p></blockquote><!-- dev-agent -->"')
+              ME=$(curl -sk --max-time 15 "$VAPI/user" -H "Authorization: Bearer $VT" | jq -r '.id // 0')
+              CID=$(curl -sk --max-time 15 "$VAPI/tasks/$TICKET/comments" -H "Authorization: Bearer $VT" | jq -r --argjson me "$ME" '[.[]?|select(.author.id==$me and (.comment|contains("<!-- dev-agent -->")))][0].id // empty')
+              [ -n "$CID" ] && curl -sk --max-time 15 -o /dev/null -X POST "$VAPI/tasks/$TICKET/comments/$CID" -H "Authorization: Bearer $VT" -H 'Content-Type: application/json' -d "$(jq -n --arg c "$WORKING" '{comment:$c}')"
+              echo "ACTIVATED agent on ${NODE} (ws ${WS})"
+---
+# teardown-dev-env: fired by the reconcile on a Done/regression/removed transition, OR by the
+# agent's own hand-back (which moves the ticket out of Doing). Removes the whole environment.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: teardown-dev-env
+spec:
+  params:
+    - name: team
+    - name: ticket
+    - name: repoFullName
+      default: ""
+  tasks:
+    - name: teardown
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: repoFullName, value: $(params.repoFullName)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: repoFullName}]
+        steps:
+          - name: destroy
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; RFN="$(params.repoFullName)"; DOMAIN="{{ .Values.domain }}"
+              NS="team-${TEAM}"; NODE="${TEAM}-tk${TICKET}-agent"; WL="app-tk${TICKET}"; BRANCH="ticket-${TICKET}"
+              LEASE="dev-lease-${TEAM}-tk${TICKET}"
+              # Release the provision lease FIRST, unconditionally -- even if the node never came up. A
+              # provision that failed after acquiring the lease but before create-node would otherwise
+              # wedge re-provision forever (lease held, node absent). Clearing it here lets moving the
+              # ticket out of Doing and back re-provision cleanly.
+              kubectl delete configmap "$LEASE" -n turnstone --ignore-not-found >/dev/null 2>&1 || true
+              if ! kubectl get deploy "$NODE" -n turnstone >/dev/null 2>&1; then
+                echo "no env for ticket ${TICKET} (${NODE} absent) -- lease released, teardown is a no-op"; exit 0
+              fi
+              # apl-api token to delete the preview objects, as agent-<team>.
+              AU=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.agent-username}' | base64 -d)
+              AP=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.agent-password}' | base64 -d)
+              CID=$(kubectl get secret oauth2-proxy-client-access -n istio-system -o jsonpath='{.data.client-id}' | base64 -d)
+              CS=$(kubectl get secret oauth2-proxy-client-access -n istio-system -o jsonpath='{.data.client-secret}' | base64 -d)
+              TOK=$(curl -sk --max-time 15 "https://keycloak.${DOMAIN}/realms/otomi/protocol/openid-connect/token" \
+                --data-urlencode grant_type=password --data-urlencode client_id="$CID" --data-urlencode client_secret="$CS" \
+                --data-urlencode username="$AU" --data-urlencode password="$AP" --data-urlencode scope=openid | jq -r '.access_token // empty')
+              API="https://console.${DOMAIN}/api"
+              if [ -n "$TOK" ]; then
+                for kind in services workloads builds; do
+                  curl -sk --max-time 20 -o /dev/null -w "delete $kind/$WL -> HTTP %{http_code}\n" -X DELETE "$API/v2/teams/$TEAM/$kind/$WL" -H "Authorization: Bearer $TOK" || true
+                done
+              else
+                echo "warning: no apl-api token -- preview objects not deleted (will need manual cleanup)"
+              fi
+              # Close the PR (find it by head branch) and delete the branch, via Gitea API.
+              if [ -n "$RFN" ]; then
+                GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+                OWNER="team-${TEAM}"
+                PRN=$(curl -sk --max-time 15 "https://gitea.${DOMAIN}/api/v1/repos/${RFN}/pulls?state=open" -H "Authorization: token $GT" \
+                  | jq -r --arg b "$BRANCH" '.[] | select(.head.ref==$b) | .number' | head -1)
+                [ -n "$PRN" ] && curl -sk --max-time 15 -o /dev/null -X PATCH "https://gitea.${DOMAIN}/api/v1/repos/${RFN}/pulls/${PRN}" -H "Authorization: token $GT" -H 'Content-Type: application/json' -d '{"state":"closed"}' && echo "closed PR #${PRN}"
+                curl -sk --max-time 15 -o /dev/null -X DELETE "https://gitea.${DOMAIN}/api/v1/repos/${RFN}/branches/${BRANCH}" -H "Authorization: token $GT" && echo "deleted branch ${BRANCH}" || true
+                # Deleting the per-PR build makes apl-gitea-operator reconcile this repo's webhooks
+                # again -- and that DELETES the repo-level workflow_job hook (same clobber as on
+                # create). Harmless if this was the repo's only PR, but if another ticket still has an
+                # open PR its CI would silently stop getting runners. So wait (bounded) for the delete
+                # clobber (push hook gone), then re-ensure the workflow_job hook. Best-effort.
+                WJURL="http://el-gitea-workflowjob-${TEAM}.team-${TEAM}.svc.cluster.local:8080/"
+                ICURL="http://el-dev-agent.team-${TEAM}.svc.cluster.local:8080"   # /rework,/resolve sink
+                HOOKS="https://gitea.${DOMAIN}/api/v1/repos/${RFN}/hooks"
+                PUSHMATCH="el-gitea-webhook-app-tk${TICKET}"
+                i=0; while [ "$i" -lt 12 ]; do curl -sk --max-time 15 "$HOOKS?limit=50" -H "Authorization: token $GT" | grep -qF "$PUSHMATCH" || break; i=$((i+1)); sleep 10; done
+                # Re-ensure BOTH the workflow_job (CI) and issue_comment (/rework,/resolve) hooks -- the
+                # delete-clobber removes both, and another ticket's PR may still need them.
+                if curl -sk --max-time 15 "$HOOKS?limit=50" -H "Authorization: token $GT" | grep -qF "$WJURL"; then
+                  echo "workflow_job hook still present after teardown"
+                else
+                  curl -sk --max-time 20 -o /dev/null -w "restored workflow_job hook post-teardown -> HTTP %{http_code}\n" -X POST "$HOOKS" \
+                    -H "Authorization: token $GT" -H "Content-Type: application/json" \
+                    -d "$(jq -n --arg url "$WJURL" '{type:"gitea",active:true,events:["workflow_job"],config:{url:$url,content_type:"json"}}')" || true
+                fi
+                if curl -sk --max-time 15 "$HOOKS?limit=50" -H "Authorization: token $GT" | grep -qF "$ICURL"; then
+                  echo "issue_comment hook still present after teardown"
+                else
+                  curl -sk --max-time 20 -o /dev/null -w "restored issue_comment hook post-teardown -> HTTP %{http_code}\n" -X POST "$HOOKS" \
+                    -H "Authorization: token $GT" -H "Content-Type: application/json" \
+                    -d "$(jq -n --arg url "$ICURL" '{type:"gitea",active:true,events:["issue_comment","pull_request_comment","pull_request"],config:{url:$url,content_type:"json"}}')" || true
+                fi
+              fi
+              kubectl delete deploy,svc -n turnstone -l app.kubernetes.io/instance=${NODE} --ignore-not-found
+              echo "DEV ENV TORN DOWN: ticket #${TICKET} (${NODE}, ${WL}, ${BRANCH})"
+---
+# rework-dev: a /rework or /resolve PR comment (forwarded by the team-side chart, which maps the PR
+# back to its ticket via the machine tag) is injected into the node's live workstream. Fire-and-
+# forget: the human watches the agent respond on the PR / the session link. If the workstream has
+# idle-closed (120 min), fork a fresh one (resume_ws copies history), re-annotate, and repost the link.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: rework-dev
+spec:
+  params:
+    - name: team
+    - name: ticket
+    - name: comment
+  tasks:
+    - name: send
+      params: [{name: team, value: $(params.team)}, {name: ticket, value: $(params.ticket)}, {name: comment, value: $(params.comment)}]
+      taskSpec:
+        params: [{name: team}, {name: ticket}, {name: comment}]
+        steps:
+          - name: send
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; TICKET="$(params.ticket)"; DOMAIN="{{ .Values.domain }}"
+              NODE="${TEAM}-tk${TICKET}-agent"; API="https://turnstone.${DOMAIN}/node/${NODE}/v1/api"
+              if ! kubectl get deploy "$NODE" -n turnstone >/dev/null 2>&1; then
+                echo "no dev node for ticket ${TICKET} (${NODE}) -- ignoring /rework"; exit 0
+              fi
+              PAT=$(kubectl get secret broker-admin-pat -n turnstone -o jsonpath='{.data.token}' | base64 -d)
+              WS=$(kubectl get deploy "$NODE" -n turnstone -o jsonpath='{.metadata.annotations.apl\.io/dev-ws-id}' 2>/dev/null || true)
+              MSG=$(jq -n --arg c "$(params.comment)" '{message:$c}')
+              CODE=000
+              if [ -n "$WS" ]; then
+                CODE=$(curl -sk --max-time 30 -o /dev/null -w '%{http_code}' -X POST "$API/workstreams/${WS}/send" -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' -d "$MSG")
+                echo "send to ws ${WS} -> HTTP ${CODE}"
+              fi
+              if [ -z "$WS" ] || [ "$CODE" = "404" ]; then
+                # workstream gone (idle-closed) -- fork a fresh one carrying the old history.
+                NEW=$(curl -sk --max-time 30 -X POST "$API/workstreams/new" -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' \
+                  -d "$(jq -n --arg p "the-developer-${TEAM}" --arg n "ticket-${TICKET}" --arg r "$WS" '{persona:$p, skill:"dev", name:$n} + (if $r=="" then {} else {resume_ws:$r} end)')" | jq -r '.ws_id // empty')
+                [ -n "$NEW" ] || { echo "could not re-create workstream"; exit 1; }
+                kubectl annotate deploy "$NODE" -n turnstone "apl.io/dev-ws-id=$NEW" --overwrite
+                curl -sk --max-time 30 -o /dev/null -w 'send to fresh ws -> HTTP %{http_code}\n' -X POST "$API/workstreams/${NEW}/send" -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' -d "$MSG"
+                echo "re-created workstream ${NEW}; new session link: https://turnstone.${DOMAIN}/node/${NODE}/?ws_id=${NEW}"
+              fi

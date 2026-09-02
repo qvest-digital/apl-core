@@ -1,0 +1,15 @@
+# Zero-config for the standard (seed) setup:
+#   * team         is taken from the namespace this deploys into (team-<id>)
+#   * review node  is <team>-review-agent in the turnstone namespace
+#   * project      to watch is the team's "<team>" Vikunja project (auto-resolved)
+#
+# Optional overrides:
+#   team: other-team           # act as another team's agent identity
+#   projectId: "5"             # watch a specific Vikunja project id instead of auto-resolving
+#   reviewNode: host:port      # point at a specific review node service
+domain: __DOMAIN__
+vikunjaUrl: https://vikunja.__DOMAIN__
+# Repos the standing review node clones (space-separated <org>/<repo>) so the desk/coach can read
+# the code. Default is the whole Bookinfo app so any team's desk can reason across services; a
+# non-demo team can override with just its own repo(s).
+repos: "team-prodpage/productpage team-details/details team-reviews/reviews team-ratings/ratings"

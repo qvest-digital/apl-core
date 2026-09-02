@@ -1,0 +1,128 @@
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: dev-agent-vikunja
+spec:
+  params:
+    - {name: taskId, value: $(body.data.task.id)}
+    - {name: event,  value: $(body.event_name)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: dev-agent-comment
+spec:
+  params:
+    - {name: pr,           value: $(body.issue.number)}
+    - {name: comment,      value: $(body.comment.body)}
+    - {name: repoFullName, value: $(body.repository.full_name)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: dev-agent-reconcile
+spec:
+  params: [{name: taskId}, {name: event}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: reconcile-ticket-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        # runs under a dedicated SA that CAN manage the per-ticket prevBucket ConfigMap (the team
+        # default SA cannot) -- see reconcile-rbac.yaml.
+        taskRunTemplate: {serviceAccountName: dev-agent-reconcile}
+        pipelineRef: {name: reconcile-ticket}
+        params:
+          - {name: taskId, value: $(tt.params.taskId)}
+          - {name: event,  value: $(tt.params.event)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: dev-agent-rework
+spec:
+  params: [{name: pr}, {name: comment}, {name: repoFullName}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: rework-forward-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        pipelineRef: {name: rework-forward}
+        params:
+          - {name: pr,           value: $(tt.params.pr)}
+          - {name: comment,      value: $(tt.params.comment)}
+          - {name: repoFullName, value: $(tt.params.repoFullName)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: dev-agent-pr
+spec:
+  params:
+    - {name: pr,           value: $(body.number)}
+    - {name: repoFullName, value: $(body.repository.full_name)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: dev-agent-complete
+spec:
+  params: [{name: pr}, {name: repoFullName}]
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: complete-ticket-
+        labels: {sidecar.istio.io/inject: "false"}
+      spec:
+        pipelineRef: {name: complete-ticket}
+        params:
+          - {name: pr,           value: $(tt.params.pr)}
+          - {name: repoFullName, value: $(tt.params.repoFullName)}
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: dev-agent
+spec:
+  serviceAccountName: tekton-triggers-{{ .Release.Namespace }}
+  triggers:
+    # Vikunja: any assignee/bucket change on the team's project -> reconcile the ticket's env.
+    - name: ticket-reconcile
+      interceptors:
+        - ref: {name: cel}
+          params:
+            - name: filter
+              value: >-
+                body.event_name in ['task.assignee.created','task.updated','task.assignee.deleted']
+      bindings: [{ref: dev-agent-vikunja}]
+      template: {ref: dev-agent-reconcile}
+    # Gitea: a /rework or /resolve comment on a PR -> forward it to the node's workstream.
+    - name: pr-rework
+      interceptors:
+        - ref: {name: cel}
+          params:
+            - name: filter
+              value: >-
+                header.match('X-Gitea-Event','issue_comment') &&
+                body.action == 'created' &&
+                body.issue.pull_request != null &&
+                (body.comment.body.startsWith('/rework') || body.comment.body.startsWith('/resolve'))
+      bindings: [{ref: dev-agent-comment}]
+      template: {ref: dev-agent-rework}
+    # Gitea: a dev-bot PR was MERGED -> mark its ticket done + retire the environment.
+    - name: pr-merged
+      interceptors:
+        - ref: {name: cel}
+          params:
+            - name: filter
+              value: >-
+                header.match('X-Gitea-Event','pull_request') &&
+                body.action == 'closed' &&
+                body.pull_request.merged == true
+      bindings: [{ref: dev-agent-pr}]
+      template: {ref: dev-agent-complete}

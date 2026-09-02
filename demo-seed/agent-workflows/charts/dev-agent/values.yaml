@@ -1,0 +1,19 @@
+# Ticket-driven dev bot. No configuration needed for the standard (seed) setup:
+#   * team    is taken from the namespace this deploys into (team-<id>)
+#   * repo    to watch is auto-detected (the team's single Gitea repo)
+#   * project is the team's Vikunja project (title == team id)
+#
+# How it works: assign the team's agent user to a Vikunja ticket AND move it to the "Doing" bucket.
+# That spawns an ephemeral environment for the ticket -- a branch, a draft PR, a live preview
+# (visible in the Console under Container Images / Workloads / Services), and an agent node that
+# implements it. Move the ticket out of Doing (or unassign) to tear it all down. Comment /rework
+# <feedback> or /resolve on the PR to steer the agent.
+brokerSink: http://el-node-broker.team-admin.svc.cluster.local:8080
+giteaUrl: https://gitea.__DOMAIN__
+vikunjaUrl: https://vikunja.__DOMAIN__
+domain: __DOMAIN__
+toolImage: alpine/k8s:1.30.0
+# Optional overrides:
+# team: other-team
+# repo: some-repo
+# project: some-project

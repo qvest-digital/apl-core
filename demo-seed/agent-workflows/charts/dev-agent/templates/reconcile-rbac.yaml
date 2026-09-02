@@ -1,0 +1,28 @@
+# The reconcile-ticket PipelineRun keeps a per-ticket prevBucket marker (ConfigMap dev-ticket-<n>) so
+# it can detect a Doing->To-Do regression. The team's default SA can't touch ConfigMaps, so give the
+# reconcile its own SA with exactly that grant (scoped to this team's namespace). The reconcile's EL
+# trigger sets the generated PipelineRun to run under this SA.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dev-agent-reconcile
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dev-agent-reconcile-state
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-agent-reconcile-state
+  namespace: {{ .Release.Namespace }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: dev-agent-reconcile-state}
+subjects:
+  - {kind: ServiceAccount, name: dev-agent-reconcile, namespace: {{ .Release.Namespace }}}

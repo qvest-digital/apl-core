@@ -1,0 +1,7 @@
+apiVersion: v2
+name: po-agent
+description: The Product Owner desk -- one install gives the team a standing self-updating review node (created via the broker) plus the ticket coach that drafts descriptions and acceptance criteria on Vikunja tickets.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+icon: data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iIzBlYTVlOSI+PHBhdGggZD0iTTQgM2gxNmEyIDIgMCAwMTIgMnYxMGEyIDIgMCAwMS0yIDJIOGwtNCA0VjVhMiAyIDAgMDEyLTJ6Ii8+PC9zdmc+

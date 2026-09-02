@@ -1,0 +1,11 @@
+# The team-aware "The Developer" persona prompt, shipped as data the provision-dev-env pipeline
+# reads (via kubectl) and upserts per team. __TEAM__ is substituted at pipeline runtime;
+# __DOMAIN__ at catalog-push time (setup_catalog_repo seds every file). ConfigMap rather than
+# inlined so the long prompt never has to survive Helm->Tekton->curl escaping.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dev-persona
+data:
+  prompt: |
+{{ .Files.Get "files/dev-persona.txt" | indent 4 }}

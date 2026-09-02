@@ -1,0 +1,13 @@
+# The team-aware "The Product Owner" persona prompt, shipped as data the
+# provision-review-node pipeline reads (via kubectl) and upserts per team. __TEAM__
+# is substituted at pipeline runtime; __DOMAIN__ is substituted at catalog-push time
+# (setup_catalog_repo seds every file). Kept as a ConfigMap rather than inlined in the
+# pipeline script so the long multi-line prompt never has to survive Helm->Tekton->curl
+# escaping.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: po-desk-persona
+data:
+  prompt: |
+{{ .Files.Get "files/po-desk-persona.txt" | indent 4 }}

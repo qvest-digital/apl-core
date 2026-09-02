@@ -1,0 +1,190 @@
+# reconcile-ticket: the team-side lifecycle gate. Fired by the team's Vikunja project webhook on
+# every assignee/bucket change. It maps the ticket's CURRENT bucket + assignee to a lifecycle action
+# and forwards it to the admin node-broker, which reconciles the actual environment idempotently:
+#   To-Do (fresh)  -> NO-OP          (nothing exists yet -- a ticket only gets an env once it's Doing)
+#   Doing          -> provision-dev  (env + draft PR; a human can drive the agent in the Turnstone UI,
+#                                     and the broker STARTS the agent automatically iff assignedToAgent)
+#   Doing -> To-Do -> teardown-dev   (regression: pulled back out of Doing -> close)
+#   Done / removed -> teardown-dev   (close)
+# So the ENV only ever opens in Doing; the assignee (assignedToAgent) then decides, separately, whether
+# the agent starts working or stays idle for a human to drive. Runs under the dev-agent-reconcile SA
+# (needs configmaps to keep the per-ticket prevBucket marker). Only the team's own tickets forward.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: reconcile-ticket
+spec:
+  params:
+    - name: taskId
+    - name: event
+  tasks:
+    - name: reconcile
+      params: [{name: taskId, value: $(params.taskId)}, {name: event, value: $(params.event)}]
+      taskSpec:
+        params: [{name: taskId}, {name: event}]
+        steps:
+          - name: gate
+            image: {{ .Values.toolImage }}
+            env:
+              - name: VT
+                valueFrom: {secretKeyRef: {name: agent-creds, key: vikunja-token}}
+              - name: GT
+                valueFrom: {secretKeyRef: {name: agent-creds, key: gitea-token}}
+            script: |
+              #!/bin/sh
+              set -eu
+              TID="$(params.taskId)"; EVENT="$(params.event)"
+              [ -n "$TID" ] && [ "$TID" != "<no value>" ] || { echo "no task id in payload -- ignoring"; exit 0; }
+              TEAM="{{ .Values.team | default (trimPrefix "team-" .Release.Namespace) }}"
+              DOMAIN="{{ .Values.domain }}"; VIK="{{ .Values.vikunjaUrl }}"
+              AGENT="agent-${TEAM}@${DOMAIN}"
+              TASK=$(curl -sk --max-time 15 "$VIK/api/v1/tasks/$TID" -H "Authorization: Bearer $VT")
+              PID=$(printf '%s' "$TASK" | jq -r '.project_id // empty')
+              DONE=$(printf '%s' "$TASK" | jq -r '.done // false')
+              [ -n "$PID" ] || { echo "task $TID has no project -- ignoring"; exit 0; }
+              VIEW=$(curl -sk --max-time 15 "$VIK/api/v1/projects/$PID/views" -H "Authorization: Bearer $VT" | jq -r '[.[]?|select(.view_kind=="kanban")][0].id // empty')
+              [ -n "$VIEW" ] || { echo "no kanban view for project $PID -- ignoring"; exit 0; }
+              # The BOARD endpoint (/views/<v>/tasks) returns buckets each with an embedded tasks[] --
+              # the ONLY place that reflects a UI drag. task.bucket_id and the /buckets endpoint do
+              # NOT (both read 0/empty for UI-placed tasks). Read the current bucket title AND the
+              # assignees from this single board fetch.
+              BOARD=$(curl -sk --max-time 15 "$VIK/api/v1/projects/$PID/views/$VIEW/tasks" -H "Authorization: Bearer $VT")
+              BTITLE=$(printf '%s' "$BOARD" | jq -r --arg t "$TID" 'first(.[]|select(any(.tasks[]?; (.id|tostring)==$t))|.title) // empty')
+              ASSIGNED=$(printf '%s' "$BOARD" | jq -r --arg t "$TID" --arg a "$AGENT" '[.[].tasks[]?|select((.id|tostring)==$t)|.assignees[]?|select(.username==$a)]|length')
+              # Resolve the team's repo (bookinfo repos are named by role, not team). The agent token
+              # lacks read:organization, so use /repos/search (which it CAN call) filtered by the team
+              # prefix, not /orgs/<org>/repos. Values.repo overrides.
+              REPO="{{ .Values.repo | default "" }}"
+              if [ -z "$REPO" ]; then
+                REPO=$(curl -sk --max-time 15 "https://gitea.${DOMAIN}/api/v1/repos/search?limit=50" -H "Authorization: token $GT" \
+                  | jq -r --arg p "team-${TEAM}/" 'first(.data[]?|.full_name|select(startswith($p))) // empty' | sed "s#^team-${TEAM}/##")
+              fi
+              [ -n "$REPO" ] || { echo "could not resolve a repo for team-${TEAM} -- set 'repo:' in values"; exit 1; }
+              RFN="team-${TEAM}/${REPO}"
+              # --- Lifecycle state machine (Doing = work, everything else closes or no-ops) ---
+              # The env ONLY opens in Doing. A fresh To-Do ticket is a no-op -- nothing exists to drive
+              # yet. Once in Doing the env + draft PR exist and the assignee decides whether the agent
+              # starts working (broker sends the kickoff iff assignedToAgent) or stays idle for a human.
+              # Closing on a move OUT of Doing back to To-Do ("regression") needs the PREVIOUS bucket,
+              # kept per-ticket in a team-ns ConfigMap -- written ONLY while an env exists (Doing).
+              NS="team-${TEAM}"; STATECM="dev-ticket-${TID}"
+              PREV=$(kubectl get configmap "$STATECM" -n "$NS" -o jsonpath='{.data.bucket}' 2>/dev/null || true)
+              if [ "${ASSIGNED:-0}" -ge 1 ]; then AGT="true"; else AGT="false"; fi
+              ACTION=""
+              if [ "$DONE" = "true" ]; then
+                ACTION="teardown-dev"          # ticket marked complete (incl. the PR-merge path) -> close
+              elif [ -z "$BTITLE" ]; then
+                ACTION="teardown-dev"          # ticket no longer on the board (removed/archived) -> close
+              elif [ "$BTITLE" = "Done" ]; then
+                ACTION="teardown-dev"          # done -> close (the PR-merge path sets Done, then this closes)
+              elif [ "$BTITLE" = "Doing" ]; then
+                ACTION="provision-dev"         # active lane -> open/keep env; assignee decides activation
+              elif [ "$PREV" = "Doing" ]; then
+                ACTION="teardown-dev"          # moved OUT of Doing back to To-Do -> regression, close
+              else
+                ACTION=""                      # fresh To-Do (no env yet) -> do nothing
+              fi
+              if [ -z "$ACTION" ]; then
+                echo "reconcile task $TID bucket='$BTITLE' prev='$PREV' -> no-op (env only opens in Doing)"
+                exit 0
+              fi
+              # Persist (or clear) the prevBucket marker for the next reconcile. Only Doing writes it
+              # (that's the only ACTION=provision-dev case), so PREV=Doing reliably means "had an env".
+              if [ "$ACTION" = "teardown-dev" ]; then
+                kubectl delete configmap "$STATECM" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
+              else
+                kubectl create configmap "$STATECM" -n "$NS" --from-literal=bucket="$BTITLE" \
+                  --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+              fi
+              BODY=$(jq -nc --arg a "$ACTION" --arg team "$TEAM" --arg t "$TID" --arg r "$RFN" --arg agt "$AGT" \
+                '{action:$a, team:$team, ticket:$t, repoFullName:$r, assignedToAgent:$agt}')
+              echo "reconcile task $TID bucket='$BTITLE' prev='$PREV' agent=$AGT -> $ACTION ($RFN)"
+              curl -sf --max-time 15 -X POST -H 'Content-Type: application/json' -d "$BODY" "{{ .Values.brokerSink }}"
+              echo "forwarded $ACTION (assignedToAgent=$AGT) for ticket $TID"
+---
+# rework-forward: a /rework or /resolve comment on a dev-bot PR. Maps the PR back to its ticket via
+# the head branch (ticket-<n>) and forwards the comment to the broker, which injects it into the
+# node's live workstream.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: rework-forward
+spec:
+  params:
+    - name: pr
+    - name: comment
+    - name: repoFullName
+  tasks:
+    - name: forward
+      params: [{name: pr, value: $(params.pr)}, {name: comment, value: $(params.comment)}, {name: repoFullName, value: $(params.repoFullName)}]
+      taskSpec:
+        params: [{name: pr}, {name: comment}, {name: repoFullName}]
+        steps:
+          - name: forward
+            image: {{ .Values.toolImage }}
+            env:
+              - name: GT
+                valueFrom: {secretKeyRef: {name: agent-creds, key: gitea-token}}
+            script: |
+              #!/bin/sh
+              set -eu
+              PR="$(params.pr)"; RFN="$(params.repoFullName)"; DOMAIN="{{ .Values.domain }}"
+              TEAM="{{ .Values.team | default (trimPrefix "team-" .Release.Namespace) }}"
+              REF=$(curl -sk --max-time 15 "https://gitea.${DOMAIN}/api/v1/repos/${RFN}/pulls/${PR}" -H "Authorization: token $GT" | jq -r '.head.ref // empty')
+              case "$REF" in
+                ticket-*) TICKET="${REF#ticket-}" ;;
+                *) echo "PR #$PR head '$REF' is not a dev-bot branch -- ignoring"; exit 0 ;;
+              esac
+              BODY=$(jq -nc --arg team "$TEAM" --arg t "$TICKET" --arg c "$(params.comment)" \
+                '{action:"rework", team:$team, ticket:$t, comment:$c}')
+              echo "rework PR #$PR (ticket $TICKET)"
+              curl -sf --max-time 15 -X POST -H 'Content-Type: application/json' -d "$BODY" "{{ .Values.brokerSink }}"
+              echo "forwarded rework for ticket $TICKET"
+---
+# complete-ticket: fired when a dev-bot PR is MERGED (by the agent or a human). Maps the PR back to
+# its ticket (head branch ticket-<n>), marks the Vikunja ticket done with a comment linking the now-
+# retired PR, and forwards teardown-dev so the environment closes. (Marking the ticket done also
+# fires the reconcile, which independently tears down -- teardown is idempotent, so this is safe.)
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: complete-ticket
+spec:
+  params:
+    - name: pr
+    - name: repoFullName
+  tasks:
+    - name: complete
+      params: [{name: pr, value: $(params.pr)}, {name: repoFullName, value: $(params.repoFullName)}]
+      taskSpec:
+        params: [{name: pr}, {name: repoFullName}]
+        steps:
+          - name: complete
+            image: {{ .Values.toolImage }}
+            env:
+              - name: GT
+                valueFrom: {secretKeyRef: {name: agent-creds, key: gitea-token}}
+              - name: VT
+                valueFrom: {secretKeyRef: {name: agent-creds, key: vikunja-token}}
+            script: |
+              #!/bin/sh
+              set -eu
+              PR="$(params.pr)"; RFN="$(params.repoFullName)"; DOMAIN="{{ .Values.domain }}"; VIK="{{ .Values.vikunjaUrl }}"
+              TEAM="{{ .Values.team | default (trimPrefix "team-" .Release.Namespace) }}"
+              P=$(curl -sk --max-time 15 "https://gitea.${DOMAIN}/api/v1/repos/${RFN}/pulls/${PR}" -H "Authorization: token $GT")
+              REF=$(printf '%s' "$P" | jq -r '.head.ref // empty')
+              PRURL=$(printf '%s' "$P" | jq -r '.html_url // empty')
+              case "$REF" in
+                ticket-*) TICKET="${REF#ticket-}" ;;
+                *) echo "PR #$PR head '$REF' is not a dev-bot branch -- ignoring"; exit 0 ;;
+              esac
+              # Comment on the ticket linking the retired PR (a distinct milestone comment -- NOT the
+              # agent's evolving status one), then mark the ticket done.
+              LINK="#${PR}"; [ -n "$PRURL" ] && LINK="<a href=\"${PRURL}\">#${PR}</a>"
+              CBODY="<blockquote><p>✅ <strong>Merged &amp; done.</strong> Pull request ${LINK} was merged, so this ticket is complete and its ephemeral environment has been retired.</p></blockquote>"
+              curl -sk --max-time 15 -o /dev/null -w "ticket #$TICKET merged-comment -> %{http_code}\n" -X PUT "$VIK/api/v1/tasks/${TICKET}/comments" -H "Authorization: Bearer $VT" -H 'Content-Type: application/json' -d "$(jq -n --arg c "$CBODY" '{comment:$c}')" || true
+              curl -sk --max-time 15 -o /dev/null -w "ticket #$TICKET set done -> %{http_code}\n" -X POST "$VIK/api/v1/tasks/${TICKET}" -H "Authorization: Bearer $VT" -H 'Content-Type: application/json' -d '{"done":true}' || true
+              # Explicitly tear the environment down (idempotent; the done->reconcile also does this).
+              BODY=$(jq -nc --arg team "$TEAM" --arg t "$TICKET" --arg r "$RFN" '{action:"teardown-dev", team:$team, ticket:$t, repoFullName:$r}')
+              curl -sf --max-time 15 -X POST -H 'Content-Type: application/json' -d "$BODY" "{{ .Values.brokerSink }}" || true
+              echo "completed ticket $TICKET from merged PR #$PR"

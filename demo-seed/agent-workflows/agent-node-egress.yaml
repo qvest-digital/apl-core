@@ -1,0 +1,43 @@
+# Agent-node egress containment (Istio). Applied by seed:turnstone-agents into the turnstone ns.
+#
+# Default-deny EXTERNAL egress for agent nodes ONLY: the Sidecar's workloadSelector matches
+# turnstone-node=tsnode, which is carried by the per-team agent/review nodes but NOT by the hub
+# (turnstone-server / turnstone-console), so the hub is untouched. Under REGISTRY_ONLY the node can
+# still reach every mesh-registry service -- and the platform already registers all its apps as
+# MESH_INTERNAL ServiceEntries (gitea, vikunja, harbor, keycloak, grafana, each team's app + its
+# ephemeral app-tk<n> preview) plus in-cluster services (Loki, Postgres) -- but arbitrary internet
+# is blocked. The one external destination the node genuinely needs is the LLM, added below as a
+# ServiceEntry. Net: a prompt-injected agent that reads a secret from the node cannot exfiltrate it.
+#
+# Enforced by the Envoy sidecar, so it needs no in-pod capabilities (unlike OpenShell, which cannot
+# create its user/network namespaces inside this hardened pod -- verified: unshare(CLONE_NEWUSER)
+# -> EPERM). Reversible: `kubectl delete sidecar agent-node-egress -n turnstone`.
+#
+# Residual (by design): REGISTRY_ONLY still permits in-cluster services, so this stops external
+# exfiltration but NOT internal lateral movement (e.g. a forged JWT to the console). That is a
+# separate, upstream concern -- asymmetric JWT + a scoped Postgres role -- not solved here.
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: agent-node-egress
+  namespace: turnstone
+spec:
+  workloadSelector:
+    labels:
+      turnstone-node: tsnode
+  egress:
+    - hosts: ["*/*"]
+  outboundTrafficPolicy:
+    mode: REGISTRY_ONLY
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: anthropic-api
+  namespace: turnstone
+spec:
+  hosts: [api.anthropic.com]
+  location: MESH_EXTERNAL
+  resolution: DNS
+  ports:
+    - {number: 443, name: https, protocol: TLS}

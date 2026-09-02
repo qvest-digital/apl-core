@@ -1,0 +1,353 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: provision-agent-node
+spec:
+  params:
+    - name: team
+    - name: pr
+    - name: branch
+    - name: sha
+    - name: repoFullName
+    - name: nodeImage
+      default: ""
+  tasks:
+    - name: copy-creds
+      params:
+        - {name: team, value: $(params.team)}
+      taskSpec:
+        params:
+          - {name: team}
+        steps:
+          - name: generate
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; DOMAIN="{{ .Values.domain }}"; NS="team-${TEAM}"
+              GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              # Loki tenant password is a per-team credential in monitoring, not the agent's -- read it here.
+              LP=$(kubectl get secret reverse-proxy-auth-config -n monitoring -o jsonpath='{.data.authn\.yaml}' \
+                   | base64 -d | grep -A1 "username: ${TEAM}$" | awk '/password:/{gsub(/'"'"'/,"",$2); print $2; exit}')
+              GUSER="agent-${TEAM}-$(echo "$DOMAIN" | tr '.' '-')"
+              mkdir -p /w
+              cat > /w/gitconfig <<GC
+              [credential]
+              	helper = "!f() { printf 'url=%s\n' \"\$(cat /etc/turnstone-git/credentials)\"; }; f"
+              [user]
+              	name = agent-${TEAM}
+              	email = agent-${TEAM}@${DOMAIN}
+              [http]
+              	sslVerify = false
+              [safe]
+              	directory = *
+              GC
+              printf 'https://%s:%s@gitea.%s' "$GUSER" "$GT" "$DOMAIN" > /w/git-credentials
+              cat > /w/tea-config.yml <<TC
+              logins:
+                  - name: ${TEAM}
+                    url: https://gitea.${DOMAIN}
+                    token: ${GT}
+                    default: true
+                    insecure: true
+                    user: ${GUSER}
+                    version_check: true
+              TC
+              printf 'url = "https://vikunja.%s"\ntoken = "%s"\n' "$DOMAIN" "$VT" > /w/vikunja-config.toml
+              printf '%s' "$TEAM" > /w/loki-username
+              printf '%s' "$LP" > /w/loki-password
+              kubectl create secret generic "agent-${TEAM}-creds" -n turnstone --from-file=/w \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "generated turnstone/agent-${TEAM}-creds from team-${TEAM}/agent-creds + loki tenant pw"
+    - name: create-node
+      runAfter: [copy-creds]
+      params:
+        - {name: team, value: $(params.team)}
+        - {name: pr, value: $(params.pr)}
+        - {name: branch, value: $(params.branch)}
+        - {name: sha, value: $(params.sha)}
+        - {name: repoFullName, value: $(params.repoFullName)}
+        - {name: nodeImage, value: $(params.nodeImage)}
+      taskSpec:
+        params:
+          - {name: team}
+          - {name: pr}
+          - {name: branch}
+          - {name: sha}
+          - {name: repoFullName}
+          - {name: nodeImage}
+        steps:
+          - name: create
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; PR="$(params.pr)"; BRANCH="$(params.branch)"; SHA="$(params.sha)"; REPO="https://gitea.{{ .Values.domain }}/$(params.repoFullName).git"
+              # Pin the checkout to the exact commit the webhook referenced, so a branch that moves
+              # between webhook delivery and node creation can't silently give us a newer commit.
+              # Fall back to the branch name if the payload carried no sha.
+              CHECKOUT="$SHA"; [ -n "$CHECKOUT" ] || CHECKOUT="$BRANCH"
+              DOMAIN="{{ .Values.domain }}"
+              NODE="${TEAM}-pr${PR}-agent"
+              if [ -n "$(params.nodeImage)" ]; then IMG="$(params.nodeImage)"; else IMG="harbor.${DOMAIN}/team-${TEAM}/ci-runner:main"; fi
+              CREDS="agent-${TEAM}-creds"
+              echo "provisioning ${NODE} from ${IMG}, branch ${BRANCH}"
+              kubectl get deploy turnstone-server -n turnstone -o json | jq \
+                --arg node "$NODE" --arg img "$IMG" --arg branch "$BRANCH" --arg checkout "$CHECKOUT" --arg repo "$REPO" --arg creds "$CREDS" '
+                  .metadata = {name:$node, namespace:"turnstone", labels:{"app.kubernetes.io/instance":$node,"app.kubernetes.io/name":"turnstone","turnstone-node":"tsnode","apl.io/ephemeral":"true"}}
+                  | del(.status)
+                  | .spec.replicas = 1
+                  | .spec.selector.matchLabels = {"app.kubernetes.io/instance":$node}
+                  | .spec.template.metadata = {labels:{"app.kubernetes.io/instance":$node,"app.kubernetes.io/name":"turnstone","turnstone-node":"tsnode"}}
+                  | .spec.template.spec.containers[0].env += [{name:"HOME",value:"/home/gradle"},{name:"PR_WORKSPACE",value:"/home/gradle/pr"}]
+                  | .spec.template.spec.containers[0].image = $img
+                  | .spec.template.spec.containers[0].imagePullPolicy = "Always"
+                  | .spec.template.spec.containers[0].workingDir = "/home/gradle/pr"
+                  | .spec.template.spec.volumes += [
+                      {name:"node-creds", secret:{secretName:$creds, defaultMode:256}},
+                      {name:"agent-workspace", emptyDir:{}} ]
+                  | .spec.template.spec.containers[0].volumeMounts += [
+                      {name:"node-creds", mountPath:"/home/gradle/.config/tea/config.yml", subPath:"tea-config.yml", readOnly:true},
+                      {name:"node-creds", mountPath:"/home/gradle/.config/vikunja-cli/config.toml", subPath:"vikunja-config.toml", readOnly:true},
+                      {name:"node-creds", mountPath:"/home/gradle/.gitconfig", subPath:"gitconfig", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-git/credentials", subPath:"git-credentials", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-loki/username", subPath:"loki-username", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-loki/password", subPath:"loki-password", readOnly:true},
+                      {name:"agent-workspace", mountPath:"/home/gradle/pr"} ]
+                  | .spec.template.spec.initContainers += [{
+                      name:"clone-pr", image:$img, imagePullPolicy:"Always",
+                      command:["sh","-c"],
+                      args:["set -eu; export HOME=/home/gradle; cd /home/gradle/pr; find . -mindepth 1 -delete 2>/dev/null || true; git clone " + $repo + " . && git checkout " + $checkout + " && echo cloned " + $repo + " at " + $checkout + " (branch " + $branch + ")"],
+                      volumeMounts:[
+                        {name:"agent-workspace", mountPath:"/home/gradle/pr"},
+                        {name:"node-creds", mountPath:"/home/gradle/.gitconfig", subPath:"gitconfig", readOnly:true},
+                        {name:"node-creds", mountPath:"/etc/turnstone-git/credentials", subPath:"git-credentials", readOnly:true} ]
+                    }]
+                ' | kubectl apply -f -
+              cat <<SVC | kubectl apply -f -
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: ${NODE}
+                namespace: turnstone
+                labels:
+                  app.kubernetes.io/instance: ${NODE}
+                  apl.io/ephemeral: "true"
+              spec:
+                selector:
+                  app.kubernetes.io/instance: ${NODE}
+                ports:
+                  - name: http
+                    port: 8080
+                    targetPort: 8080
+              SVC
+              kubectl -n turnstone rollout status deploy/${NODE} --timeout=200s
+              echo "AGENT NODE READY: ${NODE} (PR #${PR}, ${BRANCH})"
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: teardown-agent-node
+spec:
+  params: [{name: team}, {name: pr}]
+  tasks:
+    - name: delete-node
+      params: [{name: team, value: $(params.team)}, {name: pr, value: $(params.pr)}]
+      taskSpec:
+        params: [{name: team}, {name: pr}]
+        steps:
+          - name: delete
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              NODE="$(params.team)-pr$(params.pr)-agent"
+              echo "tearing down ${NODE}"
+              kubectl delete deploy,svc -n turnstone \
+                -l app.kubernetes.io/instance=${NODE} --ignore-not-found
+              echo "AGENT NODE TORN DOWN: ${NODE} (PR #$(params.pr) closed)"
+---
+# provision-review-node: the PERSISTENT per-team review node behind the po-desk / ticket coach.
+# Same shape as provision-agent-node (copy-creds + clone-and-patch turnstone-server onto the team's
+# baked ci-runner image), but the node is STANDING, not ephemeral: a stable id, all the team's repos
+# cloned + a git-sync sidecar that self-updates them, and label apl.io/review-agent (NOT ephemeral,
+# so the PR teardown never reaps it). Idempotent -- re-applying just reconciles the one Deployment.
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: provision-review-node
+spec:
+  params:
+    - name: team
+    - name: repos            # space-separated <org>/<repo> list to clone (defaults to the team's own)
+    - name: nodeImage
+      default: ""
+  tasks:
+    - name: copy-creds
+      params:
+        - {name: team, value: $(params.team)}
+      taskSpec:
+        params:
+          - {name: team}
+        steps:
+          - name: generate
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; DOMAIN="{{ .Values.domain }}"; NS="team-${TEAM}"
+              GT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.gitea-token}' | base64 -d)
+              VT=$(kubectl get secret agent-creds -n "$NS" -o jsonpath='{.data.vikunja-token}' | base64 -d)
+              LP=$(kubectl get secret reverse-proxy-auth-config -n monitoring -o jsonpath='{.data.authn\.yaml}' \
+                   | base64 -d | grep -A1 "username: ${TEAM}$" | awk '/password:/{gsub(/'"'"'/,"",$2); print $2; exit}')
+              GUSER="agent-${TEAM}-$(echo "$DOMAIN" | tr '.' '-')"
+              mkdir -p /w
+              cat > /w/gitconfig <<GC
+              [credential]
+              	helper = "!f() { printf 'url=%s\n' \"\$(cat /etc/turnstone-git/credentials)\"; }; f"
+              [user]
+              	name = agent-${TEAM}
+              	email = agent-${TEAM}@${DOMAIN}
+              [http]
+              	sslVerify = false
+              [safe]
+              	directory = *
+              GC
+              printf 'https://%s:%s@gitea.%s' "$GUSER" "$GT" "$DOMAIN" > /w/git-credentials
+              cat > /w/tea-config.yml <<TC
+              logins:
+                  - name: ${TEAM}
+                    url: https://gitea.${DOMAIN}
+                    token: ${GT}
+                    default: true
+                    insecure: true
+                    user: ${GUSER}
+                    version_check: true
+              TC
+              printf 'url = "https://vikunja.%s"\ntoken = "%s"\n' "$DOMAIN" "$VT" > /w/vikunja-config.toml
+              printf '%s' "$TEAM" > /w/loki-username
+              printf '%s' "$LP" > /w/loki-password
+              kubectl create secret generic "agent-${TEAM}-creds" -n turnstone --from-file=/w \
+                --dry-run=client -o yaml | kubectl apply -f -
+              echo "generated turnstone/agent-${TEAM}-creds from team-${TEAM}/agent-creds + loki tenant pw"
+    - name: create-review-node
+      runAfter: [copy-creds]
+      params:
+        - {name: team, value: $(params.team)}
+        - {name: repos, value: $(params.repos)}
+        - {name: nodeImage, value: $(params.nodeImage)}
+      taskSpec:
+        params:
+          - {name: team}
+          - {name: repos}
+          - {name: nodeImage}
+        steps:
+          - name: create
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              set -eu
+              TEAM="$(params.team)"; DOMAIN="{{ .Values.domain }}"; REPOS="$(params.repos)"
+              NODE="${TEAM}-review-agent"
+              if [ -n "$(params.nodeImage)" ]; then IMG="$(params.nodeImage)"; else IMG="harbor.${DOMAIN}/team-${TEAM}/ci-runner:main"; fi
+              CREDS="agent-${TEAM}-creds"
+              echo "provisioning standing review node ${NODE} from ${IMG}, repos: ${REPOS}"
+              # Patch turnstone-server into the standing review node. Inherit all of turnstone's env
+              # (DB/OIDC/keys/JWT) from the base; only swap image, set a STABLE node id (drop the
+              # fieldRef default), add the repos clone init + git-sync sidecar, and label it as a
+              # review node (never ephemeral).
+              kubectl get deploy turnstone-server -n turnstone -o json | jq \
+                --arg node "$NODE" --arg img "$IMG" --arg creds "$CREDS" --arg repos "$REPOS" --arg domain "$DOMAIN" '
+                  .metadata = {name:$node, namespace:"turnstone", labels:{"app.kubernetes.io/instance":$node,"app.kubernetes.io/name":"turnstone","turnstone-node":"tsnode","apl.io/review-agent":"true"}}
+                  | del(.status)
+                  | .spec.replicas = 1
+                  | .spec.selector.matchLabels = {"app.kubernetes.io/instance":$node}
+                  | .spec.template.metadata = {labels:{"app.kubernetes.io/instance":$node,"app.kubernetes.io/name":"turnstone","turnstone-node":"tsnode"}}
+                  | .spec.template.spec.containers[0].image = $img
+                  | .spec.template.spec.containers[0].imagePullPolicy = "Always"
+                  | .spec.template.spec.containers[0].workingDir = "/home/gradle/repos"
+                  | .spec.template.spec.containers[0].env = ([.spec.template.spec.containers[0].env[] | select(.name != "TURNSTONE_NODE_ID")] + [{name:"TURNSTONE_NODE_ID",value:$node},{name:"HOME",value:"/home/gradle"}])
+                  | .spec.template.spec.volumes += [
+                      {name:"node-creds", secret:{secretName:$creds, defaultMode:256}},
+                      {name:"repos", emptyDir:{}} ]
+                  | .spec.template.spec.containers[0].volumeMounts += [
+                      {name:"node-creds", mountPath:"/home/gradle/.config/tea/config.yml", subPath:"tea-config.yml", readOnly:true},
+                      {name:"node-creds", mountPath:"/home/gradle/.config/vikunja-cli/config.toml", subPath:"vikunja-config.toml", readOnly:true},
+                      {name:"node-creds", mountPath:"/home/gradle/.gitconfig", subPath:"gitconfig", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-git/credentials", subPath:"git-credentials", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-loki/username", subPath:"loki-username", readOnly:true},
+                      {name:"node-creds", mountPath:"/etc/turnstone-loki/password", subPath:"loki-password", readOnly:true},
+                      {name:"repos", mountPath:"/home/gradle/repos"} ]
+                  | .spec.template.spec.initContainers += [{
+                      name:"clone-repos", image:$img, imagePullPolicy:"Always",
+                      command:["sh","-c"],
+                      args:["set -eu; export HOME=/home/gradle; mkdir -p /home/gradle/repos; cd /home/gradle/repos; for f in \($repos); do n=$(basename \"$f\"); [ -d \"$n/.git\" ] || git clone https://gitea.\($domain)/$f.git \"$n\" || true; done; echo cloned: $(ls /home/gradle/repos)"],
+                      volumeMounts:[
+                        {name:"repos", mountPath:"/home/gradle/repos"},
+                        {name:"node-creds", mountPath:"/home/gradle/.gitconfig", subPath:"gitconfig", readOnly:true},
+                        {name:"node-creds", mountPath:"/etc/turnstone-git/credentials", subPath:"git-credentials", readOnly:true} ]
+                    }]
+                  | .spec.template.spec.containers += [{
+                      name:"git-sync", image:$img, imagePullPolicy:"Always",
+                      command:["sh","-c"],
+                      args:["export HOME=/home/gradle; while true; do for d in /home/gradle/repos/*/; do git -C \"$d\" fetch origin main --quiet 2>/dev/null && git -C \"$d\" reset --hard origin/main --quiet 2>/dev/null || true; done; sleep 30; done"],
+                      volumeMounts:[
+                        {name:"repos", mountPath:"/home/gradle/repos"},
+                        {name:"node-creds", mountPath:"/home/gradle/.gitconfig", subPath:"gitconfig", readOnly:true},
+                        {name:"node-creds", mountPath:"/etc/turnstone-git/credentials", subPath:"git-credentials", readOnly:true} ]
+                    }]
+                ' | kubectl apply -f -
+              cat <<SVC | kubectl apply -f -
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: ${NODE}
+                namespace: turnstone
+                labels:
+                  app.kubernetes.io/instance: ${NODE}
+                  apl.io/review-agent: "true"
+              spec:
+                selector:
+                  app.kubernetes.io/instance: ${NODE}
+                ports:
+                  - name: http
+                    port: 8080
+                    targetPort: 8080
+              SVC
+              kubectl -n turnstone rollout status deploy/${NODE} --timeout=240s
+              echo "REVIEW NODE READY: ${NODE}"
+    - name: create-persona
+      runAfter: [create-review-node]
+      params:
+        - {name: team, value: $(params.team)}
+      taskSpec:
+        params: [{name: team}]
+        steps:
+          - name: upsert
+            image: {{ .Values.toolImage }}
+            script: |
+              #!/bin/sh
+              # Create/refresh this team's "The Product Owner (<team>)" persona so the PO can pick a
+              # team-aware desk. Uses the platform-admin PAT (turnstone/broker-admin-pat, seeded) as a
+              # BEARER -- turnstone accepts its own ts_ PAT on the admin API (unlike a raw Keycloak
+              # bearer), so no OIDC login here, no rate-limit burst. Non-fatal: a missing PAT just skips.
+              set -eu
+              TEAM="$(params.team)"; DOMAIN="{{ .Values.domain }}"
+              PAT=$(kubectl get secret broker-admin-pat -n turnstone -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+              if [ -z "$PAT" ]; then echo "no turnstone/broker-admin-pat -- skipping per-team persona (seed it to enable)"; exit 0; fi
+              PROMPT=$(kubectl get configmap po-desk-persona -o jsonpath='{.data.prompt}' | sed "s/__TEAM__/${TEAM}/g")
+              [ -n "$PROMPT" ] || { echo "empty persona prompt from configmap"; exit 1; }
+              NAME="the-po-desk-${TEAM}"; API="https://turnstone.${DOMAIN}/v1/api/admin"
+              BODY=$(jq -n --arg n "$NAME" --arg t "$TEAM" --arg p "$PROMPT" \
+                '{name:$n,display_name:("The Product Owner ("+$t+")"),description:("Interactive PO desk for the "+$t+" team -- team-aware."),base_prompt:$p,tool_allowlist:["bash","read_file","search","skills"],mcp_enabled:false,memory_enabled:true,applies_to_kinds:["interactive"],is_default:false,enabled:true}')
+              PID=$(curl -sk --max-time 15 -H "Authorization: Bearer $PAT" "$API/personas" | jq -r --arg n "$NAME" '(.personas // .)[]? | select(.name==$n) | .persona_id' 2>/dev/null | head -1)
+              if [ -z "$PID" ]; then
+                H=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' "$API/personas" -d "$BODY")
+                echo "created persona $NAME -> HTTP $H"
+              else
+                PATCHBODY=$(printf '%s' "$BODY" | jq 'del(.name, .applies_to_kinds, .enabled)')
+                H=$(curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X PATCH -H "Authorization: Bearer $PAT" -H 'Content-Type: application/json' "$API/personas/$PID" -d "$PATCHBODY")
+                echo "updated persona $NAME ($PID) -> HTTP $H"
+              fi
+              [ "${H:-0}" -lt 300 ] || { echo "persona upsert failed (HTTP $H) -- non-fatal, node is up"; exit 0; }
