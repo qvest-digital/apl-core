@@ -70,7 +70,7 @@ protecting when you resolve):
 | `chart/apl/templates/deployment.yaml`, `post-job.yaml` | `651782eaf` | image repo/pull-policy settable |
 | `charts/team-ns/templates/builds/docker.yaml` | kaniko/CA-trust comment commits | comment-only in the fork: the `sslVerify: false` / `--skip-tls-verify` block now cites `CLAUDE.md`'s CA-trust section rather than the deleted `POD-EGRESS-INVESTIGATION.md`. Trivial to resolve — keep upstream's logic, keep the fork's comment |
 | `values/gitea/gitea.gotmpl`, `values/argocd-image-updater/*.gotmpl` | same | comment-only, same reason as above |
-| `.cspell.json` | several docs commits | fork-only jargon (Vikunja, Turnstone, etc.) — trivial, always keep both sides' words |
+| `.cspell.json`, `package.json` | the spellcheck-removal commit | **this fork deleted `cspell` entirely** — the `spellcheck` script, the `lint` entry, the devDependency and `.cspell.json` itself. An upstream merge will try to restore all four; drop them again rather than merging, and check `package-lock.json` came back clean |
 
 Two of these are the ones actually likely to fight upstream line-for-line, because they are places
 upstream also edits often:
@@ -93,7 +93,7 @@ timeout 60 bin/gen-chart-schema.sh                 # values.schema.json is gitig
 git ls-files charts/vikunja charts/turnstone | grep values.yaml   # confirm .git/info/exclude didn't eat one
 ```
 
-Then run the test suite from a clean context (root `*.md` spellcheck trap applies here same as any
+Then run the test suite from a clean context (the clean-context build rule applies here same as any
 build — see `CLAUDE.md` §"Traps that will cost you an hour each").
 
 ## 4b. While you're in here: check for stale pinned tool versions too
@@ -117,6 +117,162 @@ v1.5.1 specifically, but the underlying pattern — upstream not auditing this d
 is unchanged, so take a look at every pinned image tag/digest under
 `charts/team-ns/templates/tekton-tasks/` while you're already touching this area for a sync,
 rather than assuming a merge keeps any of them current.
+
+## 4c. Known upstream bug, not yet fixed here: a team named `platform` collides
+
+Found live 2026-08-31, recorded rather than fixed — nothing in the lab is blocked by it today, and
+it is a candidate for whenever this fork's divergence gets cleaned up.
+
+`values/kubernetes-gateways/kubernetes-gateways-raw.gotmpl` emits one ReferenceGrant per team, named
+after the team, and then a platform-level one with a hardcoded name:
+
+```gotmpl
+{{- range $teamId := (keys $v.teamConfig | sortAlpha) }}
+      name: {{ $teamId }}-oauth2-proxy-apps          # team loop
+{{- end }}
+      name: platform-oauth2-proxy-apps               # hardcoded, emitted AFTER the loop
+```
+
+A team called `platform` therefore produces an object with exactly the platform-level name. Both are
+rendered into the same raw chart, the hardcoded one is emitted last, and it wins — so the *team's*
+grant silently does not exist. This is the same shape as the `team-admin` collision CLAUDE.md
+already documents: a team id colliding with a platform-level identifier.
+
+**Symptom, and why it does not look like a naming bug.** The team's HTTPRoutes may no longer
+reference `oauth2-proxy` in `istio-system`, so they report
+`ResolvedRefs=False (RefNotPermitted)` and their Argo application sits **Degraded** while every
+resource under it shows `Synced` and no individual resource reports a health problem. On the
+2026-08-31 lab that was `team-platform-tekton-dashboard-platform-artifacts`, 1 of 95 apps, and it
+had been carried in a session handover for two days as "not diagnosed". Compare the grant against a
+working team's — the `from:` list is the tell:
+
+```
+platform-oauth2-proxy-apps   from: argocd, harbor, monitoring, grafana, kfp, otomi, tekton-dashboard
+details-oauth2-proxy-apps    from: team-details
+```
+
+The blast radius is every auth-backed route that team owns. It showed up on only one route because
+`team-platform` happens to own only one, but any public service that team gains would hit it too —
+which matters, because `team-platform` is the team `seed:agent-base` creates to own the shared
+agent image (`AGENT-ENVIRONMENTS.md` §18), and CLAUDE.md actively recommends a team named
+`platform` for shared, platform-owned assets.
+
+**The fix, when someone takes it:** prefix the per-team name — `team-{{ $teamId }}-oauth2-proxy-apps`
+— which removes the whole collision class, since no team-derived name can then match a
+platform-level one. One line. It renames the existing per-team grants; they are owned by the
+`kubernetes-gateways-artifacts` Argo application with automated prune, so Argo replaces them and
+nothing references them by name. Renaming the hardcoded platform grant instead is the smaller edit
+but leaves the trap in place for the next collision.
+
+Two caveats worth knowing before starting:
+
+- `values/*.gotmpl` is baked into the **operator image**, not read from the git values repo, so this
+  cannot be applied to a running cluster by committing it. It lands at the next `task setup`; doing
+  it live means rebuilding the operator image, loading it into the kind node and restarting
+  `apl-operator`, and SETUP.md's "Changing values after install" warns that restarting the operator
+  can re-run bootstrap.
+- The file is upstream (every commit touching it is an upstream PR: #3543, #3325, #3068), so fixing
+  it here is new fork divergence in a file a merge may touch — and it is worth reporting upstream,
+  since it is a genuine bug for anyone who names a team `platform`.
+
+**Verification** that a fix worked: the grant `team-platform-oauth2-proxy-apps` exists carrying
+`from: team-platform`, the team's HTTPRoutes report `ResolvedRefs=True`, and the Argo application
+turns Healthy.
+
+## 4e. Known upstream bug, not fixed here: `isTeamAdmin` gives every team admin the platform admin team
+
+Found live 2026-08-31, and it is a real privilege escalation, not a cosmetic label — but it lives
+entirely in upstream code, so it is written down and left alone per this fork's policy on upstream
+faults. It is **not** caused by the seed: the seed creates a team's dev user with the documented
+apl-api call `POST /v1/users` `{"isTeamAdmin": true, "teams": ["<team>"]}`, which is the only way to
+make someone an admin of their own team — there is no per-team admin flag to use instead.
+
+**What happens.** `apl-tasks` (`src/operators/keycloak/keycloak.ts`) turns the flag into a Keycloak
+group whose name is the bare string `team-admin`:
+
+```ts
+if (decoded.isTeamAdmin === 'true') groups.push('team-admin')
+```
+
+That group is **global** — it carries no team scope. The platform's built-in **admin team** also
+renders as `team-<id>` → `team-admin`. Same string, two meanings — the collision CLAUDE.md already
+documents. The part that makes it an escalation rather than a display glitch is that **apl-api
+authorizes on the group name**, so every team admin is treated as a member of the admin team.
+
+**Verified live 2026-08-31**, as `dev-reviews` (a plain team admin, groups `[team-reviews,
+team-admin]`):
+
+```
+GET  /api/v2/teams/admin/workloads      -> 200
+GET  /api/v2/teams/admin/sealedsecrets  -> 200
+POST /api/v2/teams/admin/sealedsecrets  -> 200   (wrote a secret into the admin team, then deleted it)
+```
+
+The Console shows the same thing from the user's side: a team dev logs in and sees themselves as a
+member of the admin team. Whether the escalation reaches an *unrestricted* admin workload (one with
+`namespace:` set, which runs under Argo project `default` with `clusterResourceWhitelist: ['*']` — see
+§4c and `AGENT-WORKFLOW-CATALOG.md` §4) was deliberately **not** tested, because a positive result
+would mean any team admin can grant themselves cluster-wide. Treat it as plausible until disproven.
+
+**Why this matters here specifically.** `AGENT-WORKFLOW-CATALOG.md`'s node-broker design rests on
+"only the admin team can deploy into `turnstone`." If a team admin already *is* the admin team, that
+boundary is weaker than the design assumes. The design is not invalidated — the broker still
+centralises the privileged action — but the assumption that a team credential cannot reach it needs
+re-checking against this bug before anything relies on it.
+
+**The fix is upstream, not here.** It is in apl-tasks' group naming (and apl-api's authz keying on
+it), both sibling repos. Reporting it upstream is the right move; do not patch the seed to route
+around it, because the seed is already doing the correct, documented thing. If a future merge brings
+a fix, this section can go.
+
+---
+
+## 4d. Known upstream inconsistency: the `k8s-deployment-otel` catalog chart is orphaned
+
+Found live 2026-08-31, recorded rather than worked around. Nothing in this fork is broken by it; the
+cost is that a catalog tile the Console offers cannot do what it says.
+
+The default catalog (`linode/apl-charts`) offers **`k8s-deployment-otel`** beside `k8s-deployment`.
+The two charts are identical apart from an `instrumentation` block, an `Instrumentation` CR, and two
+pod annotations that make the OpenTelemetry Operator inject an auto-instrumentation agent. The CR
+hardcodes where the agent sends its spans:
+
+```yaml
+exporter:
+  endpoint: http://otel-collector-collector.otel.svc.cluster.local:4317
+```
+
+**Nothing on this platform serves that address, and nothing can be switched on to make it.**
+`values/otel-operator/otel-operator-raw.gotmpl` (228 lines, **pristine upstream** — zero diff against
+the fork point) creates exactly one `OpenTelemetryCollector`, `platform-logs`, gated on
+`apps.loki.enabled`, whose only pipeline is `logs`. `apps.otel` in `values-schema.yaml` exposes only
+`operator.replicaCount` and `resources.{logsCollector,manager}` — there is no traces knob to find.
+
+The chart's own README explains the intent and dates it: it lists the prerequisites for viewing
+traces as Istio tracing, *"Loki and **Tempo** enabled"*, and Grafana. App Platform
+[removed Tempo in v4.14.0](https://techdocs.akamai.com/app-platform/changelog/v4-14-0) (2026-02-24),
+completing a deprecation — the release notes give cleanup commands and name **no replacement trace
+backend**. So the catalog chart still points at a store the platform deleted from under it.
+
+Two further limits, both confirmed from the vendored chart rather than from documentation:
+
+- **The operator cannot instrument Ruby.** `charts/otel-operator/crds/crd-opentelemetryinstrumentation.yaml`
+  (operator 0.158.0) has sections for `dotnet`, `go`, `java`, `nginx`, `nodejs`, `python` and
+  `apacheHttpd`. There is no `ruby`. The demo's `details` service is `ruby:3.4.3-slim`, so one of the
+  four teams could never be injected at all. Ruby's own
+  [`opentelemetry-ruby-instrumentation`](https://github.com/open-telemetry/opentelemetry-ruby-instrumentation)
+  gems exist, but they are in-process libraries added to the app, not something the operator injects.
+- **The chart defaults to `instrumentation.language: java`.** Leave it unset on a Python or Node
+  service and it injects a Java agent. The language is per service, which would make it the first
+  genuinely per-team value in `setup_team_service`.
+
+**What was done instead.** Nothing: the demo workloads stay on `k8s-deployment`
+(`SEED_WORKLOAD_CHART_PATH` in `.taskfiles/seed.yml`). Istio's own data-plane metrics cover the
+service-to-service view for all four teams with no app changes — see the `apps.otel` entry in
+`CLAUDE.md` for what that app actually gates, and note that the platform already ships
+`charts/grafana-dashboards/istio-admin/workload-dashboard.json`, which consumes exactly those metrics
+while nothing scrapes them. Reviving `k8s-deployment-otel` means providing a trace store first; that
+is a real integration, not a setting.
 
 ## 5. Record the new sync point
 

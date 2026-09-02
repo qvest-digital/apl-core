@@ -48,8 +48,27 @@ namespace).
 
 ## What's actually deployed
 
+> ### RULE — do not break this one
+>
+> **The platform identity is the credential, and the OIDC *flow* is how you present it.** Every app
+> here federates to the same Keycloak realm, so `platform-admin` already **is** an admin in Gitea,
+> Harbor, Vikunja and Turnstone — the identity the Console's apps page signs you in with. Reach an
+> app's API by completing its authorization-code round trip with a cookie jar and keeping the
+> session/JWT that lands there: `gitea_oidc_login`, `vikunja_oidc_login`, or Turnstone's
+> `GET /v1/api/auth/oidc/authorize` (all `.taskfiles/seed-lib.sh` shape). Copy one; never invent a
+> flow.
+>
+> **Do not** reach for a per-app bootstrap admin password out of a Kubernetes Secret because the app
+> "has its own admin". **Do not** conclude an API is closed because a raw Keycloak bearer returned
+> `401` — a raw bearer is not the OIDC flow. (Harbor is the lone app that also accepts one.)
+> **Do not** test auth against an endpoint that answers anonymously; use an admin-only endpoint and
+> run a bogus credential as a control. Both of those bad tests produced confidently wrong
+> conclusions on 2026-08-30. Full rule in `CLAUDE.md`.
+
 **A new Gitea repo**, `team-labteam/team-pipelines` (created via Gitea's API with the
-`gitea-admin-secret` credential), structured as a chart-per-subfolder monorepo so a team can hold
+`gitea-admin-secret` credential — which is exactly what the rule above says not to do; it predates
+the rule and should be `gitea_oidc_login` + `gitea_mint_pat`), structured as a chart-per-subfolder
+monorepo so a team can hold
 more than one pipeline without spinning up a new repo each time:
 
 ```

@@ -40,7 +40,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   cat >&2 <<EOF
 error: image '$IMAGE' is not present locally.
 
-Build it first, from a clean context so local notes do not break the build's spellcheck:
+Build it first, from a clean context so the image matches a fresh clone:
 
   CTX=\$(mktemp -d)
   git ls-files -z | tar --null -T - -c | tar -x -C "\$CTX"

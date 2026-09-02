@@ -20,11 +20,14 @@ wrong one for the task wastes a session.
 | `VIKUNJA.md` | the worked example behind that playbook — a record of one real integration | you need the concrete detail a rule in the playbook is abbreviating |
 | `TURNSTONE.md` | a second worked example — an app needing an upstream LLM API, and the certificate trap that came with it | your app is not a Go web app, or anything TLS fails in a way `openssl` says is fine |
 | `UPSTREAM-SYNC.md` | an executable runbook: pull new commits from `linode/apl-core` into this fork | you are asked to merge in, sync with, or catch up on upstream |
-| `MCP.md` | a record of deploying MCP servers for Gitea and Vikunja, and every credential/session trap proving them live turned up | you are touching either app's MCP server, wiring an MCP client (Turnstone or otherwise) to them, or need a platform-user credential neither app's OIDC login hands you directly |
+| `MCP.md` | a record of deploying MCP servers for Gitea and Vikunja, and every credential/session trap proving them live turned up | you are touching either app's MCP server, wiring an MCP client (Turnstone or otherwise) to them, or need a platform-user credential neither app's OIDC login hands you directly, or a user shows up in Gitea as somebody else entirely (Gitea links an incoming SSO identity to whichever account is already signed in — last section) |
 | `VIKUNJA-TURNSTONE-PIPELINE.md` | a proof-of-flow: a Vikunja webhook triggers a Tekton pipeline that calls Turnstone through its real Python SDK | you are wiring any app event to trigger a Tekton pipeline, or need a working example of the `turnstone` PyPI SDK from inside a pod |
 | `TEAM-WORKLOAD-CATALOG.md` | the preferred, correct way to give a team a pipeline or other workload: a git-tracked chart + the platform's own `workloads`/`catalogs` mechanism, not raw `kubectl apply` | you are asked to add a pipeline, a workload, or anything a team should own and iterate on going forward |
 | `GITEA-ACTIONS-CI.md` | why the demo teams' lint/build merge gate is built the way it is: Actions rather than Tekton, ephemeral host-mode runners, runner images built by the platform itself | you are touching `seed:runners`/`seed:gates`, any `demo-seed/bookinfo/*/.gitea/` file, or branch protection |
 | `EPHEMERAL-AND-TEAM-WORKLOADS.md` | the reusable shapes behind that CI work: how to run a pod that exists only while there is work for it (Job + TTL, not a Deployment), how per-team namespaces are actually laid out, and the diagnosis order when an event-created pod misbehaves | you are adding any ephemeral or per-team workload, or an event-created pod of any kind — read it before `GITEA-ACTIONS-CI.md`, which is the Gitea-specific narrative |
+| `AGENT-ENVIRONMENTS.md` | working notes on giving AI agents ephemeral environments, and the first full loop proven end to end: an agent on a per-environment Turnstone node that clones, commits, pushes and opens a real pull request, whose branch is then built and served by the environment. Covers the forge identity and its token lifecycle, why the credential must be a file rather than an env var, per-node config as a tenancy lever, and two agent bugs that compiled and passed CI but only failed when run | you are working on agent environments, Turnstone nodes, giving an agent a git credential, or anything in the agentic-platform direction — it is a record of what was proven live, not a design |
+| `AGENT-WORKFLOW-CATALOG.md` | **a design, not a record** — the one fork document describing something not yet built: agent workflows published as catalog items, installed per team as an ordinary workload, each run creating an ephemeral environment plus a Turnstone node and destroying both. Carries the live-verified constraints the design rests on, and corrects two claims in `research/catalogs-and-workloads.md` | you are working on the agent workflow catalog, the node broker, or anything that would publish an agentic workflow for teams to self-serve — read `AGENT-ENVIRONMENTS.md` first, which is the evidence this is built on |
+| `AGENT-SECURITY-AUDIT.md` | a live audit of what a dev/agent node can see/reach, and the runtime security posture: the critical finding (an agent's bash shares UID 1000 with the node's turnstone-server, so `/proc/1/environ` leaks the JWT signing secret, DB password, OIDC + LLM keys), what was FIXED (scoped Istio egress containment, commit 9e7bf9702), why OpenShell was infeasible here, and the DEFERRED root-cause fix (asymmetric JWT + scoped DB role) | you are touching agent-node security, egress/NetworkPolicy for nodes, Turnstone's node auth/JWT/DB, or evaluating whether agents can be trusted with untrusted input |
 
 The distinction that matters: **`SETUP.md` and `INTEGRATING-AN-APP.md` are instructions to follow.
 `VIKUNJA.md` is evidence, not a plan** — its work is already done and on `feat/vikunja-integration`.
@@ -49,8 +52,9 @@ not a manual walk through `SETUP.md`.** That was the point of building it: this 
 longer need an agent driving `kubectl`/`docker`/`helm` by hand, session after session, to come up
 the same way SETUP.md already proved works. Useful sub-tasks (see `task --list`):
 
-- `task setup` — interactive: asks Y/n per optional app (gitea/harbor/tekton/vikunja/turnstone
-  default yes, everything else — including prometheus — defaults no), Enter accepts the
+- `task setup` — interactive: asks Y/n per optional app (the 5 core apps
+  gitea/harbor/tekton/vikunja/turnstone **and** the observability stack grafana/loki/otel default
+  yes; everything else — including prometheus/alertmanager — defaults no), Enter accepts the
   suggestion. **As an agent, you almost never want the interactive prompts** — run
   `NONINTERACTIVE=true task setup` instead so every `*_ENABLED` var falls back to its documented
   default without blocking on a terminal read you cannot answer; this is also what CI should use.
@@ -100,7 +104,15 @@ Istio Bookinfo microservice per team wired to the others, and — added later �
 **merge gate**: a Gitea Actions lint+build check, an ephemeral runner whose image this platform
 builds itself, and `main` protected behind that check. Vikunja provisioning runs last.
 
-Sub-tasks, each independently re-runnable (`seed:apps` → `seed:runners` → `seed:gates`):
+Sub-tasks, each independently re-runnable (`seed:agent-base` → `seed:apps` → `seed:runners` → `seed:gates`):
+
+- `seed:agent-base` — a fifth, non-Bookinfo team called `platform` and the shared
+  `agent-base` image it owns: Turnstone plus the CLIs an agent calls as tools (`tea`,
+  `logcli`, `vikunja-cli`) and the `gitea-runner` binary, assembled as a relocatable
+  `/opt/platform` layer. **Every team's runner Dockerfile does `COPY --from` against it**, so
+  it must exist in Harbor before `seed:runners` builds anything — hence `seed:apps` depends on
+  it. One image per team then serves as both the CI runner and the image that team's agent
+  node runs, which is what stops the two drifting. See `AGENT-ENVIRONMENTS.md` §18.
 
 - `seed:apps` — repos, Tekton builds, workloads, public services, cross-team netpols
 - `seed:runners` — each team's ephemeral Actions runner: second `AplTeamBuild` off the same repo,
@@ -186,6 +198,13 @@ using platform-user credentials, not the bootstrap admin. **The one finding that
 neither app's API accepts a raw Keycloak/OIDC token as a bearer credential** — this is a real
 upstream limitation (tracked for Gitea, `go-gitea/gitea#23382`), not something to fix here or route
 around with a cleverer curl invocation.
+
+⛔ **That finding is about a raw token, NOT about the platform identity.** `platform-admin` and every
+team user *can* reach these APIs — by completing the app's OIDC flow and keeping the session or JWT
+it returns, which is exactly what `gitea_oidc_login` and `vikunja_oidc_login` do. Misreading this
+paragraph as "OIDC identities cannot use the API" and reaching for a per-app bootstrap password
+instead is a repeated, expensive mistake here; the binding rule is in "Traps that will cost you an
+hour each" above, and every integration doc now repeats it.
 
 Two separate things follow from that, and conflating them wastes a session:
 
@@ -343,10 +362,10 @@ restart needed. Full account, including the specific failure mode this generaliz
 
 ## Traps that will cost you an hour each
 
-**Build from a clean context, not the working directory.** `npm run test:ci` spellchecks every
-root-level `*.md`. `docker build .` copies your whole working tree, so stray local notes fail the
-build with an error that has nothing to do with the code — and `.git/info/exclude` does not apply to
-Docker. Always:
+**Build from a clean context, not the working directory.** `docker build .` copies your whole
+working tree, and `.git/info/exclude` does not apply to Docker — so the image is built from whatever
+happens to be lying around rather than from what a fresh clone would produce. Exporting tracked
+files makes the build reproducible and keeps local scratch out of it. Always:
 
 ```bash
 CTX=$(mktemp -d)
@@ -381,8 +400,39 @@ they happen. Marking the task `interactive: true` exempts it from grouping. `ins
 `install:values`, `install:watch`, `install:watch-argocd` and `images:load-all` all carry it for
 this reason; any future task of either shape needs it too.
 
+**Nothing creates a Gitea repository for you — the seed does it explicitly.** `AplTeamCodeRepo`
+does not create the repo, `apl-gitea-operator` does not (it manages OIDC config and build webhooks
+only), and push-to-create is off. Register a build against a repo that does not exist and the
+operator sits in a `createBuildWebHook` error loop, which reads like a webhook or trigger fault and
+is not. **Mirror `seed.yml`'s `setup_team_service` (lines ~678-711) rather than inventing a flow:**
+`gitea_oidc_login` as the team's dev user (this provisions the account *and* its org membership from
+the JWT `groups` claim) → `gitea_mint_pat` → `gitea_wait_for_org_permission` →
+**`gitea_create_org_repo`** → `gitea_unprotect_branch` → coderepo + build via apl-api → push. Also:
+a user freshly created via `POST /v1/users` carries `requiredActions: ["UPDATE_PASSWORD"]` and
+cannot SSO-login until `kc_make_password_permanent` (`seed-lib.sh:81`) both resets the credential
+with `temporary:false` and clears `requiredActions` — the reset alone is not enough.
+
+**`team-admin` is not a usable team for anything you want to own.** Its Gitea org contains no
+humans (only `organization-team-admin` and `otomi-admin`), so `platform-admin` is not even offered
+it as a repo owner, and the admin team is special-cased throughout because `team-admin` collides
+with the `isTeamAdmin` group marker (see the `team-admin` collision note below). For shared,
+platform-owned assets create a **normal** team — a team named `platform` worked first try for
+namespace, Gitea org, Harbor project, coderepo, build, Pipeline and EventListener. Remember to flip
+its Harbor project public if other teams must pull from it.
+
 **A half-installed platform is not salvageable.** `helm uninstall apl` removes the operator only;
 every release the *operator* created survives. Delete the cluster instead.
+
+**A team named `platform` collides with a platform-level object, and the symptom is a Degraded Argo
+app with nothing visibly wrong under it.** `values/kubernetes-gateways/kubernetes-gateways-raw.gotmpl`
+emits `<teamId>-oauth2-proxy-apps` per team and then a hardcoded `platform-oauth2-proxy-apps`; for a
+team called `platform` those are one object, the hardcoded one is emitted last and wins, and the
+team's ReferenceGrant silently does not exist. Its auth-backed HTTPRoutes then report
+`ResolvedRefs=False (RefNotPermitted)` while every resource shows `Synced`. Same shape as the
+`team-admin` collision below. **Not fixed** as of 2026-08-31 — deliberately recorded rather than
+repaired, with the full account and the one-line fix in `UPSTREAM-SYNC.md` §4c. This is the known
+cost of the "create a normal team named `platform`" advice above; it is still the right advice for
+everything else, and `team-platform/agent-base` works exactly as documented.
 
 **`team-admin` means two different things.** It is a Keycloak group and realm role carried by every
 user with `isTeamAdmin` (`apl-tasks` `src/operators/keycloak/keycloak.ts`:
@@ -442,6 +492,90 @@ kubectl get application <app> -n argocd -o jsonpath='{.spec.source.targetRevisio
 git diff <that-revision> -- charts/<name>      # non-empty = the cluster cannot see your change
 ```
 
+**This whole platform is OIDC-integrated — the platform admin can reach every app's API, and the
+way in is the app's OIDC login flow.** Every app authenticates against the same Keycloak realm, so
+`platform-admin` already *is* an admin in Gitea, Harbor, Vikunja and Turnstone — the same identity
+the Console's apps page signs you in with. Do not go hunting for a per-app bootstrap password in a
+Kubernetes Secret because an app "has its own admin". That is a second credential path the platform
+does not need, and reaching for it is a recurring mistake here.
+
+**The flow, not a bearer token.** Fetching a Keycloak access token and sending it as
+`Authorization: Bearer` is *not* the OIDC flow, and it is the wrong test for whether an app is
+reachable: Gitea, Vikunja and Turnstone all answer `401` to a raw token, exactly as they do to a
+bogus one. What works is the authorization-code round trip the browser performs — hit the app's
+OIDC entrypoint with a cookie jar, POST the credentials to the Keycloak form it returns, follow the
+callback back, and keep the app session cookie or JWT that lands in the jar. Three worked
+implementations already exist, so write a fourth by copying one, never by inventing a flow:
+
+| app | helper | what you get |
+|---|---|---|
+| Gitea | `gitea_oidc_login` (`.taskfiles/seed-lib.sh`) | session; pair with `gitea_mint_pat` for an API token |
+| Vikunja | `vikunja_oidc_login` / `vikunja_login` | a Vikunja JWT |
+| Turnstone | none yet — `GET /v1/api/auth/oidc/authorize`, same shape | `turnstone_auth_console` cookie |
+| Harbor | `harbor_token` | Harbor also accepts a **raw** Keycloak bearer, unusually — verified live |
+
+Verified live 2026-08-30: the Turnstone flow above logs `platform-admin` in with `admin.settings`
+and `admin.models` (`/v1/api/auth/whoami`), and `PUT /v1/api/admin/settings/model.default_alias`
+succeeds with that session. Harbor's bearer reaches admin-only `/api/v2.0/users` and
+`/configurations` and writes with `PUT /projects/{id}`.
+
+**Two things that genuinely are not this.** Docker/OCI *registry* auth (skopeo, `docker login`)
+needs a per-user CLI secret rather than any of the above; the one recipe that needs it (mirroring a
+base image into Harbor with skopeo) is preserved as a comment in `.taskfiles/seed-lib.sh` and reads
+the password straight out of the `harbor-admin-password` Secret. And Keycloak's own master-realm administration
+(`kc_master_token`) is the IdP bootstrapping itself: a realm user cannot administer the realm.
+
+**Testing this wrong is easy, so test it right.** Never measure authentication against an endpoint
+that answers anonymously — `GET /api/v2.0/projects`, or any public project's `/repositories`,
+returns `200` for *anyone*, a deliberately bogus credential included. Use an admin-only endpoint
+(`/users`, `/configurations`, `/whoami`) and always run a bogus credential as a control. Both
+mistakes were made live on 2026-08-30: a `200` from an anonymous endpoint read as "the password
+works", and a `401` from a raw bearer read as "platform-admin cannot use this API". Both
+conclusions were wrong, and the second one is the one that keeps coming back.
+
+**`apps.otel` is the observability plumbing, not tracing — do not switch it off to save memory.**
+The name suggests distributed tracing, and tracing is the one thing it does *not* deliver (see
+`UPSTREAM-SYNC.md` §4d). What it actually gates, both confirmed live 2026-08-31:
+
+- **Log shipping into Loki.** Upstream replaced Promtail with an OpenTelemetry collector, so
+  `platform-logs` (`values/otel-operator/otel-operator-raw.gotmpl`, gated on `apps.loki.enabled`) is
+  what puts pod logs in front of Loki at all. No otel, no logs — and the agent's `logs` tool
+  (`AGENT-ENVIRONMENTS.md` §17) goes with them.
+- **Istio access logging.** `istio-resources-artifacts` is `installed: {{ $a | get "otel.enabled" }}`
+  (`helmfile.d/helmfile-91.artifacts.yaml.gotmpl`), and the release is one `Telemetry` CR turning on
+  Envoy access logs. Those carry the request id that made the four-service request trace in §17
+  possible.
+
+So turning otel off silently removes both the logs and the correlation id, in a way that looks like
+Loki being broken. Leave it on.
+
+Related, and the reason tracing is absent: Istio's own **data-plane** metrics
+(`istio_requests_total`, `istio_request_duration_milliseconds`, …) are exposed by every Envoy right
+now, and **nothing scrapes them** — there is a ServiceMonitor for `istiod` only. The platform even
+ships the dashboard that consumes them
+(`charts/grafana-dashboards/istio-admin/workload-dashboard.json`). The hook to fix it exists and is
+empty: `additionalPodMonitors` in `values/prometheus-operator/pod-monitors.gotmpl`.
+
+**`act` runs the real Gitea Actions workflow on a node in host mode — it does NOT need Docker, and
+this is already solved.** `act` normally runs each job in a container, and a Turnstone/agent node
+pod has no Docker daemon — so the reflex "act needs Docker, therefore dind or a build.sh" is wrong
+here and keeps getting re-derived. The whole reason the team toolchain (gradle/jdk/checkstyle,
+ruby, node, python — whichever the team pins) is baked into the `ci-runner` image (`AGENT-ENVIRONMENTS.md`
+§18) is so the workflow can run as plain processes with no container per step. Map the workflow's
+`runs-on` label to `-self-hosted`:
+
+```
+act -P ubuntu-latest=-self-hosted -W .gitea/workflows/ci.yml
+```
+
+and `act` executes every step directly on the node using the baked-in tools. This is the **same
+host mode the cluster runner uses** (`ci.yml`'s own comment: "registered in host mode: no Docker, no
+per-step containers"), the **same engine** (`gitea-runner` vendors nektos/act), and the **same
+workflow file** — so a green run on the node means the merge gate is green. Do not reach for a Docker
+socket, dind, or a `build.sh`; running the actual `.gitea/workflows/ci.yml` through `act` in host
+mode is the point. (`demo-seed/ci-local.sh` is the *host* equivalent and uses containers only because
+a laptop is not the runner image; the node already is.)
+
 **Never run `docker system prune -a`.** It will destroy unrelated containers, images and volumes
 belonging to other projects on this machine. If you need disk, `docker builder prune` is safe.
 
@@ -469,5 +603,8 @@ unanswered — particularly anything that narrows scope or changes tracked files
 - `main` is the fully merged state. Reference PRs against `reference/base` exist for reading only
   and must never be merged; they are drafts and titled `[reference]`.
 - Commit messages are conventional commits, with a body explaining *why*, not just what.
-- Root `*.md` files are spellchecked. New jargon goes in `.cspell.json`, inserted in alphabetical
-  order — do not let a formatter rewrite that file, it will reflow unrelated arrays.
+- **There is no spellchecker.** `cspell`, the `spellcheck` npm script and `.cspell.json` were removed
+  from this fork deliberately: policing prose in a software project cost more attention than it ever
+  returned, and every hit it produced here was a real word it did not know. Do not reintroduce it,
+  and do not add jargon lists anywhere. If an upstream merge brings it back, drop it again — see
+  `UPSTREAM-SYNC.md` §3.

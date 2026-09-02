@@ -127,10 +127,25 @@ What it looks like when missing: five `pip` retries against
 it is not DNS and not a NetworkPolicy — a team namespace has **no egress NetworkPolicy at all**, so
 that lead is a dead end.
 
-One observation left deliberately unexplained: the blocked pod listed only its own container, with
-no `istio-proxy` alongside, yet its egress was still intercepted. Whatever the interception
-mechanism, the annotation is what controls it. Do not conclude "no sidecar container, therefore not
-the mesh" — that inference cost time here.
+One observation was left unexplained here for a long time: the blocked pod listed only its own
+container, with no `istio-proxy` alongside, yet its egress was still intercepted. Whatever the
+interception mechanism, the annotation is what controls it. Do not conclude "no sidecar container,
+therefore not the mesh" — that inference cost time here.
+
+**Resolved 2026-08-31: `istio-proxy` is a *native* sidecar, so it lives in `initContainers`.**
+Kubernetes 1.33+ keeps an init container with `restartPolicy: Always` running for the whole life of
+the pod, and that is the form Istio injects here. Measured on `team-reviews/app`:
+
+```
+containers:     app
+initContainers: istio-init  istio-proxy      <- istio-proxy restartPolicy=Always
+```
+
+So `kubectl get pod -o jsonpath='{.spec.containers[*].name}'` honestly reports one container while a
+fully working proxy intercepts every packet. Nothing else changes: `kubectl exec … -c istio-proxy`
+and `kubectl logs … -c istio-proxy` both work once you know where to look. **When checking whether a
+pod is in the mesh, print both lists** — otherwise a pod with a sidecar is indistinguishable from one
+without.
 
 ## 6. Ingress to an EventListener is label-gated
 
@@ -195,6 +210,25 @@ What genuinely does not work: an OIDC/Keycloak bearer token as an API credential
 auth with the platform password (`401` — these accounts hold no local Gitea password). SSO login is
 still required for a different purpose: it provisions the account and re-syncs its org/team
 membership from the JWT `groups` claim, on **every** login.
+
+> ### RULE — do not break this one
+>
+> **The platform identity is the credential, and the OIDC *flow* is how you present it.** Every app
+> here federates to the same Keycloak realm, so `platform-admin` already **is** an admin in Gitea,
+> Harbor, Vikunja and Turnstone — the identity the Console's apps page signs you in with. Reach an
+> app's API by completing its authorization-code round trip with a cookie jar and keeping the
+> session/JWT that lands there: `gitea_oidc_login`, `vikunja_oidc_login`, or Turnstone's
+> `GET /v1/api/auth/oidc/authorize` (all `.taskfiles/seed-lib.sh` shape). Copy one; never invent a
+> flow.
+>
+> **Do not** reach for a per-app bootstrap admin password out of a Kubernetes Secret because the app
+> "has its own admin". **Do not** conclude an API is closed because a raw Keycloak bearer returned
+> `401` — a raw bearer is not the OIDC flow. (Harbor is the lone app that also accepts one.)
+> **Do not** test auth against an endpoint that answers anonymously; use an admin-only endpoint and
+> run a bogus credential as a control. Both of those bad tests produced confidently wrong
+> conclusions on 2026-08-30. Full rule in `CLAUDE.md`.
+
+
 
 ## 10. Diagnosis order, when an event-created pod misbehaves
 

@@ -39,7 +39,26 @@ platform's single Keycloak OIDC client (`otomi`).
 
 ## Neither app's API accepts a raw Keycloak/OIDC token ✅
 
-This is the single most important finding, and it will keep coming up:
+> ### RULE — do not break this one
+>
+> **The platform identity is the credential, and the OIDC *flow* is how you present it.** Every app
+> here federates to the same Keycloak realm, so `platform-admin` already **is** an admin in Gitea,
+> Harbor, Vikunja and Turnstone — the identity the Console's apps page signs you in with. Reach an
+> app's API by completing its authorization-code round trip with a cookie jar and keeping the
+> session/JWT that lands there: `gitea_oidc_login`, `vikunja_oidc_login`, or Turnstone's
+> `GET /v1/api/auth/oidc/authorize` (all `.taskfiles/seed-lib.sh` shape). Copy one; never invent a
+> flow.
+>
+> **Do not** reach for a per-app bootstrap admin password out of a Kubernetes Secret because the app
+> "has its own admin". **Do not** conclude an API is closed because a raw Keycloak bearer returned
+> `401` — a raw bearer is not the OIDC flow. (Harbor is the lone app that also accepts one.)
+> **Do not** test auth against an endpoint that answers anonymously; use an admin-only endpoint and
+> run a bogus credential as a control. Both of those bad tests produced confidently wrong
+> conclusions on 2026-08-30. Full rule in `CLAUDE.md`.
+
+Read this section as "a raw token is not a credential", **never** as "an OIDC identity cannot use
+the API". It can — through the flow above. This is the single most important finding, and it will
+keep coming up:
 
 **A Keycloak-issued access token (however you mint it — browser SSO, `password` grant, doesn't
 matter) is rejected outright by both apps' own APIs.** Confirmed live:
@@ -386,3 +405,64 @@ does **not** re-resolve semver ranges at *your* build time the way installing th
 `npm install` in your own Dockerfile does. If a wrapped app's own dependency on the same shared
 library (here, the MCP SDK) can outpace the wrapper image's baked-in copy, building both from
 scratch in one layer is what keeps them in step.
+
+## Gitea silently links an SSO identity to the account already signed in ✅
+
+Found live 2026-08-30, and it cost a session's worth of confusion because every symptom points
+somewhere else.
+
+**Symptom:** log into the Console as `platform-admin`, follow the Gitea app link — and you are
+`dev-details`. Log out of Gitea, log back in, still `dev-details`. A fresh private window does not
+help. Nothing errors anywhere.
+
+**What it is not**, all checked before the real cause was found: Keycloak's active sessions were
+*all* `platform-admin`; every Gitea OAuth callback returned `303`, not an error; the Keycloak users
+have distinct usernames, distinct emails and distinct ids; `ENABLE_AUTO_REGISTRATION` is `true`.
+
+**What it is:** a corrupt row in Gitea's `external_login_user` table.
+
+```
+external_id                           | user
+ffc512d3-2bde-4e93-a340-f86a3d3c0c50  | dev-details-…    <- platform-admin's Keycloak id
+c374fedc-f97e-43da-ba3c-3e4437cf0f54  | dev-details-…    <- dev-details' own Keycloak id
+```
+
+One Gitea account had **two** OIDC identities attached, one of them belonging to a different
+Keycloak user. Gitea resolves a login by looking up the `sub` claim in that table, finds it already
+linked, and signs you in as the linked account. Auto-registration never fires, because from Gitea's
+point of view the identity is already known — which is why no `platform-admin` Gitea account existed
+despite repeated successful logins.
+
+**How it happens:** Gitea attaches an incoming OIDC identity to the session that is **currently
+signed in**, rather than refusing when the `sub` is unknown but a different user is logged in. So
+completing an SSO login as user B while already signed into Gitea as user A permanently links B's
+identity to A's account. This is upstream behaviour, and a demo lab where one person switches
+between identities is exactly the environment that triggers it.
+
+It is also sticky and escalating: the wrong account inherits whatever the login grants. Here
+`dev-details` picked up `is_admin = true` (Gitea *instance* admin, the only dev user with it) and
+membership of the platform-internal `otomi` org, purely from platform-admin logins landing on it.
+
+**The seed cannot cause this.** `gitea_oidc_login` (`seed-lib.sh:160`) creates a fresh `mktemp`
+cookie jar per call and deletes it afterwards, so two users can never share a session, and it is
+only ever called with `dev-*`/`po-*`/`agent-*` emails — never `platform-admin`. A rebuilt lab starts
+clean; this is browser-only damage.
+
+**Diagnosis and repair.** Read the table before suspecting sessions, cookies or Keycloak:
+
+```sql
+SELECT e.external_id, e.login_source_id, u.name, u.is_admin
+  FROM external_login_user e JOIN "user" u ON u.id = e.user_id ORDER BY u.name;
+```
+
+Any account appearing twice is the bug. Delete the wrong link only, then log in again so Gitea
+provisions properly, and undo whatever privilege the account inherited:
+
+```sql
+DELETE FROM external_login_user WHERE external_id = '<the-other-users-keycloak-id>';
+UPDATE "user" SET is_admin = false WHERE name = '<the-account-it-landed-on>';
+```
+
+(`kubectl exec -n gitea gitea-db-1 -c postgres -- psql -U postgres -d gitea -c "…"`.) Check org
+membership too — `GET /api/v1/orgs/<org>/members` — since group sync will have run against the wrong
+account.
