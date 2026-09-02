@@ -179,7 +179,7 @@ resources:
         argocd.argoproj.io/secret-type: repository
     data:
       type: {{ print "git" | b64enc | quote }}
-      url: {{ print "https://github.com/linode/apl-core.git" | b64enc | quote }}
+      url: {{ env "APPS_REPO_URL" | default "https://github.com/linode/apl-core.git" | b64enc | quote }}
       depth: {{ print "1" | b64enc | quote }}
       name: {{ print "apl-core" | b64enc | quote }}
       project: {{ print "default" | b64enc | quote }}
