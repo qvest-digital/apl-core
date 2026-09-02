@@ -21,7 +21,11 @@ metadata:
 spec:
   stepTemplate:
     computeResources:
-      {{- $t.resources.grypeTask | toYaml | nindent 6 }}
+      # fork: minimal requests + NO limits so build pods always schedule on the single-node lab
+      # and can burst freely. Overrides the operator's $t.resources.grypeTask (was 500m/512Mi).
+      requests:
+        cpu: 1m
+        memory: 8Mi
   description: >-
     A vulnerability scanner for container images and filesystems.
     Works with Syft, the powerful SBOM (software bill of materials) tool for container images and filesystems.
