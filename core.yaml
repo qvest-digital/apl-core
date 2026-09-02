@@ -91,6 +91,7 @@ k8s:
       app: policy-reporter
       disablePolicyChecks: true
       disableIstioInjection: true
+    - name: turnstone
     - name: vikunja
     - name: apl-vikunja-operator
       disableIstioInjection: true
@@ -177,6 +178,10 @@ adminApps:
     tags: [security]
   - name: rabbitmq
     tags: [messaging]
+  - name: turnstone
+    tags: [ai, agents]
+    isShared: true
+    ownHost: true
     # Same trick as gitea above: link into the app's OIDC-start endpoint, not its login page, so a
     # user who already has a Keycloak session never sees the password form or the otomi-idp button.
     # Neither app can sit behind oauth2-proxy -- both do OIDC in-app, and a proxy in front would
