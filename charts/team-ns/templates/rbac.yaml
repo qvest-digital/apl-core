@@ -136,6 +136,53 @@ roleRef:
   kind: ClusterRole
   name: tekton-triggers-aggregate-view
 ---
+# NOTE(apl-core fork): lets a team's EventListener create Jobs in its own namespace.
+#
+# Needed by the on-demand CI runner: a Gitea `workflow_job: queued` webhook fires an EventListener
+# whose TriggerTemplate creates a Job running one ephemeral runner. Without this the EventListener
+# accepts the event and then fails to create anything, which looks exactly like the webhook never
+# arriving.
+#
+# Deliberately a namespaced Role, not an edit to the upstream `tekton-triggers-eventlistener-roles`
+# ClusterRole -- additive, scoped to the team's own namespace, and it survives an upstream sync
+# that rewrites that ClusterRole.
+#
+# This is not a privilege escalation: the same ServiceAccount can already create PipelineRuns,
+# which run arbitrary pods with the team's own service account. Creating a Job in the same
+# namespace is that same capability with a different noun. `delete` is included so the TTL
+# controller's work can also be done by hand when debugging, and so a re-sync can replace a Job
+# it previously created.
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: tekton-triggers-createjob-team-{{ $v.teamId }}
+  namespace: team-{{ $v.teamId }}
+rules:
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tekton-triggers-createjob-team-{{ $v.teamId }}
+  namespace: team-{{ $v.teamId }}
+subjects:
+  - kind: ServiceAccount
+    name: tekton-triggers-team-{{ $v.teamId }}
+    namespace: team-{{ $v.teamId }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tekton-triggers-createjob-team-{{ $v.teamId }}
+---
 kind: Role
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
