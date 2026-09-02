@@ -26,6 +26,49 @@ RUN apt-get update \
 # workflow points NODE_PATH at `npm root -g` for eslint.config.js's requires.
 RUN npm install -g eslint@9 @eslint/js@9 globals@15
 
+# --- Platform agent layer ------------------------------------------------------------------------
+#
+# Supplied by the `platform` team, built once, consumed by every team: Turnstone plus the CLIs an
+# agent calls as tools (tea, logcli, vikunja-cli). See AGENT-ENVIRONMENTS.md section 18.
+#
+# COPY --from, not FROM, so this image keeps its own curated toolchain pin above -- none of the four
+# team bases are reproducible from Debian apt at those versions, and at least one is a deliberate,
+# documented version choice. Everything under /opt/platform is relocatable and self-contained (its
+# Python is a standalone build, not the distro's), so it lands cleanly even on a base with no Python
+# at all. The path must stay /opt/platform: console-script shebangs bake it in.
+#
+# One image, two roles. This is the team's CI runner AND the image its agent node runs, so the agent
+# reproduces the merge gate with the same toolchain and the same host-mode workarounds by
+# construction -- there is only one artifact, so the two cannot drift.
+#
+# The image reference on the COPY line below is a placeholder, substituted by
+# stage_service_tree at seed time: the reference is domain-dependent, and this build context is
+# already seed-assembled (see the gitea-runner note above), so it cannot be hardcoded here.
+# --- Agent shell toolbox (baked in; this image is also the agent node) -------------------------
+# A generous set of general CLI tools so the agent (and CI) can probe HTTP, slice JSON, search code
+# fast, inspect process/network, and view/edit files -- things a minimal -slim base lacks. All four
+# team bases are Debian/Ubuntu, so this apt block is identical across them. Debian renames two
+# binaries (fd-find->fdfind, bat->batcat); symlink the friendly names the agent is told to use.
+# yq (mikefarah) rides in via /opt/platform from agent-base.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       curl wget jq ripgrep fd-find bat tree less vim-tiny nano file \
+       procps htop iproute2 dnsutils netcat-openbsd iputils-ping \
+       unzip xz-utils socat rsync ca-certificates \
+    && ln -sf "$(command -v fdfind)" /usr/local/bin/fd \
+    && ln -sf "$(command -v batcat)" /usr/local/bin/bat \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=__AGENT_BASE_IMAGE__ /opt/platform /opt/platform
+# APPENDED, never prepended. The platform layer ships its own Python, and putting it first
+# shadows the team's toolchain: on the python-based runner `python3`, `pip` and `pip3` all resolved
+# to /opt/platform, so the team's own dependencies (installed into the image's interpreter) simply
+# vanished and CI failed. Confirmed live -- prodpage's merge gate went red on exactly this.
+# Appending keeps the team's toolchain first and still finds tea/logcli/vikunja-cli/turnstone,
+# which nothing else provides. Turnstone's console scripts carry an absolute shebang into
+# /opt/platform/python/bin, so they are unaffected by the ordering either way.
+ENV PATH=$PATH:/opt/platform/bin:/opt/platform/python/bin
+
 COPY gitea-runner /usr/local/bin/gitea-runner
 COPY config.yaml /data/config.yaml
 COPY entrypoint.sh /entrypoint.sh

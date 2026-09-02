@@ -1,0 +1,173 @@
+#!/bin/sh
+# Terse Vikunja helper for the PO-desk agent. vikunja-cli emits JSON ({"data":...});
+# no jq on the node, so this trims output via the platform python -- keeping the
+# agent token-efficient. Remote ticket changes only; makes no local changes.
+V=/opt/platform/bin/vikunja-cli
+PY=/opt/platform/python/bin/python3
+export HOME=/home/gradle
+# Posted ONCE as a top comment on every desk-CREATED ticket (`vik new`). The
+# passive ticket coach skips tickets the desk created, so it never advertises
+# its commands on them -- this does, so the PO knows they can drive the coach
+# from the comments. Wording mirrors coach.py's FOOTER command list.
+HINT='<p>🧑‍💼 <strong>Drafted via the Product Owner desk.</strong> You can refine this ticket from the comments &mdash; reply with a command: <code>/coach</code> draft a description &amp; acceptance criteria &middot; <code>/estimate</code> effort &middot; <code>/risks</code> risks &middot; <code>/tests</code> test cases &middot; <code>/plan</code> dev plan &middot; <code>/split</code> break it up &middot; <code>/accept</code> save the description &middot; <code>/help</code>. Or just reply with feedback to refine.</p>'
+sub="${1:-}"; [ $# -gt 0 ] && shift
+case "$sub" in
+  projects)
+    $V projects list 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); items=d.get("data",d) if isinstance(d,dict) else d
+for p in items: print("#%s %s" % (p["id"], p["title"]))'
+    ;;
+  search|similar)
+    $V tasks list --search "$1" --per-page 8 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); items=d.get("data",d) if isinstance(d,dict) else d
+for t in (items or []): print("#%s [%s] %s" % (t["id"], "done" if t.get("done") else "open", t["title"]))'
+    ;;
+  show)
+    $V tasks get --id "$1" 2>/dev/null | $PY -c 'import sys,json,re
+d=json.load(sys.stdin); t=d.get("data",d) if isinstance(d,dict) and "data" in d else d
+desc=re.sub("<[^>]+>","",t.get("description") or "")[:500]
+print("#%s [%s] %s\nproject:%s\n%s" % (t["id"], "done" if t.get("done") else "open", t["title"], t.get("project_id"), desc))'
+    ;;
+  new)
+    _out=$($V tasks create --project-id "$2" --title "$1" 2>/dev/null)
+    _id=$(printf '%s' "$_out" | $PY -c 'import sys,json
+d=json.load(sys.stdin); t=d.get("data",d) if isinstance(d,dict) and "data" in d else d
+print(t["id"])' 2>/dev/null)
+    _title=$(printf '%s' "$_out" | $PY -c 'import sys,json
+d=json.load(sys.stdin); t=d.get("data",d) if isinstance(d,dict) and "data" in d else d
+print(t.get("title",""))' 2>/dev/null)
+    echo "created #$_id $_title"
+    # advertise the coach commands as a top comment -- the coach skips desk-created
+    # tickets, so this is the only place the PO learns the commands work here.
+    # BUT never on another team's inbox: the coach isn't active there, so the /commands
+    # would be dead. Cross-team tickets must go through `vik handoff`, not `vik new`.
+    _newpt=$($V projects list 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); items=d.get("data",d) if isinstance(d,dict) else d
+pid=str(sys.argv[1])
+for p in (items or []):
+    if str(p.get("id"))==pid: print(p.get("title","")); break' "$2")
+    case "$_newpt" in
+      *-inbox) : ;;  # inbox project -- no coach here, so no hint
+      *) [ -n "$_id" ] && $V tasks comments create --task-id "$_id" --comment "$HINT" >/dev/null 2>&1 \
+           && echo "posted coach-commands hint on #$_id" ;;
+    esac
+    ;;
+  comment)
+    $V tasks comments create --task-id "$1" --comment "$2" >/dev/null 2>&1 && echo "commented on #$1"
+    ;;
+  desc)
+    # Set the ticket DESCRIPTION (the agreed spec belongs here, not in a comment).
+    # Vikunja renders HTML.
+    $V tasks update --id "$1" --description "$2" >/dev/null 2>&1 && echo "set description on #$1"
+    ;;
+  done)
+    # Close/complete the ticket.
+    $V tasks update --id "$1" --done >/dev/null 2>&1 && echo "closed #$1"
+    ;;
+  comments)
+    $V tasks comments list --task-id "$1" 2>/dev/null | $PY -c 'import sys,json,re
+d=json.load(sys.stdin); items=d.get("data",d) if isinstance(d,dict) else d
+for c in (items or []):
+    a=(c.get("author") or {})
+    who=a.get("username") or a.get("name") or "?"
+    txt=re.sub("<[^>]+>"," ",c.get("comment") or ""); txt=re.sub("\\s+"," ",txt).strip()[:300]
+    print("[%s] %s" % (who, txt))'
+    ;;
+  handoff)
+    # Cross-team request: create a ticket in <team>-inbox (public, shared with all teams) and
+    # cross-link it with the source ticket -- the WHOLE flow, deterministically, so the agent
+    # only ever calls this one verb (never `vik new` into another team's inbox, which would post
+    # the coach-commands HINT that isn't active there). Mirrors coach.py's /handoff exactly.
+    # $1=target team, $2=source ticket id, $3="<title>", $4="<html body>".
+    _htgt="$1"; _hsrc="$2"; _htitle="$3"; _hbody="$4"
+    # Source team + domain are derived from the node, not passed -- the review node is per-team
+    # (TURNSTONE_NODE_ID=<team>-review-agent) and its vikunja-cli config carries the base URL.
+    _hsteam=${TURNSTONE_NODE_ID%-review-agent}; [ -n "$_hsteam" ] || _hsteam="another"
+    _hdom=$(sed -n 's|^url *= *"https://vikunja\.\([^"]*\)".*|\1|p' "$HOME/.config/vikunja-cli/config.toml" 2>/dev/null | head -1)
+    _hpid=$($V projects list 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); items=d.get("data",d) if isinstance(d,dict) else d
+tgt=sys.argv[1]
+for p in (items or []):
+    if p.get("title")==tgt: print(p["id"]); break' "$_htgt-inbox")
+    if [ -z "$_hpid" ]; then echo "no inbox for team '$_htgt' (looked for '$_htgt-inbox') -- is that team set up with a public inbox?"; exit 1; fi
+    _hnid=$($V tasks create --project-id "$_hpid" --title "$_htitle" 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); t=d.get("data",d) if isinstance(d,dict) and "data" in d else d
+print(t["id"])')
+    if [ -z "$_hnid" ]; then echo "failed to create the request ticket in $_htgt-inbox"; exit 1; fi
+    # Provenance goes in the DESCRIPTION (with the body), a source backlink goes on the SOURCE
+    # ticket as a comment -- both sides cross-referenced, no coach-commands HINT anywhere.
+    _hsrclink="#$_hsrc"; [ -n "$_hdom" ] && _hsrclink="<a href=\"https://vikunja.$_hdom/tasks/$_hsrc\">#$_hsrc</a>"
+    _hnewlink="#$_hnid $_htitle"; [ -n "$_hdom" ] && _hnewlink="<a href=\"https://vikunja.$_hdom/tasks/$_hnid\">#$_hnid $_htitle</a>"
+    $V tasks update --id "$_hnid" --description "$_hbody<hr><p>🤝 Cross-team request from the <strong>$_hsteam</strong> team. Source ticket: $_hsrclink.</p>" >/dev/null 2>&1
+    [ -n "$_hsrc" ] && $V tasks comments create --task-id "$_hsrc" --comment "<p>🤝 Filed a change request with the <strong>$_htgt</strong> team: $_hnewlink (in their inbox).</p>" >/dev/null 2>&1
+    echo "filed request #$_hnid in $_htgt-inbox: $_htitle (source #$_hsrc cross-linked)"
+    ;;
+  me)
+    # Current Vikunja user id -- the agent's own identity, for self-unassign.
+    $V user get 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); u=d.get("data",d) if isinstance(d,dict) and "data" in d else d
+print(u.get("id",""))'
+    ;;
+  assignees)
+    # List a task'"'"'s assignees (id + username).
+    $V tasks assignees list --task-id "$1" 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); items=d.get("data",d) if isinstance(d,dict) else d
+for a in (items or []): print("#%s %s" % (a.get("id"), a.get("username") or a.get("name") or "?"))'
+    ;;
+  move)
+    # Move a task to a named kanban bucket ("To-Do" | "Doing" | "Done"). Resolves name->id.
+    $V tasks move --id "$1" --bucket "$2" >/dev/null 2>&1 && echo "moved #$1 to bucket \"$2\"" || echo "vik move: failed (#$1 -> \"$2\")"
+    ;;
+  unassign)
+    # Remove an assignee from a task; defaults to SELF (the agent) when no user id is given.
+    _uid="$2"
+    [ -n "$_uid" ] || _uid=$($V user get 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); u=d.get("data",d) if isinstance(d,dict) and "data" in d else d
+print(u.get("id",""))')
+    if [ -n "$_uid" ]; then
+      $V tasks assignees remove --task-id "$1" --user-id "$_uid" >/dev/null 2>&1 \
+        && echo "unassigned user $_uid from #$1" || echo "vik unassign: failed (#$1 user $_uid)"
+    else
+      echo "vik unassign: could not resolve a user id"
+    fi
+    ;;
+  status)
+    # Upsert THIS agent's SINGLE status comment on a ticket -- update-in-place like the coach, so
+    # progress/decisions live in one evolving comment instead of a pile of new ones. The branded
+    # blockquote FRAME (the "Dev agent" box) is added HERE, so callers pass only the body content
+    # (HTML: <p>, <ul><li>, <strong>, <code>). Marked with a hidden tag so it is found again.
+    # $1=id, $2="<html body>".
+    _stid="$1"
+    _sthtml="<blockquote><p>🤖 <strong>Dev agent</strong></p>$2</blockquote>"
+    _stmark="<!-- dev-agent -->"
+    _stme=$($V user get 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); u=d.get("data",d) if isinstance(d,dict) and "data" in d else d
+print(u.get("id",""))')
+    _stcid=$($V tasks comments list --task-id "$_stid" 2>/dev/null | $PY -c 'import sys,json
+d=json.load(sys.stdin); items=d.get("data",d) if isinstance(d,dict) else d
+me=sys.argv[1]
+for c in (items or []):
+    a=(c.get("author") or {})
+    if str(a.get("id"))==me and "<!-- dev-agent -->" in (c.get("comment") or ""): print(c["id"]); break' "$_stme")
+    if [ -n "$_stcid" ]; then
+      $V tasks comments update --task-id "$_stid" --id "$_stcid" --comment "$_sthtml$_stmark" >/dev/null 2>&1 \
+        && echo "updated status on #$_stid" || echo "vik status: update failed on #$_stid"
+    else
+      $V tasks comments create --task-id "$_stid" --comment "$_sthtml$_stmark" >/dev/null 2>&1 \
+        && echo "posted status on #$_stid" || echo "vik status: create failed on #$_stid"
+    fi
+    ;;
+  handback)
+    # Deterministic hand-back to the PO (mirrors the coach's in-code actuation): set the single
+    # status comment to the reason, move the ticket back to To-Do, and unassign yourself -- one
+    # command, so nothing is half-done. $1=id, $2="<html reason>". Moving out of Doing / unassigning
+    # is what tears the environment down.
+    "$0" status "$1" "<p><strong>⛔ Handed back for clarification.</strong></p>$2"
+    "$0" move "$1" "To-Do"
+    "$0" unassign "$1"
+    echo "handed back #$1 (status comment set, moved to To-Do, unassigned)"
+    ;;
+  *)
+    echo 'usage: vik projects | search <kw> | similar <kw> | show <id> | comments <id> | new "<title>" <project-id> | comment <id> "<text>" | desc <id> "<html>" | done <id> | handoff <team> <source-id> "<title>" "<html>" | me | assignees <id> | move <id> "<bucket>" | unassign <id> [<user-id>] | status <id> "<html>" | handback <id> "<html-reason>"'
+    ;;
+esac

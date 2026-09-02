@@ -1,0 +1,31 @@
+#!/bin/sh
+# Rehearse the team's real Gitea Actions pipeline locally, in HOST mode (no Docker) -- the SAME
+# engine (gitea-runner vendors nektos/act), the SAME workflow file, and the SAME toolchain the
+# cluster's merge-gate runner uses (this node IS the ci-runner image). A green run here means the
+# merge gate will go green when you open the PR. Run this from INSIDE the repo checkout, before
+# `pr open`, and again after any `/rework` or `/resolve`.
+#
+# Notes for the curious: host mode is gitea-runner's `-i -self-hosted` flag -- NOT act's
+# `-P label=-self-hosted` (there is no standalone `act` binary on the node; gitea-runner is act).
+# The workflow's checkout step needs GITHUB_TOKEN + the GITHUB_* context (see demo-seed/ci-local.sh);
+# we derive them from the node's git remote and mounted credential so you don't pass anything.
+set -eu
+WF="${1:-.gitea/workflows/ci.yml}"
+CREDS=/etc/turnstone-git/credentials
+REMOTE=$(git config --get remote.origin.url 2>/dev/null || true)   # https://gitea.<domain>/team-x/repo.git
+case "$REMOTE" in
+  https://*) : ;;
+  *) echo "citest: run this from inside a cloned repo (no https 'origin' remote found)"; exit 1 ;;
+esac
+HOST=$(printf '%s' "$REMOTE" | sed -E 's#https://([^/]+)/.*#\1#')            # gitea.<domain>
+REPO=$(printf '%s' "$REMOTE" | sed -E 's#https://[^/]+/(.*)\.git$#\1#')       # team-x/repo
+TOKEN=$(sed -E 's#https://[^:]+:([^@]+)@.*#\1#' "$CREDS" 2>/dev/null | head -1)
+[ -n "$TOKEN" ] || { echo "citest: no git token at $CREDS -- is this a dev-bot node?"; exit 1; }
+echo "citest: rehearsing $WF against $REPO on host (no Docker)"
+exec gitea-runner exec -E push -W "$WF" -i -self-hosted \
+  --env GITHUB_SERVER_URL="https://$HOST" \
+  --env GITHUB_REPOSITORY="$REPO" \
+  --env GITHUB_API_URL="https://$HOST/api/v1" \
+  --env GIT_SSL_NO_VERIFY=1 \
+  -s GITHUB_TOKEN="$TOKEN" \
+  --pull=false

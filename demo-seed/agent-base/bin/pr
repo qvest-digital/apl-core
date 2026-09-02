@@ -1,0 +1,166 @@
+#!/bin/sh
+# Terse Gitea PR (pull request) helper for the dev-bot agent -- the forge-as-a-skill that
+# AGENT-ENVIRONMENTS.md §14 flagged as the next step. Wraps `tea` (already configured on the node
+# by the broker's copy-creds: ~/.config/tea/config.yml), python-trims JSON (no jq on the node),
+# and infers the repo from the current git checkout's remote -- so RUN IT FROM INSIDE THE REPO.
+V=/opt/platform/bin/tea
+PY=/opt/platform/python/bin/python3
+export HOME=/home/gradle
+
+# Machine tag stamped into every PR this bot opens, so teardown/rework can map a PR back to its
+# node without a callback. Derived from the node id (<team>-tk<ticket>-agent), never passed.
+NODE="${TURNSTONE_NODE_ID:-}"
+_team=""; _ticket=""
+case "$NODE" in
+  *-tk*-agent) _team="${NODE%%-tk*}"; _rest="${NODE#*-tk}"; _ticket="${_rest%-agent}" ;;
+esac
+TAG="<!-- dev-agent team=$_team ticket=$_ticket node=$NODE -->"
+
+sub="${1:-}"; [ $# -gt 0 ] && shift
+case "$sub" in
+  open)
+    # open "<title>" "<html/markdown body>" [base-branch]
+    # Head defaults to the current branch; base defaults to the repo's default branch (or $3).
+    _br=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ -z "$_br" ] || [ "$_br" = "HEAD" ]; then
+      echo "pr open: not on a named branch (detached HEAD?) -- create a feature branch first"; exit 1
+    fi
+    _base="$3"
+    set -- create -t "$1" -d "$2
+$TAG"
+    [ -n "$_base" ] && set -- "$@" --base "$_base"
+    $V pulls "$@" >/dev/null 2>&1 || { echo "pr open: tea pulls create failed (already a PR for $_br? branch not pushed?)"; exit 1; }
+    # Fetch the index+url of the PR whose head is our branch (create's own output is not machine-parseable).
+    $V pulls list --state open --fields index,head,url --output json 2>/dev/null | $PY -c 'import sys,json
+s=sys.stdin.read().strip()
+try: d=json.loads(s) if s else []
+except Exception: d=[]
+br=sys.argv[1]
+for p in (d or []):
+    if (p.get("head") or "").split(":")[-1]==br:
+        print("opened PR #%s %s" % (p.get("index"), p.get("url"))); break
+else: print("PR opened for %s (index not resolved)" % br)' "$_br"
+    ;;
+  comment)
+    # comment <pr-index> "<html/markdown>"
+    $V comments add "$1" -d "$2" >/dev/null 2>&1 && echo "commented on PR #$1" || echo "pr comment: failed on #$1"
+    ;;
+  note)
+    # note <pr-index> "<html body>" -- your SINGLE evolving "Dev agent" comment on the PR, the
+    # analog of `vik status` for the ticket. Upserts (updates in place) via a hidden marker kept
+    # FIRST in the body, because `tea comments list` TRUNCATES the body field -- a trailing marker
+    # would be invisible to detection. Gitea renders the leading HTML comment as nothing. Adds the
+    # branded box; pass only body content.
+    _pnid="$1"
+    _framed="<!-- dev-agent --><blockquote><p>🤖 <strong>Dev agent</strong></p>$2</blockquote>"
+    _pncid=$($V comments list "$_pnid" --output json 2>/dev/null | $PY -c 'import sys,json
+s=sys.stdin.read().strip()
+try: d=json.loads(s) if s else []
+except: d=[]
+items=d if isinstance(d,list) else (d.get("data") or [])
+for c in (items or []):
+    if "<!-- dev-agent -->" in (c.get("body") or ""): print(c.get("id")); break')
+    if [ -n "$_pncid" ]; then
+      $V comments edit "$_pncid" -d "$_framed" >/dev/null 2>&1 && echo "updated PR note on #$_pnid" || echo "pr note: edit failed on #$_pnid"
+    else
+      $V comments add "$_pnid" -d "$_framed" >/dev/null 2>&1 && echo "posted PR note on #$_pnid" || echo "pr note: add failed on #$_pnid"
+    fi
+    ;;
+  reply)
+    # reply <pr-index> "<html body>" -- post a NEW branded "Dev agent" comment (append, NOT the
+    # single evolving one). Use this to ANSWER a reviewer's /rework or /resolve: your response then
+    # lands in the conversation right below their comment, instead of silently editing your status
+    # note way up the thread. Deliberately carries NO `<!-- dev-agent -->` marker, so `pr note` never
+    # mistakes it for the evolving status comment. Adds the branded box; pass only body content.
+    _rpid="$1"
+    _rframed="<blockquote><p>🤖 <strong>Dev agent</strong></p>$2</blockquote>"
+    $V comments add "$_rpid" -d "$_rframed" >/dev/null 2>&1 && echo "replied on PR #$_rpid" || echo "pr reply: failed on #$_rpid"
+    ;;
+  comments)
+    # comments <pr-index> -- read the discussion (author + trimmed text per line)
+    $V comments list "$1" --output json 2>/dev/null | $PY -c 'import sys,json,re
+s=sys.stdin.read().strip()
+try: d=json.loads(s) if s else []
+except Exception: d=[]
+items=d if isinstance(d,list) else (d.get("data") or [])
+for c in (items or []):
+    u=(c.get("poster") or c.get("user") or {})
+    who=u.get("login") or u.get("username") or "?"
+    txt=re.sub("<!--.*?-->","",c.get("body") or "")           # drop machine tags
+    txt=re.sub("\\s+"," ",re.sub("<[^>]+>"," ",txt)).strip()[:300]
+    if txt: print("[%s] %s" % (who, txt))'
+    ;;
+  status)
+    # status <pr-index> -- the CI check state for the PR (this is the merge gate result)
+    $V pulls list --state all --fields index,ci --output json 2>/dev/null | $PY -c 'import sys,json
+s=sys.stdin.read().strip()
+try: d=json.loads(s) if s else []
+except Exception: d=[]
+n=str(sys.argv[1])
+for p in (d or []):
+    if str(p.get("index"))==n:
+        print("PR #%s CI: %s" % (n, p.get("ci") or "(none reported)")); break
+else: print("PR #%s not found" % n)' "$1"
+    ;;
+  ready)
+    # ready <pr-index> -- mark a draft PR ready for review (strips the "WIP:" prefix).
+    $V pulls edit "$1" --ready >/dev/null 2>&1 && echo "PR #$1 marked ready for review" || echo "pr ready: failed on #$1"
+    ;;
+  draft)
+    # draft <pr-index> -- mark a PR as draft/WIP (not ready to merge).
+    $V pulls edit "$1" --draft >/dev/null 2>&1 && echo "PR #$1 marked draft (WIP)" || echo "pr draft: failed on #$1"
+    ;;
+  show)
+    # show <pr-index> -- title/state/ci/head/base + trimmed body
+    $V pulls list --state all --fields index,title,state,ci,head,base,body --output json 2>/dev/null | $PY -c 'import sys,json,re
+s=sys.stdin.read().strip()
+try: d=json.loads(s) if s else []
+except Exception: d=[]
+n=str(sys.argv[1])
+for p in (d or []):
+    if str(p.get("index"))==n:
+        body=re.sub("<!--.*?-->","",p.get("body") or "")
+        body=re.sub("\\s+"," ",re.sub("<[^>]+>"," ",body)).strip()[:500]
+        print("PR #%s [%s] %s\nhead:%s base:%s CI:%s\n%s" % (
+            n, p.get("state"), p.get("title"), p.get("head"), p.get("base"), p.get("ci") or "-", body)); break
+else: print("PR #%s not found" % n)' "$1"
+    ;;
+  preview)
+    # preview [path] [needle] -- fetch YOUR PR's live preview and show it, so you can VERIFY your
+    # change is actually deployed BEFORE you report it ready. The preview redeploys a short while
+    # AFTER `git push` (image rebuild + rollout, ~1-2 min) -- so if your change isn't visible yet,
+    # WAIT a few seconds and run this again (retry a handful of times). There is no curl on the node,
+    # so this fetches via python. The URL is derived from your node id + domain
+    # (https://app-tk<ticket>-<team>.<domain>); pass a path (default /) and an optional needle string
+    # to check the rendered HTML for (e.g. your new heading text).
+    _pvpath="${1:-/}"; _pvneedle="${2:-}"
+    TEAM="$_team" TICKET="$_ticket" PVPATH="$_pvpath" NEEDLE="$_pvneedle" $PY - <<'PVEOF'
+import os,sys,re,ssl,urllib.request
+team=os.environ.get("TEAM",""); ticket=os.environ.get("TICKET","")
+path=os.environ.get("PVPATH","/") or "/"; needle=os.environ.get("NEEDLE","")
+home=os.environ.get("HOME","/home/gradle"); dom=""
+try:
+    for line in open(home+"/.config/tea/config.yml"):
+        m=re.search(r'url:\s*https://gitea\.(\S+)', line)
+        if m: dom=m.group(1); break
+except Exception: pass
+if not (team and ticket and dom):
+    print("pr preview: cannot derive URL (team=%r ticket=%r domain=%r)"%(team,ticket,dom)); sys.exit(1)
+if not path.startswith("/"): path="/"+path
+url="https://app-tk%s-%s.%s%s"%(ticket,team,dom,path)
+ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+try:
+    r=urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"dev-agent"}),timeout=20,context=ctx)
+    body=r.read().decode("utf-8","replace"); code=r.getcode()
+except Exception as e:
+    print("GET %s -> FAILED: %s"%(url,e)); sys.exit(2)
+text=re.sub(r"\s+"," ",re.sub(r"<[^>]+>"," ",body)).strip()
+print("GET %s -> HTTP %s (%d bytes)"%(url,code,len(body)))
+if needle: print(("FOUND" if needle in body else "NOT FOUND")+": %r"%needle)
+print("--- visible text (first 800 chars) ---"); print(text[:800])
+PVEOF
+    ;;
+  *)
+    echo 'usage (run inside the repo checkout): pr open "<title>" "<body>" [base] | note <n> "<html>" | reply <n> "<html>" | comment <n> "<html>" | comments <n> | status <n> | show <n> | ready <n> | draft <n> | preview [path] [needle]'
+    ;;
+esac
