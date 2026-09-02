@@ -3,10 +3,18 @@
 {{- /* The ORCS mirror only carries released tags, not branch builds. */ -}}
 {{- $isRelease := regexMatch "^v?[0-9]" $v.otomi.version }}
 image:
-  {{- if and $v.otomi.linodeLkeImageRepository $isRelease }}
+  {{- /* coreImageRepository is the full reference and wins; linodeLkeImageRepository is the host-only form. */ -}}
+  {{- $coreImageRepository := $v.otomi | get "coreImageRepository" nil }}
+  {{- if $coreImageRepository }}
+  repository: "{{ $coreImageRepository }}"
+  {{- else if and $v.otomi.linodeLkeImageRepository $isRelease }}
   repository: "{{ $v.otomi.linodeLkeImageRepository }}/docker/linode/apl-core"
   {{- end }}
   tag: {{ $v.otomi.version }}
+{{- with $v.otomi | get "coreImagePullPolicy" nil }}
+otomi:
+  coreImagePullPolicy: {{ . }}
+{{- end }}
 
 {{- with $v.otomi | get "globalPullSecret" nil }}
 imagePullSecretNames:

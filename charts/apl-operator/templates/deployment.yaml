@@ -3,7 +3,9 @@
 {{- $isRelease := regexMatch "^v?[0-9]" $version }}
 {{- /* Mirrors snippets/derived.gotmpl, but the ORCS mirror only carries released tags. */ -}}
 {{- $useORCS := and .Values.otomi.useORCS (eq (.Values.cluster.provider | default "") "linode") $isRelease }}
-{{- $repository := .Values.image.repository | default (ternary "mirror.registry.linodelke.net/docker/linode/apl-core" "docker.io/linode/apl-core" $useORCS) }}
+{{- /* otomi.coreImageRepository: the full reference (no tag), one value for chart/apl and the apl-operator release the platform later manages for itself. */ -}}
+{{- $repository := .Values.image.repository | default .Values.otomi.coreImageRepository | default (ternary "mirror.registry.linodelke.net/docker/linode/apl-core" "docker.io/linode/apl-core" $useORCS) }}
+{{- $pullPolicy := .Values.otomi.coreImagePullPolicy | default (ternary "IfNotPresent" "Always" $isRelease) }}
 {{- if not .Values.installation.skipOperatorDeployment }}
 apiVersion: apps/v1
 kind: Deployment
@@ -53,7 +55,7 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ $repository }}:{{ $version }}"
-          imagePullPolicy: {{ ternary "IfNotPresent" "Always" $isRelease }}
+          imagePullPolicy: {{ $pullPolicy }}
           workingDir: /home/app/stack
           {{- with .Values.command }}
           command:

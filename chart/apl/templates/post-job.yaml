@@ -1,7 +1,9 @@
 {{- $version := .Values.image.tag | default .Values.otomi.version | default .Chart.AppVersion }}
 {{- $isRelease := regexMatch "^v?[0-9]" $version }}
 {{- $useORCS := and .Values.otomi.useORCS (eq (.Values.cluster.provider | default "") "linode") $isRelease }}
-{{- $repository := .Values.image.repository | default (ternary "mirror.registry.linodelke.net/docker/linode/apl-core" "docker.io/linode/apl-core" $useORCS) }}
+{{- /* otomi.coreImageRepository: the full reference (no tag), one value for chart/apl and the apl-operator release the platform later manages for itself. */ -}}
+{{- $repository := .Values.image.repository | default .Values.otomi.coreImageRepository | default (ternary "mirror.registry.linodelke.net/docker/linode/apl-core" "docker.io/linode/apl-core" $useORCS) }}
+{{- $pullPolicy := .Values.otomi.coreImagePullPolicy | default (ternary "IfNotPresent" "Always" $isRelease) }}
 
 apiVersion: batch/v1
 kind: Job
@@ -34,7 +36,7 @@ spec:
       containers:
         - name: destroy
           image: "{{ $repository }}:{{ $version }}"
-          imagePullPolicy: {{ ternary "IfNotPresent" "Always" $isRelease }}
+          imagePullPolicy: {{ $pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
