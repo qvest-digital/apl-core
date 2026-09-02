@@ -99,12 +99,54 @@ resources:
     name: turnstone-model-config
   data:
     config.toml: |
+      # Every entry is named by LITERAL alias, and defaultModel only selects between them at the
+      # bottom. It used to name the first entry ([models.{{"{{"}} $model {{"}}"}}]), which quietly made haiku
+      # undefaultable: setting defaultModel to claude-haiku-4-5 emitted that table twice -- once
+      # from the template, once from the block below -- and duplicate tables are a TOML parse
+      # error, so the pod would have come up healthy with an empty model registry.
+      #
+      # base_url and context_window are spelled out on every entry, for the two reasons the comment
+      # above this ConfigMap gives at length: without base_url the loader inherits a localhost
+      # vLLM convention and every request fails with connection refused, and without
+      # context_window it inherits a 32768 ceiling that silently DROPS tool results once a session
+      # outgrows it. claude-sonnet-5 and claude-haiku-4-5 both really have 200000.
+      [models.claude-sonnet-5]
+      provider = "anthropic"
+      model = "claude-sonnet-5"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+
+      # The default on this lab, deliberately. Most traffic here is trivial -- smoke-testing a new
+      # node, asking which host it is on, checking a tool is wired up -- and that costs the same as
+      # real work when the only model on offer is the expensive one. Sonnet stays defined and is
+      # selectable per conversation in the console, so nothing is lost by defaulting to haiku.
+      [models.claude-haiku-4-5]
+      provider = "anthropic"
+      model = "claude-haiku-4-5-20251001"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+
+      # The heavyweight, offered but never the default: selectable per conversation for work that
+      # actually needs it. Same 200000 window as the other two.
+      [models.claude-opus-5]
+      provider = "anthropic"
+      model = "claude-opus-5"
+      base_url = "https://api.anthropic.com"
+      context_window = 200000
+      api_key = "${ANTHROPIC_API_KEY}"
+{{- if and (ne $model "claude-sonnet-5") (ne $model "claude-haiku-4-5") (ne $model "claude-opus-5") }}
+
+      # defaultModel names neither entry above, so it is defined here rather than left dangling:
+      # [model] default pointing at an undefined alias is the empty-registry failure again.
       [models.{{ $model }}]
       provider = "anthropic"
       model = "{{ $model }}"
       base_url = "https://api.anthropic.com"
       context_window = 200000
       api_key = "${ANTHROPIC_API_KEY}"
+{{- end }}
 
       [model]
       default = "{{ $model }}"
@@ -360,7 +402,14 @@ resources:
                     "read,write,conversation.modify,"
                     "workstreams.create,workstreams.close,"
                     "project.create,project.read,project.write,project.delete,"
-                    "persona.read,tools.approve"
+                    # "approve" is the SCOPE the approval endpoint gates on, and it is NOT implied by
+                    # "tools.approve". Turnstone derives scopes in core/auth.py:_permissions_to_scopes, which
+                    # only promotes a permission literally named read/write/approve, or any admin.* one --
+                    # "tools.approve" matches neither and contributes nothing. Without the bare "approve" a team
+                    # admin sees the approval prompt, clicks it, and the POST to .../workstreams/<id>/approve
+                    # returns 403 with nothing surfaced in the UI: the tool call never runs and the conversation
+                    # hangs. Verified live 2026-08-29 on Turnstone 1.8.1.
+                    "persona.read,tools.approve,approve"
                 )
                 now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
                 engine = sa.create_engine(os.environ["TURNSTONE_DB_URL"])

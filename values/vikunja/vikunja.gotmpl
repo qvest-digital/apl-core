@@ -103,6 +103,13 @@ vikunja:
   env:
     # Vikunja builds its config map from VIKUNJA_<SECTION>_<KEY> env vars and
     # merges them over config.yml, including nested provider keys.
+    # Vikunja vendors an SSRF guard (code.dny.dev/ssrf) that denies 10.0.0.0/8 --
+    # this cluster's pod AND service CIDRs -- on every outbound call, webhooks
+    # included, so webhook delivery to any in-cluster EventListener is silently
+    # dropped without it. Required for the agent-workflow webhooks (Vikunja ->
+    # Tekton EventListener). Trades SSRF protection for cluster-internal reach;
+    # see VIKUNJA-TURNSTONE-PIPELINE.md bug #1.
+    VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS: "true"
     # The chart's own template reads this one to decide whether to add the
     # SQLite path, so it must be set even though config.yml already says it.
     VIKUNJA_DATABASE_TYPE: postgres
