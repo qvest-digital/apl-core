@@ -8,8 +8,10 @@ cluster:
     disableHttp2: false
 namespace: ""
 resourceQuota:
+  # fork: raise the pod cap high so a team namespace is never blocked from creating pods on this
+  # demo lab (no cpu/memory quota is set here, so the only ceiling is the node's real capacity).
   - name: pods
-    value: "50"
+    value: "1000"
   - name: services.loadbalancers
     value: "0"
 apps: {}

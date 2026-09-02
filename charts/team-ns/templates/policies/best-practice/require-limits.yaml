@@ -21,7 +21,7 @@ metadata:
       requests and memory limits.
   labels: {{- include "team-ns.chart-labels" $ | nindent 4 }}
 spec:
-  validationFailureAction: {{ $p.action }}
+  validationFailureAction: Audit  # fork: never BLOCK on missing requests/limits -- report only
   background: true
   failurePolicy: Fail
   rules:
