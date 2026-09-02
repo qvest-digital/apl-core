@@ -20,11 +20,13 @@
   Values may override any component version. versions.yaml in the repo root floats several
   components on `main` (see UPGRADE.md); this lets an installation pin them -- or point at a
   locally built image -- without editing a tracked upstream file.
+
   merge's DESTINATION wins, and `X | merge Y` calls merge(Y, X) -- so the override has to be the
   argument and not the piped value. Backwards, this silently keeps versions.yaml and drops the
   values, with no error and no warning. deepCopy because merge mutates its destination.
 */}}
 {{- $versions = $versions | merge (deepCopy ($v | get "versions" dict)) }}
+{{- /* core follows otomi.version and is not overridable, so it is applied last and wins. */}}
 {{- $versions = $versions | merge (dict "core" $otomiVersion) }}
 # Domain suffix may not be present during initial deployment stage
 {{- $domainSuffix := $v | get "cluster.domainSuffix" nil }}
@@ -238,6 +240,8 @@ environments:
           giteaDbUsername: gitea
           keycloakDomain: {{ printf "keycloak.%s" $domainSuffix }}
           harborDomain: {{ printf "harbor.%s" $domainSuffix }}
+          vikunjaDomain: {{ printf "vikunja.%s" $domainSuffix }}
+          vikunjaDbUsername: vikunja
           tlsSecretName: {{ $tlsSecretName }}
           egressGatewayName: {{ $egressGatewayName }}
           egressGatewayLabel: {{ $egressGatewayLabel }}

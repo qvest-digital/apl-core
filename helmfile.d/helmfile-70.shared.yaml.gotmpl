@@ -21,6 +21,19 @@ releases:
     labels:
       pkg: harbor
     <<: *default
+  - name: vikunja-artifacts
+    installed: {{ $a | get "vikunja.enabled" }}
+    namespace: vikunja
+    labels:
+      pkg: vikunja
+      app: core
+    <<: *raw
+  - name: vikunja
+    installed: {{ $a | get "vikunja.enabled" }}
+    namespace: vikunja
+    labels:
+      pkg: vikunja
+    <<: *default
   - name: oauth2-proxy
     # TODO: remove oauth dependency
     installed: true
