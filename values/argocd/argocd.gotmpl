@@ -204,6 +204,16 @@ configs:
     resource.customizations.ignoreDifferences.admissionregistration.k8s.io_ValidatingWebhookConfiguration: |
         jqPathExpressions:
             - '.metadata.generation'
+    ### Tekton's admission webhook writes back the embedded task's `spec` as an explicit null
+    ### (EmbeddedTask.Spec is a runtime.RawExtension, which cannot be omitted). Server-side apply
+    ### treats a null in the desired state as a deletion, so a Pipeline synced with
+    ### ServerSideApply=true -- every admin-team workload gets that -- stays OutOfSync on this one
+    ### field forever, and its retry loop rewrites the parent Application (chart: "" dropped by
+    ### SetAppOperation's typed Update). Found live 2026-09-04.
+    resource.customizations.ignoreDifferences.tekton.dev_Pipeline: |
+        jqPathExpressions:
+          - '.spec.tasks[]?.taskSpec.spec'
+          - '.spec.finally[]?.taskSpec.spec'
     oidc.config: |
       name: Otomi
       issuer: {{ $v._derived.oidcBaseUrl }}
