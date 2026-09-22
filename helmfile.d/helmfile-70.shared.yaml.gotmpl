@@ -47,6 +47,28 @@ releases:
     labels:
       pkg: vikunja
     <<: *default
+  - name: penpot-artifacts
+    installed: {{ $a | get "penpot.enabled" }}
+    namespace: penpot
+    labels:
+      pkg: penpot
+      app: core
+    <<: *raw
+  - name: penpot
+    installed: {{ $a | get "penpot.enabled" }}
+    namespace: penpot
+    labels:
+      pkg: penpot
+    <<: *default
+  - name: penpot-valkey
+    installed: {{ $a | get "penpot.enabled" }}
+    namespace: penpot
+    labels:
+      pkg: penpot
+      app: core
+    chart: ../charts/valkey
+    values:
+      - ../values/penpot/penpot-valkey.gotmpl
   - name: oauth2-proxy
     # TODO: remove oauth dependency
     installed: true

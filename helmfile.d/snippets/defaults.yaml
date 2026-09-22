@@ -215,6 +215,36 @@ environments:
                 requests:
                   cpu: 100m
                   memory: 256Mi
+          penpot:
+            _rawValues: {}
+            enabled: false
+            persistence:
+              size: 5Gi
+            resources:
+              backend:
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+              frontend:
+                # 256Mi OOMKilled the nginx container almost immediately on a live install
+                # (exitCode 137, confirmed 2026-09-23) -- it does more at startup than serve
+                # static files, apparently including compressing/indexing the SPA bundle.
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+              exporter:
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
           grafana:
             enabled: false
             resources:
@@ -1166,6 +1196,32 @@ environments:
               max_connections: "32"
               shared_buffers: 64MB
               work_mem: 2MB
+          penpot:
+            imageName: null
+            size: 5Gi
+            walStorageSize: 5Gi
+            replicas: 2
+            recovery: {}
+            externalClusters: []
+            # Same sizing rationale as vikunja above: small dataset, low-complexity queries.
+            resources:
+              limits:
+                cpu: "200m"
+                memory: 192Mi
+              requests:
+                cpu: "200m"
+                memory: 192Mi
+            backupSidecarResources:
+              limits:
+                cpu: "300m"
+                memory: 256Mi
+              requests:
+                cpu: "50m"
+                memory: 48Mi
+            postgresqlParameters:
+              max_connections: "32"
+              shared_buffers: 64MB
+              work_mem: 2MB
           gitea:
             imageName: null
             size: 5Gi
@@ -1224,6 +1280,11 @@ environments:
               retentionPolicy: 7d
               schedule: 0 0 * * *
               pathSuffix: vikunja
+            penpot:
+              enabled: false
+              retentionPolicy: 7d
+              schedule: 0 0 * * *
+              pathSuffix: penpot
           gitea:
             enabled: false
             retentionPolicy: 7d

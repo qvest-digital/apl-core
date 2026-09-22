@@ -267,3 +267,14 @@ appsInfo:
     dependencies: Keycloak
     about: Vikunja is the open-source, self-hostable to-do app. It organizes tasks in projects, with list, gantt, table and kanban views, labels, reminders, filters and sharing, and offers a CalDAV interface and a full REST API.
     integration: App Platform runs one shared Vikunja instance for the whole cluster. Access is provided by the OIDC integration in App Platform, so members sign in through Keycloak and their account is created on first login. Vikunja teams are not currently synced from platform teams -- set them up inside Vikunja directly.
+  penpot:
+    title: Penpot
+    appVersion: 2.17.2
+    repo: https://github.com/penpot/penpot
+    maintainers: Penpot
+    relatedLinks:
+      - https://help.penpot.app/
+    license: MPL-2.0
+    dependencies: Keycloak
+    about: Penpot is the open-source design and prototyping platform for product teams -- an alternative to Figma, with vector editing, boards, components, design tokens and interactive prototyping.
+    integration: App Platform runs one shared Penpot instance for the whole cluster. Access is provided by the OIDC integration in App Platform, so members sign in through Keycloak and their account -- along with a personal team -- is created on first login. Penpot teams are not currently synced from platform teams; set up further collaboration inside Penpot directly.
