@@ -53,6 +53,8 @@ environments:
           storageClass: {{ $defaultStorageClass | quote }}
         turnstone:
           storageClass: {{ $defaultStorageClass | quote }}
+        penpot:
+          storageClass: {{ $defaultStorageClass | quote }}
       teamConfig:
       {{- range $teamName := $teamNames }}
         {{ $teamName }}:
