@@ -2513,6 +2513,40 @@ properties:
                 $ref: '#/definitions/resources'
           networkPolicies:
             $ref: '#/definitions/appNetworkPolicyConfig'
+      penpot:
+        properties:
+          _rawValues:
+            $ref: '#/definitions/rawValues'
+          enabled:
+            type: boolean
+            default: false
+          secretKey:
+            type: string
+            description: This secret was generated and cannot be changed without logging out every user.
+            x-secret: '{{ randAlphaNum 32 }}'
+            readOnly: true
+          postgresqlPassword:
+            type: string
+            description: This password was generated and cannot be changed without manual intervention.
+            x-secret: '{{ randAlphaNum 20 }}'
+            readOnly: true
+          persistence:
+            additionalProperties: false
+            properties:
+              size:
+                type: string
+                description: Size of the volume holding uploaded assets when object storage is not configured
+          resources:
+            additionalProperties: false
+            properties:
+              backend:
+                $ref: '#/definitions/resources'
+              frontend:
+                $ref: '#/definitions/resources'
+              exporter:
+                $ref: '#/definitions/resources'
+          networkPolicies:
+            $ref: '#/definitions/appNetworkPolicyConfig'
       otel:
         properties:
           _rawValues:
@@ -3061,6 +3095,20 @@ properties:
                 type: string
                 pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])$'
                 default: vikunja
+          penpot:
+            title: Penpot
+            properties:
+              enabled:
+                type: boolean
+                default: false
+              retentionPolicy:
+                $ref: '#/definitions/backupRetentionPolicy'
+              schedule:
+                $ref: '#/definitions/backupSchedule'
+              pathSuffix:
+                type: string
+                pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])$'
+                default: penpot
       gitea:
         type: object
         title: Gitea
@@ -3227,6 +3275,37 @@ properties:
             default: []
       vikunja:
         title: Vikunja
+        properties:
+          size:
+            type: string
+          storageClass:
+            type: string
+          walStorageSize:
+            type: string
+          resources:
+            $ref: '#/definitions/resources'
+          backupSidecarResources:
+            $ref: '#/definitions/resources'
+          postgresqlParameters:
+            type: object
+            additionalProperties:
+              type: string
+            default: {}
+          replicas:
+            type: integer
+            default: 2
+          recovery:
+            type: object
+            additionalProperties: true
+            default: {}
+          externalClusters:
+            type: array
+            items:
+              type: object
+              additionalProperties: true
+            default: []
+      penpot:
+        title: Penpot
         properties:
           size:
             type: string

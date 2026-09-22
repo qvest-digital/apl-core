@@ -72,3 +72,17 @@ releases:
       pkg: vikunja
       app: core
     <<: *otomiDb
+  - name: penpot-db-secret-artifacts
+    installed: {{ $a | get "penpot.enabled" }}
+    namespace: penpot
+    labels:
+      pkg: penpot
+      app: core
+    <<: *raw
+  - name: penpot-otomi-db
+    installed: {{ $a | get "penpot.enabled" }}
+    namespace: penpot
+    labels:
+      pkg: penpot
+      app: core
+    <<: *otomiDb

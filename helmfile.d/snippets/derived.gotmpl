@@ -244,6 +244,8 @@ environments:
           vikunjaDbUsername: vikunja
           turnstoneDomain: {{ printf "turnstone.%s" $domainSuffix }}
           turnstoneDbUsername: turnstone
+          penpotDomain: {{ printf "penpot.%s" $domainSuffix }}
+          penpotDbUsername: penpot
           tlsSecretName: {{ $tlsSecretName }}
           egressGatewayName: {{ $egressGatewayName }}
           egressGatewayLabel: {{ $egressGatewayLabel }}
