@@ -98,6 +98,10 @@ prometheus:
       {{- end }}
       pullPolicy: {{ $g | get "image.prometheus.pullPolicy" "IfNotPresent" }}
     podMetadata:
+      annotations:
+        # Every sidecar listens on 0.0.0.0:15090 itself, so without this Prometheus's own
+        # istio-proxy answers each scrape of <pod-ip>:15090 with its own Envoy stats.
+        traffic.sidecar.istio.io/excludeOutboundPorts: "15090"
       labels:
         otomi.io/auth: platform
         otomi.io/auth-policy: prometheus
