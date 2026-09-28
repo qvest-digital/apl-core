@@ -95,8 +95,17 @@ extraInitContainers: |
 extraEnv: |
   - name: KC_CACHE
     value: local
+  # Explicit scheme pins the issuer/discovery URLs to https for every request context, front-
+  # and back-channel alike. Without it, Keycloak's hostnamev2 provider infers the scheme per
+  # request: https for public/gateway-terminated traffic (X-Forwarded-Proto trusted), but http
+  # for direct in-cluster (backchannel) calls -- which have neither TLS nor a forwarded-proto
+  # header. Any client that authenticates over the public https endpoint but then calls another
+  # OIDC endpoint (e.g. userinfo) over the internal http backchannel -- exactly Penpot's design,
+  # see PENPOT.md -- gets its access token minted with iss=https..., then rejected by that
+  # backchannel call with USER_INFO_REQUEST_ERROR/invalid_token because Keycloak's own request
+  # context there expects iss=http... Confirmed live 2026-09-28.
   - name: KC_HOSTNAME
-    value: keycloak.{{ $v.cluster.domainSuffix }}
+    value: https://keycloak.{{ $v.cluster.domainSuffix }}
   - name: KC_DB_POOL_INITIAL_SIZE
     value: {{ $k.databaseInitialConnections | quote }}
   - name: KC_DB_POOL_MIN_SIZE
