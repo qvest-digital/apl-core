@@ -74,6 +74,11 @@ alertmanager:
     externalUrl: "https://{{ $alertmanagerHostname }}"
     useExistingSecret: true
     configSecret: alertmanager-team-{{ $teamId }}-config
+    # Only this team's own AlertmanagerConfig objects (the chart default {} reads every namespace's, so
+    # every team Alertmanager would also send every other team's notifications).
+    alertmanagerConfigNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: team-{{ $teamId }}
     {{- if $teamSettings | get "managedMonitoring.alertmanager" false }}
     {{- $teamReceivers := $teamSettings | get "alerts.receivers" ($v | get "alerts.receivers" (list "slack")) }}
     {{- if not (has "none" $teamReceivers) }}
