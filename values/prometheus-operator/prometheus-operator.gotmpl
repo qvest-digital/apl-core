@@ -242,6 +242,13 @@ alertmanager:
     externalUrl: https://{{ $alertmanagerDomain }}
     useExistingSecret: true
     configSecret: alertmanager-platform-config
+    # A team's AlertmanagerConfig objects belong to that team's own Alertmanager, not this one: with
+    # the chart default ({} = every object in every namespace) the platform AND each team Alertmanager
+    # all pick a team's object up and each sends every notification. The chart renders an empty
+    # selector as {}, so "none" has to be a label no team object carries.
+    alertmanagerConfigSelector:
+      matchLabels:
+        apl.io/alertmanager: platform
     {{- if $hasReceivers }}
     secrets:
       - alertmanager-credentials
