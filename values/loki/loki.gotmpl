@@ -68,10 +68,10 @@ sidecar:
   resources:
     limits:
       cpu: 100m
-      memory: 100Mi
+      memory: 256Mi
     requests:
       cpu: 50m
-      memory: 50Mi
+      memory: 64Mi
 
 loki:
   {{- if $v.otomi.linodeLkeImageRepository }}
